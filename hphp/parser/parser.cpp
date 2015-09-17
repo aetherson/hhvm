@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,11 +15,11 @@
 */
 #include "parser.h"
 
-#include "folly/Format.h"
+#include <folly/Conv.h>
+#include <folly/Format.h>
 
 #include "hphp/util/hash.h"
 
-#include <boost/lexical_cast.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 
 namespace HPHP {
@@ -30,6 +30,7 @@ bool ParserBase::IsClosureName(const std::string &name) {
 }
 
 std::string ParserBase::newClosureName(
+    const std::string &namespaceName,
     const std::string &className,
     const std::string &funcName) {
   // Closure names must be globally unique.  The easiest way to do
@@ -39,17 +40,20 @@ std::string ParserBase::newClosureName(
   std::string name = "Closure$";
   if (!className.empty()) {
     name += className + "::";
+  } else if (!namespaceName.empty()) {
+    // If className is present, it already includes the namespace
+    name += namespaceName + "\\";
   }
   name += funcName;
 
   int id = ++m_seenClosures[name];
-
-  folly::format(&name, ";{}", hash);
-
   if (id > 1) {
     // we've seen the same name before, uniquify
     name = name + '#' + std::to_string(id);
   }
+
+  folly::format(&name, ";{}", hash);
+
   return name;
 }
 
@@ -68,49 +72,48 @@ ParserBase::ParserBase(Scanner &scanner, const char *fileName)
 ParserBase::~ParserBase() {
 }
 
-std::string ParserBase::getMessage(bool filename /* = false */) const {
+std::string ParserBase::getMessage(bool filename /* = false */,
+                                   bool rawPosWhenNoError /* = false */
+                                  ) const {
   std::string ret = m_scanner.getError();
+
   if (!ret.empty()) {
     ret += " ";
   }
-  ret += getMessage(m_scanner.getLocation(), filename);
+  if (!ret.empty() || rawPosWhenNoError) {
+    ret += getMessage(m_scanner.getLocation()->r, filename);
+  }
+
   return ret;
 }
 
-std::string ParserBase::getMessage(Location *loc,
+std::string ParserBase::getMessage(const Location::Range& loc,
                                    bool filename /* = false */) const {
-  int line = loc->line1;
-  int column = loc->char1;
+  int line = loc.line1;
+  int column = loc.char1;
   std::string ret = "(";
   if (filename) {
     ret += std::string("File: ") + file() + ", ";
   }
-  ret += std::string("Line: ") + boost::lexical_cast<std::string>(line);
-  ret += ", Char: " + boost::lexical_cast<std::string>(column) + ")";
+  ret += std::string("Line: ") + folly::to<std::string>(line);
+  ret += ", Char: " + folly::to<std::string>(column) + ")";
   return ret;
 }
 
-LocationPtr ParserBase::getLocation() const {
-  LocationPtr location(new Location());
-  location->file  = file();
-  location->line0 = line0();
-  location->char0 = char0();
-  location->line1 = line1();
-  location->char1 = char1();
-  location->cursor = cursor();
-  return location;
+const Location::Range& ParserBase::getRange() const {
+  return m_loc.r;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // T_FUNCTION related functions
 
 void ParserBase::pushFuncLocation() {
-  m_funcLocs.push_back(getLocation());
+  m_funcLocs.push_back(getRange());
 }
 
-LocationPtr ParserBase::popFuncLocation() {
+Location::Range ParserBase::popFuncLocation() {
   assert(!m_funcLocs.empty());
-  LocationPtr loc = m_funcLocs.back();
+  auto loc = m_funcLocs.back();
   m_funcLocs.pop_back();
   return loc;
 }
@@ -182,7 +185,7 @@ void ParserBase::popLabelScope() {
 }
 
 void ParserBase::addLabel(const std::string &label,
-                          LocationPtr loc,
+                          const Location::Range& loc,
                           ScannerToken *stmt) {
   assert(!m_labelInfos.empty());
   LabelInfo &info = m_labelInfos.back();
@@ -202,7 +205,7 @@ void ParserBase::addLabel(const std::string &label,
 }
 
 void ParserBase::addGoto(const std::string &label,
-                         LocationPtr loc,
+                         const Location::Range& loc,
                          ScannerToken *stmt) {
   assert(!m_labelInfos.empty());
   LabelInfo &info = m_labelInfos.back();
@@ -225,7 +228,7 @@ void ParserBase::popLabelInfo() {
     if (iter == info.labels.end()) {
       invalidateGoto(gotoInfo.stmt, UndefLabel);
       error("'goto' to undefined label '%s': %s",
-            gotoInfo.label.c_str(), getMessage(gotoInfo.loc.get()).c_str());
+            gotoInfo.label.c_str(), getMessage(gotoInfo.loc).c_str());
       continue;
     }
     const LabelStmtInfo &labelInfo = iter->second;
@@ -240,7 +243,7 @@ void ParserBase::popLabelInfo() {
     if (!found) {
       invalidateGoto(gotoInfo.stmt, InvalidBlock);
       error("'goto' into loop or switch statement "
-            "is disallowed: %s", getMessage(gotoInfo.loc.get()).c_str());
+            "is disallowed: %s", getMessage(gotoInfo.loc).c_str());
       continue;
     } else {
       labels.erase(gotoInfo.label);

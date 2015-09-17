@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,6 +16,8 @@
 
 #include "hphp/runtime/base/timezone.h"
 
+#include <folly/AtomicHashArray.h>
+
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/datetime.h"
@@ -23,12 +25,13 @@
 #include "hphp/runtime/base/runtime-error.h"
 #include "hphp/runtime/base/type-conversions.h"
 
+#include "hphp/util/functional.h"
 #include "hphp/util/logger.h"
 #include "hphp/util/text-util.h"
 
 namespace HPHP {
 
-IMPLEMENT_OBJECT_ALLOCATION(TimeZone)
+IMPLEMENT_RESOURCE_ALLOCATION(TimeZone)
 ///////////////////////////////////////////////////////////////////////////////
 
 class GuessedTimeZone {
@@ -41,10 +44,13 @@ public:
     struct tm tmbuf;
     struct tm *ta = localtime_r(&the_time, &tmbuf);
     const char *tzid = nullptr;
+#ifndef _MSC_VER
+    // TODO: Fixme under MSVC!
     if (ta) {
       tzid = timelib_timezone_id_from_abbr(ta->tm_zone, ta->tm_gmtoff,
                                            ta->tm_isdst);
     }
+#endif
     if (!tzid) {
       tzid = "UTC";
     }
@@ -58,9 +64,13 @@ public:
   "misspelled the timezone identifier. "
 
     string_printf(m_warning, DATE_TZ_ERRMSG
-                  "We selected '%s' for '%s/%.1f/%s' instead",
-                  tzid, ta ? ta->tm_zone : "Unknown",
+                  "We selected '%s' for '%s/%.1f/%s' instead", tzid,
+#ifdef _MSC_VER
+                  "Unknown", 0,
+#else
+                  ta ? ta->tm_zone : "Unknown",
                   ta ? (float) (ta->tm_gmtoff / 3600) : 0,
+#endif
                   ta ? (ta->tm_isdst ? "DST" : "no DST") : "Unknown");
   }
 };
@@ -74,9 +84,33 @@ public:
   TimeZoneData() : Database(nullptr) {}
 
   const timelib_tzdb *Database;
-  MapStringToTimeZoneInfo Cache;
 };
 static IMPLEMENT_THREAD_LOCAL(TimeZoneData, s_timezone_data);
+
+struct ahm_eqstr {
+  bool operator()(const char* a, const char* b) {
+    return intptr_t(a) > 0 && (strcmp(a, b) == 0);
+  }
+};
+
+using TimeZoneCache =
+  folly::AtomicHashArray<const char*, timelib_tzinfo*, cstr_hash, ahm_eqstr>;
+using TimeZoneCacheEntry = std::pair<const char*, timelib_tzinfo*>;
+
+TimeZoneCache* s_tzCache;
+
+using TimeZoneValidityCache =
+  folly::AtomicHashArray<const char*, bool, cstr_hash, ahm_eqstr>;
+using TimeZoneValidityCacheEntry = std::pair<const char*, bool>;
+
+TimeZoneValidityCache* s_tzvCache;
+
+void timezone_init() {
+  // Allocate enough space to cache all possible timezones, if needed.
+  constexpr size_t kMaxTimeZoneCache = 1000;
+  s_tzCache = TimeZoneCache::create(kMaxTimeZoneCache).release();
+  s_tzvCache = TimeZoneValidityCache::create(kMaxTimeZoneCache).release();
+}
 
 const timelib_tzdb *TimeZone::GetDatabase() {
   const timelib_tzdb *&Database = s_timezone_data->Database;
@@ -86,42 +120,46 @@ const timelib_tzdb *TimeZone::GetDatabase() {
   return Database;
 }
 
-TimeZoneInfo TimeZone::GetTimeZoneInfo(char* name, const timelib_tzdb* db) {
-  MapStringToTimeZoneInfo &Cache = s_timezone_data->Cache;
-
-  MapStringToTimeZoneInfo::const_iterator iter = Cache.find(name);
-  if (iter != Cache.end()) {
-    return iter->second;
+timelib_tzinfo* TimeZone::GetTimeZoneInfoRaw(char* name,
+                                             const timelib_tzdb* db) {
+  auto const it = s_tzCache->find(name);
+  if (it != s_tzCache->end()) {
+    return it->second;
   }
 
-  TimeZoneInfo tzi(timelib_parse_tzfile(name, db), tzinfo_deleter());
+  auto tzi = timelib_parse_tzfile(name, db);
   if (!tzi) {
     char* tzid = timelib_timezone_id_from_abbr(name, -1, 0);
     if (tzid) {
-      tzi = TimeZoneInfo(timelib_parse_tzfile(tzid, db), tzinfo_deleter());
+      tzi = timelib_parse_tzfile(tzid, db);
     }
   }
 
   if (tzi) {
-    Cache[name] = tzi;
+    auto key = strdup(name);
+    auto result = s_tzCache->insert(TimeZoneCacheEntry(key, tzi));
+    if (!result.second) {
+      // The cache should never fill up since tzinfos are finite.
+      always_assert(result.first != s_tzCache->end());
+      // A collision occurred, so we don't need our strdup'ed key.
+      free(key);
+      timelib_tzinfo_dtor(tzi);
+      tzi = result.first->second;
+    }
   }
+
   return tzi;
 }
 
-timelib_tzinfo* TimeZone::GetTimeZoneInfoRaw(char* name,
-                                             const timelib_tzdb* db) {
-  return GetTimeZoneInfo(name, db).get();
-}
-
-bool TimeZone::IsValid(const String& name) {
-  return timelib_timezone_id_is_valid((char*)name.data(), GetDatabase());
+bool TimeZone::IsValid(const char* name) {
+  return timelib_timezone_id_is_valid((char*)name, GetDatabase());
 }
 
 String TimeZone::CurrentName() {
   /* Checking configure timezone */
-  String timezone = g_context->getTimeZone();
-  if (!timezone.empty()) {
-    return timezone;
+  auto& tz = RID().getTimeZone();
+  if (!tz.empty()) {
+    return String(tz);
   }
 
   /* Check environment variable */
@@ -130,47 +168,38 @@ String TimeZone::CurrentName() {
     return String(env, CopyString);
   }
 
-  /* Check config setting for default timezone */
-  String default_timezone = g_context->getDefaultTimeZone();
-  if (!default_timezone.empty() && IsValid(default_timezone.data())) {
-    return default_timezone;
-  }
-
   /* Try to guess timezone from system information */
   raise_strict_warning(s_guessed_timezone.m_warning);
   return String(s_guessed_timezone.m_tzid);
 }
 
-SmartResource<TimeZone> TimeZone::Current() {
-  return NEWOBJ(TimeZone)(CurrentName());
+req::ptr<TimeZone> TimeZone::Current() {
+  return req::make<TimeZone>(CurrentName());
 }
 
-bool TimeZone::SetCurrent(const String& zone) {
-  if (!IsValid(zone)) {
-    raise_notice("Timezone ID '%s' is invalid", zone.data());
+bool TimeZone::SetCurrent(const char* name) {
+  bool valid;
+  auto const it = s_tzvCache->find(name);
+  if (it != s_tzvCache->end()) {
+    valid = it->second;
+  } else {
+    valid = IsValid(name);
+
+    auto key = strdup(name);
+    auto result = s_tzvCache->insert(TimeZoneValidityCacheEntry(key, valid));
+    if (!result.second) {
+      // The cache is full or a collision occurred, and we don't need our
+      // strdup'ed key.
+      free(key);
+    }
+  }
+
+  if (!valid) {
+    raise_notice("Timezone ID '%s' is invalid", name);
     return false;
   }
-  g_context->setTimeZone(zone);
+  RID().setTimeZone(name);
   return true;
-}
-
-Array TimeZone::GetNamesToCountryCodes() {
-  const timelib_tzdb *tzdb = timelib_builtin_db();
-  int item_count = tzdb->index_size;
-  const timelib_tzdb_index_entry *table = tzdb->index;
-
-  Array ret;
-  for (int i = 0; i < item_count; ++i) {
-    // This string is what PHP considers as "data" or "info" which is basically
-    // the string of "PHP1xx" where xx is country code that uses this timezone.
-    // When country code is unknown or not in use anymore, ?? is used instead.
-    // There is no known better way to extract this information out.
-    const char* infoString = (const char*)&tzdb->data[table[i].pos];
-    const char* countryCode = &infoString[5];
-
-    ret.set(String(table[i].id, CopyString), String(countryCode, CopyString));
-  }
-  return ret;
 }
 
 const StaticString
@@ -205,9 +234,12 @@ Array TimeZone::GetAbbreviations() {
 }
 
 String TimeZone::AbbreviationToName(String abbr, int utcoffset /* = -1 */,
-                                    bool isdst /* = true */) {
+                                    int isdst /* = 1 */) {
+  if (isdst != 0 && isdst != 1) {
+    isdst = -1;
+  }
   return String(timelib_timezone_id_from_abbr(abbr.data(), utcoffset,
-                                              isdst ? -1 : 0),
+                                              isdst),
                 CopyString);
 }
 
@@ -215,20 +247,19 @@ String TimeZone::AbbreviationToName(String abbr, int utcoffset /* = -1 */,
 // class TimeZone
 
 TimeZone::TimeZone() {
-  m_tzi = TimeZoneInfo();
+  m_tzi = nullptr;
 }
 
 TimeZone::TimeZone(const String& name) {
-  m_tzi = GetTimeZoneInfo((char*)name.data(), GetDatabase());
+  m_tzi = GetTimeZoneInfoRaw((char*)name.data(), GetDatabase());
 }
 
 TimeZone::TimeZone(timelib_tzinfo *tzi) {
-  m_tzi = TimeZoneInfo(tzi, tzinfo_deleter());
+  m_tzi = tzi;
 }
 
-SmartResource<TimeZone> TimeZone::cloneTimeZone() const {
-  if (!m_tzi) return NEWOBJ(TimeZone)();
-  return NEWOBJ(TimeZone)(timelib_tzinfo_clone(m_tzi.get()));
+req::ptr<TimeZone> TimeZone::cloneTimeZone() const {
+  return req::make<TimeZone>(m_tzi);
 }
 
 String TimeZone::name() const {
@@ -245,7 +276,7 @@ int TimeZone::offset(int64_t timestamp) const {
   if (!m_tzi) return 0;
 
   timelib_time_offset *offset =
-    timelib_get_time_zone_info(timestamp, m_tzi.get());
+    timelib_get_time_zone_info(timestamp, m_tzi);
   int ret = offset->offset;
   timelib_time_offset_dtor(offset);
   return ret;
@@ -255,29 +286,54 @@ bool TimeZone::dst(int64_t timestamp) const {
   if (!m_tzi) return false;
 
   timelib_time_offset *offset =
-    timelib_get_time_zone_info(timestamp, m_tzi.get());
+    timelib_get_time_zone_info(timestamp, m_tzi);
   bool ret = offset->is_dst;
   timelib_time_offset_dtor(offset);
   return ret;
 }
 
-Array TimeZone::transitions() const {
+Array TimeZone::transitions(int64_t timestamp_begin, /* = k_PHP_INT_MIN */
+                            int64_t timestamp_end /* = k_PHP_INT_MAX */) const {
   Array ret;
   if (m_tzi) {
-    for (unsigned int i = 0; i < m_tzi->timecnt; ++i) {
-      int index = m_tzi->trans_idx[i];
-      int timestamp = m_tzi->trans[i];
-      DateTime dt(timestamp);
-      ttinfo &offset = m_tzi->type[index];
-      const char *abbr = m_tzi->timezone_abbr + offset.abbr_idx;
-
+    // If explicitly provided add the beginning timestamp to the ret array
+    if (timestamp_begin > k_PHP_INT_MIN) {
+      auto dt = req::make<DateTime>(timestamp_begin);
+      auto idx = m_tzi->trans_idx[0];
       ret.append(make_map_array(
-        s_ts, timestamp,
-        s_time, dt.toString(DateTime::DateFormat::ISO8601),
-        s_offset, offset.offset,
-        s_isdst, (bool)offset.isdst,
-        s_abbr, String(abbr, CopyString)
-      ));
+            s_ts, timestamp_begin,
+            s_time, dt->toString(DateTime::DateFormat::ISO8601),
+            s_offset, m_tzi->type[idx].offset,
+            s_isdst, (bool)m_tzi->type[idx].isdst,
+            s_abbr, String(m_tzi->timezone_abbr + m_tzi->type[idx].abbr_idx,
+                           CopyString)
+          ));
+    }
+    uint32_t timecnt;
+#ifdef FACEBOOK
+    // Internal builds embed tzdata into HHVM by keeping timelib updated
+    timecnt = m_tzi->bit32.timecnt;
+#else
+    // OSS builds read tzdata from the system location (eg /usr/share/zoneinfo)
+    // as this format must be stable, we're keeping timelib stable too
+    timecnt = m_tzi->timecnt;
+#endif
+    for (uint32_t i = 0; i < timecnt; ++i) {
+      int timestamp = m_tzi->trans[i];
+      if (timestamp > timestamp_begin && timestamp <= timestamp_end) {
+        int index = m_tzi->trans_idx[i];
+        auto dt = req::make<DateTime>(timestamp);
+        ttinfo &offset = m_tzi->type[index];
+        const char *abbr = m_tzi->timezone_abbr + offset.abbr_idx;
+
+        ret.append(make_map_array(
+          s_ts, timestamp,
+          s_time, dt->toString(DateTime::DateFormat::ISO8601),
+          s_offset, offset.offset,
+          s_isdst, (bool)offset.isdst,
+          s_abbr, String(abbr, CopyString)
+        ));
+      }
     }
   }
   return ret;

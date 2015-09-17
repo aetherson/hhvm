@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,17 +18,36 @@
 
 #include "hphp/runtime/base/runtime-option.h"
 
+#include <boost/type_traits.hpp>
+
 namespace HPHP {
 
-enum class Arch {
-  X64,
-  ARM,
-};
+///////////////////////////////////////////////////////////////////////////////
+
+enum class Arch { X64, ARM, };
 
 inline Arch arch() {
   if (RuntimeOption::EvalSimulateARM) return Arch::ARM;
   return Arch::X64;
 }
+
+/*
+ * Macro for defining easy arch-dispatch wrappers.
+ *
+ * We need to specify the return type explicitly, or else we may drop refs.
+ */
+#define ARCH_SWITCH_CALL(func, ...)     \
+  ([&]() -> boost::function_traits<decltype(x64::func)>::result_type {  \
+    switch (arch()) {                   \
+      case Arch::X64:                   \
+        return x64::func(__VA_ARGS__);  \
+      case Arch::ARM:                   \
+        return arm::func(__VA_ARGS__);  \
+    }                                   \
+    not_reached();                      \
+  }())
+
+///////////////////////////////////////////////////////////////////////////////
 
 }
 

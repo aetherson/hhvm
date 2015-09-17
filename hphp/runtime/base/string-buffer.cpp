@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -21,7 +21,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#include "folly/Conv.h"
+#include <folly/Conv.h>
 
 #include "hphp/runtime/base/file.h"
 #include "hphp/runtime/base/zend-functions.h"
@@ -31,26 +31,26 @@
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-StringBuffer::StringBuffer(int initialSize /* = SmallStringReserve */)
+StringBuffer::StringBuffer(uint32_t initialSize /* = SmallStringReserve */)
   : m_initialCap(initialSize)
   , m_maxBytes(kDefaultOutputLimit)
   , m_len(0)
 {
-  assert(initialSize >= 0);
   m_str = StringData::Make(initialSize);
   auto const s = m_str->bufferSlice();
-  m_buffer = s.ptr;
-  m_cap = s.len;
+  m_buffer = s.data();
+  m_cap = s.size();
 }
 
 StringBuffer::~StringBuffer() {
   if (m_str) {
+    assert(m_str->hasExactlyOneRef());
     assert((m_str->setSize(0), true)); // appease StringData::checkSane()
     m_str->release();
   }
 }
 
-const char *StringBuffer::data() const {
+const char* StringBuffer::data() const {
   if (m_buffer && m_len) {
     m_buffer[m_len] = '\0'; // fixup
     return m_buffer;
@@ -60,15 +60,14 @@ const char *StringBuffer::data() const {
 
 String StringBuffer::detach() {
   if (m_buffer && m_len) {
-    assert(m_str && m_str->getCount() == 0);
-    m_buffer[m_len] = '\0'; // fixup
-    StringData* str = m_str;
-    str->setSize(m_len);
+    assert(m_str && m_str->hasExactlyOneRef());
+    auto str = String::attach(m_str);
+    str.setSize(m_len);
     m_str = 0;
     m_buffer = 0;
     m_len = 0;
     m_cap = 0;
-    return String(str); // causes incref
+    return str;
   }
   return empty_string();
 }
@@ -90,7 +89,7 @@ void StringBuffer::absorb(StringBuffer& buf) {
     if (str) {
       buf.m_buffer = (char*)str->data();
       buf.m_len = str->size();
-      buf.m_cap = str->capacity() - 1;
+      buf.m_cap = str->capacity();
     } else {
       buf.m_buffer = 0;
       buf.m_len = 0;
@@ -109,8 +108,10 @@ void StringBuffer::clear() {
 
 void StringBuffer::release() {
   if (m_str) {
-    assert(m_str->getCount() == 0);
-    m_buffer[m_len] = 0; // appease StringData::checkSane()
+    assert(m_str->hasExactlyOneRef());
+    if (debug) {
+      m_buffer[m_len] = 0; // appease StringData::checkSane()
+    }
     m_str->release();
   }
   m_str = 0;
@@ -118,9 +119,9 @@ void StringBuffer::release() {
   m_len = m_cap = 0;
 }
 
-void StringBuffer::resize(int size) {
-  assert(size >= 0 && size <= m_cap);
-  if (size >= 0 && size <= m_cap) {
+void StringBuffer::resize(uint32_t size) {
+  assert(size <= m_cap);
+  if (size <= m_cap) {
     m_len = size;
   }
 }
@@ -129,17 +130,16 @@ char* StringBuffer::appendCursor(int size) {
   if (!m_buffer) {
     makeValid(size);
   } else if (m_cap - m_len < size) {
-    m_buffer[m_len] = 0;
     m_str->setSize(m_len);
     auto const tmp = m_str->reserve(m_len + size);
     if (UNLIKELY(tmp != m_str)) {
-      assert(m_str->getCount() == 0);
+      assert(m_str->hasExactlyOneRef());
       m_str->release();
       m_str = tmp;
     }
     auto const s = m_str->bufferSlice();
-    m_buffer = s.ptr;
-    m_cap = s.len;
+    m_buffer = s.data();
+    m_cap = s.size();
   }
   return m_buffer + m_len;
 }
@@ -147,12 +147,12 @@ char* StringBuffer::appendCursor(int size) {
 void StringBuffer::append(int n) {
   char buf[12];
   int len;
-  const StringData *sd = String::GetIntegerStringData(n);
+  auto const sd = String::GetIntegerStringData(n);
   char *p;
   if (!sd) {
     auto sl = conv_10(n, buf + 12);
-    p = const_cast<char*>(sl.ptr);
-    len = sl.len;
+    p = const_cast<char*>(sl.data());
+    len = sl.size();
   } else {
     p = (char *)sd->data();
     len = sd->size();
@@ -163,12 +163,12 @@ void StringBuffer::append(int n) {
 void StringBuffer::append(int64_t n) {
   char buf[21];
   int len;
-  const StringData *sd = String::GetIntegerStringData(n);
+  auto const sd = String::GetIntegerStringData(n);
   char *p;
   if (!sd) {
     auto sl = conv_10(n, buf + 21);
-    p = const_cast<char*>(sl.ptr);
-    len = sl.len;
+    p = const_cast<char*>(sl.data());
+    len = sl.size();
   } else {
     p = (char *)sd->data();
     len = sd->size();
@@ -179,15 +179,23 @@ void StringBuffer::append(int64_t n) {
 void StringBuffer::append(const Variant& v) {
   auto const cell = v.asCell();
   switch (cell->m_type) {
-  case KindOfStaticString:
-  case KindOfString:
-    append(cell->m_data.pstr);
-    break;
-  case KindOfInt64:
-    append(cell->m_data.num);
-    break;
-  default:
-    append(v.toString());
+    case KindOfInt64:
+      append(cell->m_data.num);
+      break;
+    case KindOfStaticString:
+    case KindOfString:
+      append(cell->m_data.pstr);
+      break;
+    case KindOfUninit:
+    case KindOfNull:
+    case KindOfBoolean:
+    case KindOfDouble:
+    case KindOfArray:
+    case KindOfObject:
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
+      append(v.toString());
   }
 }
 
@@ -199,12 +207,12 @@ void StringBuffer::appendHelper(char ch) {
   m_buffer[m_len++] = ch;
 }
 
-void StringBuffer::makeValid(int minCap) {
+void StringBuffer::makeValid(uint32_t minCap) {
   assert(!valid());
   assert(!m_len);
   m_str = StringData::Make(std::max(m_initialCap, minCap));
   m_buffer = (char*)m_str->data();
-  m_cap = m_str->capacity() - 1;
+  m_cap = m_str->capacity();
 }
 
 void StringBuffer::appendHelper(const char *s, int len) {
@@ -230,12 +238,12 @@ void StringBuffer::printf(const char *format, ...) {
     va_list v;
     va_copy(v, ap);
 
-    char *buf = (char*)smart_malloc(len);
+    char *buf = (char*)req::malloc(len);
     if (vsnprintf(buf, len, format, v) < len) {
       append(buf);
       printed = true;
     }
-    smart_free(buf);
+    req::free(buf);
 
     va_end(v);
   }
@@ -287,13 +295,13 @@ void StringBuffer::growBy(int spaceRequired) {
    * is power-of-two minus 1, or that it stays that way
    * (new_size < minSize below).
    */
-  long new_size = m_cap * 2L + 1;
-  long minSize = m_cap + (long)spaceRequired;
+  auto new_size = m_cap * 2 + 1;
+  auto const minSize = static_cast<unsigned>(m_cap) + spaceRequired;
   if (new_size < minSize) {
     new_size = minSize;
   }
 
-  if (m_maxBytes > 0 && new_size > m_maxBytes) {
+  if (new_size > m_maxBytes) {
     if (minSize > m_maxBytes) {
       throw StringBufferLimitException(m_maxBytes, detach());
     } else {
@@ -305,13 +313,20 @@ void StringBuffer::growBy(int spaceRequired) {
   m_str->setSize(m_len);
   auto const tmp = m_str->reserve(new_size);
   if (UNLIKELY(tmp != m_str)) {
-    assert(m_str->getCount() == 0);
+    assert(m_str->hasExactlyOneRef());
     m_str->release();
     m_str = tmp;
   }
   auto const s = m_str->bufferSlice();
-  m_buffer = s.ptr;
-  m_cap = s.len;
+  m_buffer = s.data();
+  m_cap = s.size();
+}
+
+//////////////////////////////////////////////////////////////////////
+
+void StringBufferLimitException::vscan(IMarker& mark) const {
+  FatalErrorException::vscan(mark);
+  mark(m_result);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -357,11 +372,13 @@ CstrBuffer::~CstrBuffer() {
   free(m_buffer);
 }
 
-void CstrBuffer::append(StringSlice slice) {
-  auto const data = slice.ptr;
-  auto const len = slice.len;
+void CstrBuffer::append(folly::StringPiece slice) {
+  auto const data = slice.data();
+  auto const len = slice.size();
 
-  assert(m_buffer && len >= 0);
+  static_assert(std::is_unsigned<decltype(len)>::value,
+                "len is supposed to be unsigned");
+  assert(m_buffer);
 
   unsigned newlen = m_len + len;
   if (newlen + 1 > m_cap) {

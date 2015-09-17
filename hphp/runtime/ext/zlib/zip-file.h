@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -35,23 +35,36 @@ public:
   virtual ~ZipFile();
 
   // overriding ResourceData
-  const String& o_getClassNameHook() const { return classnameof(); }
+  const String& o_getClassNameHook() const override { return classnameof(); }
 
-  virtual bool open(const String& filename, const String& mode);
-  virtual bool close();
-  virtual int64_t readImpl(char *buffer, int64_t length);
-  virtual int64_t writeImpl(const char *buffer, int64_t length);
-  virtual bool seekable() { return true;}
-  virtual bool seek(int64_t offset, int whence = SEEK_SET);
-  virtual int64_t tell();
-  virtual bool eof();
-  virtual bool rewind();
-  virtual bool flush();
+  bool open(const String& filename, const String& mode) override;
+  bool close() override;
+  int64_t readImpl(char *buffer, int64_t length) override;
+  int64_t writeImpl(const char *buffer, int64_t length) override;
+  bool seekable() override { return true;}
+  bool seek(int64_t offset, int whence = SEEK_SET) override;
+  int64_t tell() override;
+  bool eof() override;
+  bool rewind() override;
+  bool flush() override;
+
+  // Proxy the lock to the underlying stream
+  bool lock(int operation, bool &wouldblock) override {
+    if (!m_innerFile || m_innerFile->isClosed()) {
+      raise_warning("Inner file descriptor is closed");
+      return false;
+    }
+    return m_innerFile->lock(operation, wouldblock);
+  }
+  bool lock(int operation) override {
+    bool wouldBlock = false;
+    return lock(operation, wouldBlock);
+  }
 
 private:
   gzFile m_gzFile;
-  Resource m_innerFile;
-  Resource m_tempFile;
+  req::ptr<File> m_innerFile;
+  req::ptr<File> m_tempFile;
 
   bool closeImpl();
 };

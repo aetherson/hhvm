@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -78,11 +78,6 @@ void IfBranchStatement::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-void IfBranchStatement::inferTypes(AnalysisResultPtr ar) {
-  if (m_condition) m_condition->inferAndCheck(ar, Type::Boolean, false);
-  if (m_stmt) m_stmt->inferTypes(ar);
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void IfBranchStatement::outputCodeModel(CodeGenerator &cg) {
@@ -97,7 +92,7 @@ void IfBranchStatement::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("trueBlock");
   cg.printAsBlock(m_stmt);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -40,11 +40,8 @@ NewObjectExpression::NewObjectExpression
     But NewObjectExpression is written to use the class as the
     function name, so clear it here, to take care of the dynamic
     case.
-    Also set m_noStatic, to prevent errors in code gen due to
-    m_className being set.
   */
   m_class.reset();
-  m_noStatic = true;
 }
 
 ExpressionPtr NewObjectExpression::clone() {
@@ -52,9 +49,6 @@ ExpressionPtr NewObjectExpression::clone() {
   FunctionCall::deepCopy(exp);
   return exp;
 }
-
-///////////////////////////////////////////////////////////////////////////////
-// parser functions
 
 ///////////////////////////////////////////////////////////////////////////////
 // static analysis functions
@@ -65,91 +59,18 @@ void NewObjectExpression::analyzeProgram(AnalysisResultPtr ar) {
   if (ar->getPhase() == AnalysisResult::AnalyzeAll ||
       ar->getPhase() == AnalysisResult::AnalyzeFinal) {
     FunctionScopePtr func;
-    if (!m_name.empty()) {
-      addUserClass(ar, m_name);
+    if (!m_origName.empty()) {
       if (ClassScopePtr cls = resolveClass()) {
-        m_name = m_className;
+        m_origName = m_origClassName;
         func = cls->findConstructor(ar, true);
         if (func) func->addNewObjCaller(getScope());
       }
     }
 
     if (m_params) {
-      markRefParams(func, "", canInvokeFewArgs());
-    }
-
-    if (ar->getPhase() == AnalysisResult::AnalyzeFinal) {
-      TypePtr at(getActualType());
-      if (at && at->isSpecificObject() && !getExpectedType()) {
-        setExpectedType(at);
-      }
+      markRefParams(func, "");
     }
   }
-}
-
-TypePtr NewObjectExpression::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                        bool coerce) {
-  reset();
-  m_classScope.reset();
-  FunctionScopePtr prev = m_funcScope;
-  m_funcScope.reset();
-  ConstructPtr self = shared_from_this();
-  if (!m_name.empty() && !isStatic()) {
-    ClassScopePtr cls = resolveClassWithChecks();
-    m_name = m_className;
-    if (!cls) {
-      if (m_params) m_params->inferAndCheck(ar, Type::Any, false);
-      return Type::Object;
-    }
-
-    if (getScope()->isFirstPass() &&
-        (cls->isTrait() ?
-         !isSelf() && !isParent() :
-         cls->isInterface() || cls->isAbstract())) {
-      Compiler::Error(Compiler::InvalidInstantiation, self);
-    }
-
-    if (cls->isVolatile() && !isPresent()) {
-      getScope()->getVariables()->
-        setAttribute(VariableTable::NeedGlobalPointer);
-    }
-    m_dynamic = cls->derivesFromRedeclaring() == Derivation::Redeclaring;
-    bool valid = true;
-    FunctionScopePtr func = cls->findConstructor(ar, true);
-    if (!func) {
-      if (m_params) {
-        if (!m_dynamic && m_params->getCount()) {
-          if (getScope()->isFirstPass()) {
-            Compiler::Error(Compiler::BadConstructorCall, self);
-          }
-        }
-        m_params->inferAndCheck(ar, Type::Some, false);
-      }
-    } else {
-      if (func != prev) func->addNewObjCaller(getScope());
-      m_extraArg = func->inferParamTypes(ar, self, m_params, valid);
-      m_variableArgument = func->allowsVariableArguments();
-    }
-    if (valid) {
-      m_classScope = cls;
-      m_funcScope = func;
-    }
-    if (!valid || m_dynamic) {
-      m_implementedType = Type::Object;
-    } else {
-      m_implementedType.reset();
-    }
-    return Type::CreateObjectType(m_name);
-  } else {
-    if (m_params) {
-      m_params->markParams(canInvokeFewArgs());
-    }
-  }
-
-  m_implementedType.reset();
-  m_nameExp->inferAndCheck(ar, Type::String, false);
-  if (m_params) m_params->inferAndCheck(ar, Type::Any, false);
-  return Type::Object;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -168,7 +89,7 @@ void NewObjectExpression::outputCodeModel(CodeGenerator &cg) {
     cg.printExpressionVector(m_params);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

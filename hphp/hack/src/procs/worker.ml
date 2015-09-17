@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -7,6 +7,8 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  *
  *)
+
+open Core
 
 external hh_worker_init: unit -> unit = "hh_worker_init"
 
@@ -118,9 +120,9 @@ type ('a, 'b) worker_list = ('a, 'b) real_t list
 
 let select: ('a, 'b) worker_list -> ('a, 'b) worker_list =
 fun tl ->
-  let fdl = List.map (fun x -> x.descr_recv) tl in
+  let fdl = List.map tl (fun x -> x.descr_recv) in
   let readyl, _, _ = Unix.select fdl [] [] (-1.0) in
-  let res = List.filter (fun x -> List.mem x.descr_recv readyl) tl in
+  let res = List.filter tl (fun x -> List.mem readyl x.descr_recv) in
   res
 
 (*****************************************************************************)
@@ -137,17 +139,17 @@ module MakeWorker = struct
   (* The current amount of "live" workers *)
   let current_workers = ref 0
 
-  let rec make: ('a, 'b) acc -> int -> ('a, 'b) acc =
-  fun acc n ->
+  let rec make: ('a, 'b) acc -> int -> Gc.control -> ('a, 'b) acc =
+  fun acc n gc_control ->
     incr current_workers;
     if !current_workers > max_workers
     then failwith "Too many workers"
     else if n <= 0
     then acc
-    else make_ acc n
+    else make_ acc n gc_control
 
-  and make_: ('a, 'b) acc -> int -> ('a, 'b) acc =
-  fun acc n ->
+  and make_: ('a, 'b) acc -> int -> Gc.control -> ('a, 'b) acc =
+  fun acc n gc_control ->
     (* Initializing a bidirectional pipe *)
     let pipe_parent_reads_child_sends = make_pipe() in
     let pipe_parent_sends_child_reads = make_pipe() in
@@ -169,7 +171,7 @@ module MakeWorker = struct
       pipe_descr_out = descr_parent_sends;
       pipe_fout = parent_sends_task;
     } = pipe_parent_sends_child_reads in
-    match Fork.fork ~reason:(Some "worker") () with
+    match Fork.fork_and_log ~reason:"worker" () with
     | -1 ->
         failwith "Could not create process"
     | 0 ->
@@ -178,7 +180,13 @@ module MakeWorker = struct
          * we close all the ones we don't need anymore.
          *)
         hh_worker_init();
+        Gc.set gc_control;
         close_parent descr_parent_reads descr_parent_sends acc;
+        if !Utils.profile
+        then begin
+          let f = open_out (string_of_int (Unix.getpid ())^".log") in
+          Utils.log := (fun s -> Printf.fprintf f "%s\n" s)
+        end;
         (* And now start the daemon worker *)
         start_worker descr_child_reads child_reads_task child_sends_result
     | pid ->
@@ -192,7 +200,7 @@ module MakeWorker = struct
           descr_send = descr_parent_sends;
         } in
         let acc = worker :: acc in
-        make acc (n-1)
+        make acc (n-1) gc_control
 
   and close_parent: Unix.file_descr -> Unix.file_descr -> ('a, 'b) acc
     -> unit =
@@ -207,19 +215,13 @@ module MakeWorker = struct
      * are duplicated. To avoid this, we need to close the pipes
      * of the previously created workers.
      *)
-    List.iter (fun w -> Unix.close w.descr_recv; Unix.close w.descr_send) acc;
+    List.iter acc (fun w -> Unix.close w.descr_recv; Unix.close w.descr_send);
     ()
 
   and start_worker: Unix.file_descr -> (unit -> 'a) -> ('b -> unit) -> 'c =
   fun descr_in child_reads_task child_sends_result ->
     (* Daemon *)
     try
-      (* Let's virtually turn off the GC, it can still be
-       * triggered in extreme cases, but should not most
-       * of the time.
-       *)
-      let gc = Gc.get() in
-      Gc.set { gc with Gc.minor_heap_size = 8_000_000 };
       while true do
         (* This is a trick to use less memory and to be faster.
          * If we fork now, the heap is very small, because no job
@@ -227,7 +229,7 @@ module MakeWorker = struct
          *)
         let readyl, _, _ = Unix.select [descr_in] [] [] (-1.0) in
         if readyl = [] then exit 0;
-        match Unix.fork() with
+        match Fork.fork() with
         | 0 ->
             (try
               let { job = job; arg = arg } = child_reads_task() in
@@ -243,7 +245,9 @@ module MakeWorker = struct
             | End_of_file ->
                 exit 1
             | e ->
-                Printf.printf "Exception: %s\n" (Printexc.to_string e);
+                let e_str = Printexc.to_string e in
+                Printf.printf "Exception: %s\n" e_str;
+                EventLogger.worker_exception e_str;
                 print_endline "Potential backtrace:";
                 Printexc.print_backtrace stdout;
                 exit 2
@@ -259,7 +263,7 @@ module MakeWorker = struct
                 raise End_of_file
             | Unix.WSIGNALED x ->
                 let sig_str = PrintSignal.string_of_signal x in
-                Printf.printf "Worker interruped with signal: %s\n" sig_str;
+                Printf.printf "Worker interrupted with signal: %s\n" sig_str;
                 exit 2
             | Unix.WSTOPPED x ->
                 Printf.printf "Worker stopped with signal: %d\n" x;
@@ -286,7 +290,7 @@ end
 let get_pid proc = (Obj.magic proc).pid
 let call proc f x = proc.send_task ({ job = f; arg = x })
 let get_result proc _ = proc.recv_result()
-let make heap = Obj.magic (MakeWorker.make [] heap)
+let make heap gc_control = Obj.magic (MakeWorker.make [] heap gc_control)
 let call proc = Obj.magic (call (Obj.magic proc))
 let select procl = Obj.magic (select (Obj.magic procl))
 let get_result proc = get_result (Obj.magic proc)

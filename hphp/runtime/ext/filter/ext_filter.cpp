@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -15,70 +15,79 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/ext/ext_filter.h"
+#include "hphp/runtime/ext/filter/ext_filter.h"
 #include "hphp/runtime/ext/filter/logical_filters.h"
 #include "hphp/runtime/ext/filter/sanitizing_filters.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/init-fini-node.h"
 #include "hphp/runtime/base/request-event-handler.h"
+#include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/php-globals.h"
 
 namespace HPHP {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-const int64_t k_INPUT_POST = 0;
-const int64_t k_INPUT_GET = 1;
-const int64_t k_INPUT_COOKIE = 2;
-const int64_t k_INPUT_ENV = 4;
-const int64_t k_INPUT_SERVER = 5;
-const int64_t k_INPUT_SESSION = 6;
-const int64_t k_INPUT_REQUEST = 99;
-const int64_t k_FILTER_FLAG_NONE = 0;
-const int64_t k_FILTER_REQUIRE_SCALAR = 33554432;
-const int64_t k_FILTER_REQUIRE_ARRAY = 16777216;
-const int64_t k_FILTER_FORCE_ARRAY = 67108864;
-const int64_t k_FILTER_NULL_ON_FAILURE = 134217728;
-const int64_t k_FILTER_VALIDATE_INT = 257;
-const int64_t k_FILTER_VALIDATE_BOOLEAN = 258;
-const int64_t k_FILTER_VALIDATE_FLOAT = 259;
-const int64_t k_FILTER_VALIDATE_REGEXP = 272;
-const int64_t k_FILTER_VALIDATE_URL = 273;
-const int64_t k_FILTER_VALIDATE_EMAIL = 274;
-const int64_t k_FILTER_VALIDATE_IP = 275;
-const int64_t k_FILTER_VALIDATE_MAC = 276;
-const int64_t k_FILTER_DEFAULT = 516;
-const int64_t k_FILTER_UNSAFE_RAW = 516;
-const int64_t k_FILTER_SANITIZE_STRING = 513;
-const int64_t k_FILTER_SANITIZE_STRIPPED = 513;
-const int64_t k_FILTER_SANITIZE_ENCODED = 514;
-const int64_t k_FILTER_SANITIZE_SPECIAL_CHARS = 515;
-const int64_t k_FILTER_SANITIZE_FULL_SPECIAL_CHARS = 515;
-const int64_t k_FILTER_SANITIZE_EMAIL = 517;
-const int64_t k_FILTER_SANITIZE_URL = 518;
-const int64_t k_FILTER_SANITIZE_NUMBER_INT = 519;
-const int64_t k_FILTER_SANITIZE_NUMBER_FLOAT = 520;
-const int64_t k_FILTER_SANITIZE_MAGIC_QUOTES = 521;
-const int64_t k_FILTER_CALLBACK = 1024;
-const int64_t k_FILTER_FLAG_ALLOW_OCTAL = 1;
-const int64_t k_FILTER_FLAG_ALLOW_HEX = 2;
-const int64_t k_FILTER_FLAG_STRIP_LOW = 4;
-const int64_t k_FILTER_FLAG_STRIP_HIGH = 8;
-const int64_t k_FILTER_FLAG_ENCODE_LOW = 16;
-const int64_t k_FILTER_FLAG_ENCODE_HIGH = 32;
-const int64_t k_FILTER_FLAG_ENCODE_AMP = 64;
-const int64_t k_FILTER_FLAG_NO_ENCODE_QUOTES = 128;
-const int64_t k_FILTER_FLAG_EMPTY_STRING_NULL = 256;
-const int64_t k_FILTER_FLAG_STRIP_BACKTICK = 512;
-const int64_t k_FILTER_FLAG_ALLOW_FRACTION = 4096;
-const int64_t k_FILTER_FLAG_ALLOW_THOUSAND = 8192;
-const int64_t k_FILTER_FLAG_ALLOW_SCIENTIFIC = 16384;
-const int64_t k_FILTER_FLAG_SCHEME_REQUIRED = 65536;
-const int64_t k_FILTER_FLAG_HOST_REQUIRED = 131072;
-const int64_t k_FILTER_FLAG_PATH_REQUIRED = 262144;
-const int64_t k_FILTER_FLAG_QUERY_REQUIRED = 524288;
-const int64_t k_FILTER_FLAG_IPV4 = 1048576;
-const int64_t k_FILTER_FLAG_IPV6 = 2097152;
-const int64_t k_FILTER_FLAG_NO_RES_RANGE = 4194304;
-const int64_t k_FILTER_FLAG_NO_PRIV_RANGE = 8388608;
+#define DEFINE_CONSTANT(name, value)                                           \
+  const int64_t k_##name = value;                                              \
+  const StaticString s_##name(#name)                                           \
+
+DEFINE_CONSTANT(INPUT_POST, 0);
+DEFINE_CONSTANT(INPUT_GET, 1);
+DEFINE_CONSTANT(INPUT_COOKIE, 2);
+DEFINE_CONSTANT(INPUT_ENV, 4);
+DEFINE_CONSTANT(INPUT_SERVER, 5);
+DEFINE_CONSTANT(INPUT_SESSION, 6);
+DEFINE_CONSTANT(INPUT_REQUEST, 99);
+DEFINE_CONSTANT(FILTER_FLAG_NONE, 0);
+DEFINE_CONSTANT(FILTER_REQUIRE_SCALAR, 33554432);
+DEFINE_CONSTANT(FILTER_REQUIRE_ARRAY, 16777216);
+DEFINE_CONSTANT(FILTER_FORCE_ARRAY, 67108864);
+DEFINE_CONSTANT(FILTER_NULL_ON_FAILURE, 134217728);
+DEFINE_CONSTANT(FILTER_VALIDATE_INT, 257);
+DEFINE_CONSTANT(FILTER_VALIDATE_BOOLEAN, 258);
+DEFINE_CONSTANT(FILTER_VALIDATE_FLOAT, 259);
+DEFINE_CONSTANT(FILTER_VALIDATE_REGEXP, 272);
+DEFINE_CONSTANT(FILTER_VALIDATE_URL, 273);
+DEFINE_CONSTANT(FILTER_VALIDATE_EMAIL, 274);
+DEFINE_CONSTANT(FILTER_VALIDATE_IP, 275);
+DEFINE_CONSTANT(FILTER_VALIDATE_MAC, 276);
+DEFINE_CONSTANT(FILTER_DEFAULT, 516);
+DEFINE_CONSTANT(FILTER_UNSAFE_RAW, 516);
+DEFINE_CONSTANT(FILTER_SANITIZE_STRING, 513);
+DEFINE_CONSTANT(FILTER_SANITIZE_STRIPPED, 513);
+DEFINE_CONSTANT(FILTER_SANITIZE_ENCODED, 514);
+DEFINE_CONSTANT(FILTER_SANITIZE_SPECIAL_CHARS, 515);
+DEFINE_CONSTANT(FILTER_SANITIZE_FULL_SPECIAL_CHARS, 515);
+DEFINE_CONSTANT(FILTER_SANITIZE_EMAIL, 517);
+DEFINE_CONSTANT(FILTER_SANITIZE_URL, 518);
+DEFINE_CONSTANT(FILTER_SANITIZE_NUMBER_INT, 519);
+DEFINE_CONSTANT(FILTER_SANITIZE_NUMBER_FLOAT, 520);
+DEFINE_CONSTANT(FILTER_SANITIZE_MAGIC_QUOTES, 521);
+DEFINE_CONSTANT(FILTER_CALLBACK, 1024);
+DEFINE_CONSTANT(FILTER_FLAG_ALLOW_OCTAL, 1);
+DEFINE_CONSTANT(FILTER_FLAG_ALLOW_HEX, 2);
+DEFINE_CONSTANT(FILTER_FLAG_STRIP_LOW, 4);
+DEFINE_CONSTANT(FILTER_FLAG_STRIP_HIGH, 8);
+DEFINE_CONSTANT(FILTER_FLAG_ENCODE_LOW, 16);
+DEFINE_CONSTANT(FILTER_FLAG_ENCODE_HIGH, 32);
+DEFINE_CONSTANT(FILTER_FLAG_ENCODE_AMP, 64);
+DEFINE_CONSTANT(FILTER_FLAG_NO_ENCODE_QUOTES, 128);
+DEFINE_CONSTANT(FILTER_FLAG_EMPTY_STRING_NULL, 256);
+DEFINE_CONSTANT(FILTER_FLAG_STRIP_BACKTICK, 512);
+DEFINE_CONSTANT(FILTER_FLAG_ALLOW_FRACTION, 4096);
+DEFINE_CONSTANT(FILTER_FLAG_ALLOW_THOUSAND, 8192);
+DEFINE_CONSTANT(FILTER_FLAG_ALLOW_SCIENTIFIC, 16384);
+DEFINE_CONSTANT(FILTER_FLAG_SCHEME_REQUIRED, 65536);
+DEFINE_CONSTANT(FILTER_FLAG_HOST_REQUIRED, 131072);
+DEFINE_CONSTANT(FILTER_FLAG_PATH_REQUIRED, 262144);
+DEFINE_CONSTANT(FILTER_FLAG_QUERY_REQUIRED, 524288);
+DEFINE_CONSTANT(FILTER_FLAG_IPV4, 1048576);
+DEFINE_CONSTANT(FILTER_FLAG_IPV6, 2097152);
+DEFINE_CONSTANT(FILTER_FLAG_NO_RES_RANGE, 4194304);
+DEFINE_CONSTANT(FILTER_FLAG_NO_PRIV_RANGE, 8388608);
+
+#undef DEFINE_CONSTANT
 
 const StaticString
   s_GET("_GET"),
@@ -87,8 +96,8 @@ const StaticString
   s_SERVER("_SERVER"),
   s_ENV("_ENV");
 
-struct FilterRequestData final : RequestEventHandler {
-  void requestInit() override {
+struct FilterRequestData final {
+  void requestInit() {
     // This doesn't copy them yet, but will do COW if they are modified
     m_GET    = php_global(s_GET).toArray();
     m_POST   = php_global(s_POST).toArray();
@@ -97,12 +106,12 @@ struct FilterRequestData final : RequestEventHandler {
     m_ENV    = php_global(s_ENV).toArray();
   }
 
-  void requestShutdown() override {
-    m_GET = nullptr;
-    m_POST = nullptr;
-    m_COOKIE = nullptr;
-    m_SERVER = nullptr;
-    m_ENV = nullptr;
+  void requestShutdown() {
+    m_GET.detach();
+    m_POST.detach();
+    m_COOKIE.detach();
+    m_SERVER.detach();
+    m_ENV.detach();
   }
 
   Array getVar(int64_t type) {
@@ -116,6 +125,14 @@ struct FilterRequestData final : RequestEventHandler {
     return empty_array();
   }
 
+  void vscan(IMarker& mark) const {
+    mark(m_GET);
+    mark(m_POST);
+    mark(m_COOKIE);
+    mark(m_SERVER);
+    mark(m_ENV);
+  }
+
 private:
   Array m_GET;
   Array m_POST;
@@ -123,20 +140,107 @@ private:
   Array m_SERVER;
   Array m_ENV;
 };
-IMPLEMENT_STATIC_REQUEST_LOCAL(FilterRequestData, s_filter_request_data);
+IMPLEMENT_THREAD_LOCAL_NO_CHECK(FilterRequestData, s_filter_request_data);
 
-static class FilterExtension : public Extension {
+#define REGISTER_CONSTANT(name)                                                \
+  Native::registerConstant<KindOfInt64>(s_##name.get(), k_##name)              \
+
+static class FilterExtension final : public Extension {
 public:
   FilterExtension() : Extension("filter", "0.11.0") {}
-  virtual void moduleLoad(const IniSetting::Map& ini, Hdf config) {
+
+  void moduleLoad(const IniSetting::Map& ini, Hdf config) override {
     HHVM_FE(__SystemLib_filter_input_get_var);
     HHVM_FE(_filter_snapshot_globals);
   }
-  virtual void requestInit() {
+
+  void moduleInit() override {
+    REGISTER_CONSTANT(INPUT_POST);
+    REGISTER_CONSTANT(INPUT_GET);
+    REGISTER_CONSTANT(INPUT_COOKIE);
+    REGISTER_CONSTANT(INPUT_ENV);
+    REGISTER_CONSTANT(INPUT_SERVER);
+    REGISTER_CONSTANT(INPUT_SESSION);
+    REGISTER_CONSTANT(INPUT_REQUEST);
+    REGISTER_CONSTANT(FILTER_FLAG_NONE);
+    REGISTER_CONSTANT(FILTER_REQUIRE_SCALAR);
+    REGISTER_CONSTANT(FILTER_REQUIRE_ARRAY);
+    REGISTER_CONSTANT(FILTER_FORCE_ARRAY);
+    REGISTER_CONSTANT(FILTER_NULL_ON_FAILURE);
+    REGISTER_CONSTANT(FILTER_VALIDATE_INT);
+    REGISTER_CONSTANT(FILTER_VALIDATE_BOOLEAN);
+    REGISTER_CONSTANT(FILTER_VALIDATE_FLOAT);
+    REGISTER_CONSTANT(FILTER_VALIDATE_REGEXP);
+    REGISTER_CONSTANT(FILTER_VALIDATE_URL);
+    REGISTER_CONSTANT(FILTER_VALIDATE_EMAIL);
+    REGISTER_CONSTANT(FILTER_VALIDATE_IP);
+    REGISTER_CONSTANT(FILTER_VALIDATE_MAC);
+    REGISTER_CONSTANT(FILTER_DEFAULT);
+    REGISTER_CONSTANT(FILTER_UNSAFE_RAW);
+    REGISTER_CONSTANT(FILTER_SANITIZE_STRING);
+    REGISTER_CONSTANT(FILTER_SANITIZE_STRIPPED);
+    REGISTER_CONSTANT(FILTER_SANITIZE_ENCODED);
+    REGISTER_CONSTANT(FILTER_SANITIZE_SPECIAL_CHARS);
+    REGISTER_CONSTANT(FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+    REGISTER_CONSTANT(FILTER_SANITIZE_EMAIL);
+    REGISTER_CONSTANT(FILTER_SANITIZE_URL);
+    REGISTER_CONSTANT(FILTER_SANITIZE_NUMBER_INT);
+    REGISTER_CONSTANT(FILTER_SANITIZE_NUMBER_FLOAT);
+    REGISTER_CONSTANT(FILTER_SANITIZE_MAGIC_QUOTES);
+    REGISTER_CONSTANT(FILTER_CALLBACK);
+    REGISTER_CONSTANT(FILTER_FLAG_ALLOW_OCTAL);
+    REGISTER_CONSTANT(FILTER_FLAG_ALLOW_HEX);
+    REGISTER_CONSTANT(FILTER_FLAG_STRIP_LOW);
+    REGISTER_CONSTANT(FILTER_FLAG_STRIP_HIGH);
+    REGISTER_CONSTANT(FILTER_FLAG_ENCODE_LOW);
+    REGISTER_CONSTANT(FILTER_FLAG_ENCODE_HIGH);
+    REGISTER_CONSTANT(FILTER_FLAG_ENCODE_AMP);
+    REGISTER_CONSTANT(FILTER_FLAG_NO_ENCODE_QUOTES);
+    REGISTER_CONSTANT(FILTER_FLAG_EMPTY_STRING_NULL);
+    REGISTER_CONSTANT(FILTER_FLAG_STRIP_BACKTICK);
+    REGISTER_CONSTANT(FILTER_FLAG_ALLOW_FRACTION);
+    REGISTER_CONSTANT(FILTER_FLAG_ALLOW_THOUSAND);
+    REGISTER_CONSTANT(FILTER_FLAG_ALLOW_SCIENTIFIC);
+    REGISTER_CONSTANT(FILTER_FLAG_SCHEME_REQUIRED);
+    REGISTER_CONSTANT(FILTER_FLAG_HOST_REQUIRED);
+    REGISTER_CONSTANT(FILTER_FLAG_PATH_REQUIRED);
+    REGISTER_CONSTANT(FILTER_FLAG_QUERY_REQUIRED);
+    REGISTER_CONSTANT(FILTER_FLAG_IPV4);
+    REGISTER_CONSTANT(FILTER_FLAG_IPV6);
+    REGISTER_CONSTANT(FILTER_FLAG_NO_RES_RANGE);
+    REGISTER_CONSTANT(FILTER_FLAG_NO_PRIV_RANGE);
+
+    HHVM_FE(filter_list);
+    HHVM_FE(filter_id);
+    HHVM_FE(filter_var);
+
+    loadSystemlib();
+  }
+
+  void threadInit() override {
+    s_filter_request_data.getCheck();
+  }
+
+  void requestShutdown() override {
     // warm up the s_filter_request_data
-    s_filter_request_data->requestInit();
+    s_filter_request_data->requestShutdown();
+  }
+
+  void vscan(IMarker& m) const override {
+    if (!s_filter_request_data.isNull()) {
+      // this also is scanned by RequestEventHandler; maybe it's redundant,
+      // or maybe the handler isn't registered yet.
+      s_filter_request_data->vscan(m);
+    }
   }
 } s_filter_extension;
+
+namespace {
+InitFiniNode globalsInit([]() { s_filter_request_data->requestInit(); },
+                         InitFiniNode::When::GlobalsInit);
+}
+
+#undef REGISTER_CONSTANT
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -311,7 +415,7 @@ static bool filter_recursive(Variant& ret, const Variant& variable, int64_t filt
 
 ///////////////////////////////////////////////////////////////////////////////
 
-Variant f_filter_list() {
+Variant HHVM_FUNCTION(filter_list) {
   size_t size = sizeof(filter_list) / sizeof(filter_list_entry);
   Array ret;
   for (size_t i = 0; i < size; ++i) {
@@ -320,7 +424,8 @@ Variant f_filter_list() {
   return ret;
 }
 
-Variant f_filter_id(const Variant& filtername) {
+Variant HHVM_FUNCTION(filter_id,
+                      const Variant& filtername) {
   if (filtername.isArray()) {
     raise_warning("Array to string conversion");
     return init_null();
@@ -341,8 +446,10 @@ Variant f_filter_id(const Variant& filtername) {
     if (x) return fail(filter_flags & k_FILTER_NULL_ON_FAILURE, options); \
   } while(0)
 
-Variant f_filter_var(const Variant& variable, int64_t filter /* = 516 */,
-                     const Variant& options /* = empty_array_ref */) {
+Variant HHVM_FUNCTION(filter_var,
+                      const Variant& variable,
+                      int64_t filter /* = 516 */,
+                      const Variant& options /* = empty_array_ref */) {
   int64_t filter_flags;
   if (options.isArray()) {
     filter_flags = options.toCArrRef()[s_flags].toInt64();

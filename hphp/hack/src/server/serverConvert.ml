@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -7,6 +7,9 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  *
  *)
+
+open Core
+open Sys_utils
 open Utils
 
 (*****************************************************************************)
@@ -16,17 +19,17 @@ open Utils
 let print_patch filename (line, kind, type_) =
   let line = string_of_int line in
   let kind = Typing_suggest.string_of_kind kind in
-  let tenv = Typing_env.empty filename in
+  let tenv = Typing_env.empty TypecheckerOptions.permissive filename in
   let type_ = Typing_print.full tenv type_ in
   Printf.printf "File: %s, line: %s, kind: %s, type: %s\n" 
-    filename line kind type_
+    (Relative_path.to_absolute filename) line kind type_
 
 (*****************************************************************************)
 (* Applies a patch to a file. *)
 (*****************************************************************************)
 
 let add_file env fn =
-  let failed_parsing = SSet.add fn env.ServerEnv.failed_parsing in
+  let failed_parsing = Relative_path.Set.add fn env.ServerEnv.failed_parsing in
   { env with ServerEnv.failed_parsing = failed_parsing }
 
 (* Maps filenames to the contents of those files, split into lines. Each line
@@ -41,48 +44,50 @@ let add_file env fn =
  * patching by the code in this file. The latter includes the line numbers we
  * maintain internally, updated after adding newlines from various mutations
  * herein. *)
-let file_data = ref (SMap.empty : (int * string) list SMap.t)
+let file_data = ref (Relative_path.Map.empty :
+  (int * string) list Relative_path.Map.t)
 
 let split_and_number content =
-  let lines = Utils.split_lines content in
-  let (_, numbered_lines) = List.fold_left begin fun (n, acc) line ->
+  let lines = split_lines content in
+  let (_, numbered_lines) = List.fold_left lines ~f:begin fun (n, acc) line ->
     n+1, (n, line)::acc
-  end (1, []) lines in
+  end ~init:(1, []) in
   List.rev numbered_lines
 
 let read_file_raw fn =
-  let content = cat_no_fail fn in
+  let content = cat_no_fail (Relative_path.to_absolute fn) in
   split_and_number content
 
 let read_file fn =
-  match SMap.get fn !file_data with
+  match Relative_path.Map.get fn !file_data with
     | Some d -> d
     | None -> read_file_raw fn
 
 let write_file fn numbered_lines =
   let buf = Buffer.create 256 in
-  List.iter begin fun (lnum, line) ->
+  List.iter numbered_lines begin fun (lnum, line) ->
     Buffer.add_string buf line;
     Buffer.add_char buf '\n'
-  end numbered_lines;
-  let oc = open_out_no_fail fn in
+  end;
+  let abs_fn = Relative_path.to_absolute fn in
+  let oc = open_out_no_fail abs_fn in
   output_string oc (Buffer.contents buf);
-  close_out_no_fail fn oc;
-  file_data := SMap.add fn numbered_lines !file_data
+  close_out_no_fail abs_fn oc;
+  file_data := Relative_path.Map.add fn numbered_lines !file_data
 
-let apply_patch genv env fn f =
-  Printf.printf "Patching %s: %!" fn;
+let apply_patch (genv:ServerEnv.genv) (env:ServerEnv.env) fn f =
+  Printf.printf "Patching %s: %!" (Relative_path.to_absolute fn);
   let content = read_file fn in
   let patched = f fn content in
   if patched == content
-  then begin 
+  then begin
     Printf.printf "No patch\n"; flush stdout;
     [], env
   end
   else begin
     write_file fn patched;
     let env = add_file env fn in
-    let env = ServerTypeCheck.type_check genv env in
+    let env, _rechecked = ServerTypeCheck.type_check genv env in
     let errors = env.ServerEnv.errorl in
     if env.ServerEnv.errorl <> []
     then begin
@@ -90,7 +95,7 @@ let apply_patch genv env fn f =
       write_file fn content;
       let env = add_file env fn in
       Printf.printf "Failed\n"; flush stdout;
-      let env = ServerTypeCheck.type_check genv env in
+      let env, _rechecked = ServerTypeCheck.type_check genv env in
       assert (env.ServerEnv.errorl = []);
       errors, env
     end
@@ -134,7 +139,7 @@ let rec search_and_insert indent type_ head = function
       Printf.printf
         "\n-%s\n+%s\n"
         line_content
-        (String.concat "\n" (List.map snd patched_lines));
+        (String.concat "\n" (List.map patched_lines snd));
       List.rev_append head (patched_lines @ rl)
   | x :: rl -> search_and_insert indent type_ (x :: head) rl
 
@@ -171,7 +176,8 @@ let add_return patch_line type_ _ content =
  * to be run through reconcile_split in order to figure out what the correct
  * fixed up line numbers are. *)
 let split_file fn =
-  let ic = Unix.open_process_in ("hackificator -split_vars " ^ fn) in
+  let abs_fn = Relative_path.to_absolute fn in
+  let ic = Unix.open_process_in ("hackificator -split_vars " ^ abs_fn) in
   (match input_line ic with
     | "Split lines:" -> ()
     | wtf -> failwith ("Unexpected output from hackificator:\n" ^ wtf));
@@ -278,29 +284,29 @@ let check_no_error genv env =
 (*****************************************************************************)
 (* Entry point *)
 (*****************************************************************************)
-open Utils
 open ServerEnv
 
 (* Selects the files we want to annotate. *)
 let select_files env dirname =
-  SMap.fold begin fun fn defs acc ->
-    if is_prefix_dir dirname fn
-    then SMap.add fn defs acc
+  Relative_path.Map.fold begin fun fn defs acc ->
+    if is_prefix_dir dirname (Relative_path.to_absolute fn)
+    then Relative_path.Map.add fn defs acc
     else acc
-  end env.files_info SMap.empty
+  end env.files_info Relative_path.Map.empty
 
 (* Infers the types where annotations are missing. *)
-let infer_types genv env root dirname = 
-  let fast = select_files env dirname in  
+let infer_types genv env dirname =
+  let fast = select_files env dirname in
   let fast = FileInfo.simplify_fast fast in
-  Typing_suggest_service.go genv.workers fast
+  Typing_suggest_service.go genv.workers env.nenv fast
 
 (* Tries to apply the patches one by one, rolls back if it failed. *)
-let apply_patches tried_patches genv env continue patches =
-  let tenv = Typing_env.empty "" in
-  file_data := SMap.empty;
-  SMap.iter begin fun fn patchl ->
-    List.iter begin fun (line, k, type_ as patch) ->
+let apply_patches tried_patches (genv:ServerEnv.genv) env continue patches =
+  let tcopt = ServerEnv.typechecker_options !env in
+  let tenv = Typing_env.empty tcopt Relative_path.default in
+  file_data := Relative_path.Map.empty;
+  Relative_path.Map.iter begin fun fn patchl ->
+    List.iter patchl begin fun (line, k, type_ as patch) ->
       if Hashtbl.mem tried_patches (fn, patch) then () else
       let go patch =
         let errors, new_env = apply_patch genv !env fn patch in
@@ -317,22 +323,22 @@ let apply_patches tried_patches genv env continue patches =
           go (add_return line type_string)
       | Typing_suggest.Kmember name ->
           go (add_member name line type_string)
-    end patchl
+    end
   end patches;
   ()
 
 (* Main entry point *)
-let go genv env root modified dirname_path =
-  let dirname = Path.string_of_path dirname_path in
-  let env = ref (ServerInit.init genv env modified) in
+let go (genv:ServerEnv.genv) env dirname_path =
+  let dirname = Path.to_string dirname_path in
+  let env = ref env in
   let continue = ref false in
   check_no_error genv !env;
   let tried_patches = Hashtbl.create 23 in
-  let patches = infer_types genv !env root dirname in
+  let patches = infer_types genv !env dirname in
   apply_patches tried_patches genv env continue patches;
   while !continue do
     continue := false;
-    let patches = infer_types genv !env root dirname in
+    let patches = infer_types genv !env dirname in
     apply_patches tried_patches genv env continue patches;
   done;
   ()

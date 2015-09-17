@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,39 +17,20 @@
 #ifndef incl_HPHP_BUILTIN_FUNCTIONS_H_
 #define incl_HPHP_BUILTIN_FUNCTIONS_H_
 
-#include "hphp/runtime/base/execution-context.h"
-#include "hphp/runtime/base/request-event-handler.h"
-#include "hphp/runtime/base/types.h"
-#include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/base/intercept.h"
-#include "hphp/runtime/base/runtime-error.h"
-#include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/base/variable-unserializer.h"
-#include "hphp/runtime/base/request-local.h"
-#include "hphp/runtime/base/strings.h"
-#include "hphp/util/functional.h"
 #include "hphp/runtime/base/type-conversions.h"
-
-#if defined(__APPLE__) || defined(__USE_BSD)
-/**
- * We don't actually use param.h in this file,
- * but other files which use us do, and we want
- * to enforce clearing of the isset macro from
- * that header by handling the header now
- * and wiping it out.
- */
-# include <sys/param.h>
-#include <algorithm>
-# ifdef isset
-#  undef isset
-# endif
-#endif
+#include "hphp/runtime/base/type-variant.h"
+#include "hphp/runtime/base/variable-unserializer.h"
+#include "hphp/runtime/vm/bytecode.h"
+#include "hphp/util/functional.h"
+#include "hphp/util/portability.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 extern const StaticString s_self;
 extern const StaticString s_parent;
 extern const StaticString s_static;
+
+extern const StaticString s_cmpWithCollection;
 
 ///////////////////////////////////////////////////////////////////////////////
 // operators
@@ -65,7 +46,6 @@ String concat4(const String& s1, const String& s2, const String& s3,
 ///////////////////////////////////////////////////////////////////////////////
 
 void NEVER_INLINE throw_invalid_property_name(const String& name);
-void NEVER_INLINE throw_null_object_prop();
 void NEVER_INLINE throw_null_get_object_prop();
 void NEVER_INLINE raise_null_object_prop();
 void throw_exception(const Object& e);
@@ -80,7 +60,16 @@ inline bool is_int(const Variant& v)    { return v.isInteger();}
 inline bool is_double(const Variant& v) { return v.is(KindOfDouble);}
 inline bool is_string(const Variant& v) { return v.isString();}
 inline bool is_array(const Variant& v)  { return v.is(KindOfArray);}
-inline bool is_object(const Variant& var) { return var.is(KindOfObject); }
+
+inline bool is_object(const Variant& var) {
+  if (!var.is(KindOfObject)) {
+    return false;
+  }
+  auto cls = var.toObject().get()->getVMClass();
+  auto incompleteClass = SystemLib::s___PHP_Incomplete_ClassClass;
+  return cls != incompleteClass;
+}
+
 inline bool is_empty_string(const Variant& v) {
   return v.isString() && v.getStringData()->empty();
 }
@@ -88,10 +77,16 @@ inline bool is_empty_string(const Variant& v) {
 ///////////////////////////////////////////////////////////////////////////////
 // misc functions
 
+/*
+ * Semantics of is_callable defined here:
+ * http://docs.hhvm.com/manual/en/function.is-callable.php
+ */
+bool is_callable(const Variant& v, bool syntax_only, RefData* name);
+/*
+ * Equivalent to is_callable(v, false, nullptr)
+ */
+bool is_callable(const Variant& v);
 bool array_is_valid_callback(const Array& arr);
-
-Variant f_call_user_func_array(const Variant& function, const Array& params,
-                               bool bound = false);
 
 const HPHP::Func*
 vm_decode_function(const Variant& function,
@@ -121,21 +116,24 @@ Variant invoke_static_method(const String& s, const String& method,
 Variant o_invoke_failed(const char *cls, const char *meth,
                         bool fatal = true);
 
+bool is_constructor_name(const char* func);
 void throw_instance_method_fatal(const char *name);
 
-void throw_iterator_not_valid() ATTRIBUTE_NORETURN;
-void throw_collection_modified() ATTRIBUTE_NORETURN;
-void throw_collection_property_exception() ATTRIBUTE_NORETURN;
-void throw_collection_compare_exception() ATTRIBUTE_NORETURN;
-void throw_param_is_not_container() ATTRIBUTE_NORETURN;
-void throw_cannot_modify_immutable_object(const char* className)
-  ATTRIBUTE_NORETURN;
-void check_collection_compare(ObjectData* obj);
-void check_collection_compare(ObjectData* obj1, ObjectData* obj2);
+ATTRIBUTE_NORETURN void throw_invalid_operation_exception(StringData*);
+ATTRIBUTE_NORETURN void throw_iterator_not_valid();
+ATTRIBUTE_NORETURN void throw_collection_modified();
+ATTRIBUTE_NORETURN void throw_collection_property_exception();
+ATTRIBUTE_NORETURN void throw_collection_compare_exception();
+ATTRIBUTE_NORETURN void throw_param_is_not_container();
+ATTRIBUTE_NORETURN
+void throw_cannot_modify_immutable_object(const char* className);
+void check_collection_compare(const ObjectData* obj);
+void check_collection_compare(const ObjectData* obj1, const ObjectData* obj2);
 void check_collection_cast_to_array();
 
 Object create_object_only(const String& s);
 Object create_object(const String& s, const Array &params, bool init = true);
+Object init_object(const String& s, const Array &params, ObjectData* o);
 
 /**
  * Argument count handling.
@@ -170,22 +168,17 @@ void handle_destructor_exception(const char* situation = "Destructor");
  *
  * Don't use in new code.
  */
-void throw_bad_type_exception(const char *fmt, ...) ATTRIBUTE_PRINTF(1,2);
-void throw_expected_array_exception();
-void throw_expected_array_or_collection_exception();
-void throw_invalid_argument(const char *fmt, ...) ATTRIBUTE_PRINTF(1,2)
-   __attribute__((__cold__));
+void throw_bad_type_exception(ATTRIBUTE_PRINTF_STRING const char *fmt, ...)
+  ATTRIBUTE_PRINTF(1,2);
+void throw_expected_array_exception(const char* fn = nullptr);
+void throw_expected_array_or_collection_exception(const char* fn = nullptr);
+void throw_invalid_argument(ATTRIBUTE_PRINTF_STRING const char *fmt, ...)
+  ATTRIBUTE_PRINTF(1,2) __attribute__((__cold__));
 
 /**
  * Unsetting ClassName::StaticProperty.
  */
 Variant throw_fatal_unset_static_property(const char *s, const char *prop);
-
-/**
- * Exceptions injected code throws
- */
-Exception* generate_request_timeout_exception();
-Exception* generate_memory_exceeded_exception();
 
 // unserializable default value arguments such as TimeStamp::Current()
 // are serialized as "\x01"

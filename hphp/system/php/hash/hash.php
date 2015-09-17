@@ -60,7 +60,7 @@ function hash_file(string $algo, string $filename,
  *                  of the message digest is returned.
  */
 <<__Native>>
-function hash_final(resource $context, bool $raw_output = false): string;
+function hash_final(resource $context, bool $raw_output = false): mixed;
 
 /**
  * hash() - http://php.net/function.hash
@@ -244,7 +244,7 @@ function hash_update_stream(mixed $context, mixed $handle,
  * @return resource - Returns a copy of Hashing Context resource.
  */
 <<__Native>>
-function hash_copy(resource $context): resource;
+function hash_copy(resource $context): mixed;
 
 /**
  * hash_pbkdf2 - http://php.net/function.hash-pbkdf2.php

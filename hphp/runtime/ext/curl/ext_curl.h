@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_CURL_H_
 #define incl_HPHP_EXT_CURL_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -217,8 +217,12 @@ extern const int64_t k_CURLOPT_RANGE;
 extern const int64_t k_CURLOPT_READDATA;
 extern const int64_t k_CURLOPT_READFUNCTION;
 extern const int64_t k_CURLOPT_REFERER;
+extern const int64_t k_CURLOPT_RESOLVE;
 extern const int64_t k_CURLOPT_RESUME_FROM;
 extern const int64_t k_CURLOPT_RETURNTRANSFER;
+#ifdef FACEBOOK
+extern const int64_t k_CURLOPT_SERVICE_NAME;
+#endif
 extern const int64_t k_CURLOPT_SSLCERT;
 extern const int64_t k_CURLOPT_SSLCERTPASSWD;
 extern const int64_t k_CURLOPT_SSLCERTTYPE;
@@ -266,6 +270,8 @@ extern const int64_t k_CURL_VERSION_LIBZ;
 extern const int64_t k_CURL_VERSION_SSL;
 
 Variant HHVM_FUNCTION(curl_init, const Variant& url = null_string);
+Variant HHVM_FUNCTION(curl_init_pooled, const String& poolName,
+                              const Variant& url = null_string);
 Variant HHVM_FUNCTION(curl_copy_handle, const Resource& ch);
 Variant HHVM_FUNCTION(curl_version, int uversion = k_CURLVERSION_NOW);
 bool HHVM_FUNCTION(curl_setopt, const Resource& ch, int option, const Variant& value);
@@ -275,6 +281,7 @@ Variant HHVM_FUNCTION(curl_exec, const Resource& ch);
 Variant HHVM_FUNCTION(curl_getinfo, const Resource& ch, int opt = 0);
 Variant HHVM_FUNCTION(curl_errno, const Resource& ch);
 Variant HHVM_FUNCTION(curl_error, const Resource& ch);
+String HHVM_FUNCTION(curl_strerror, int code);
 Variant HHVM_FUNCTION(curl_close, const Resource& ch);
 void HHVM_FUNCTION(curl_reset, const Resource& ch);
 Resource HHVM_FUNCTION(curl_multi_init);

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,11 +17,15 @@
 #ifndef incl_HPHP_VM_HHBC_H_
 #define incl_HPHP_VM_HHBC_H_
 
-#include "folly/Optional.h"
+#include <type_traits>
 
-#include "hphp/runtime/base/types.h"
+#include <folly/Optional.h>
+
 #include "hphp/runtime/base/repo-auth-type.h"
 #include "hphp/runtime/base/typed-value.h"
+#include "hphp/runtime/base/types.h"
+#include "hphp/util/functional.h"
+#include "hphp/util/hash-map-typedefs.h"
 
 namespace HPHP {
 
@@ -89,15 +93,31 @@ enum FlavorDesc {
   FV,   // Function parameter (cell or var)
   UV,   // Uninit
   CVV,  // Cell or Var argument
+  CRV,  // Cell or Return value argument
+  CUV,  // Cell, or Uninit argument
   CVUV, // Cell, Var, or Uninit argument
 };
 
 enum InstrFlags {
-  NF = 0x0, // No flags
-  TF = 0x1, // Next instruction is not reachable via fall through or the
-            //   callee returning control
-  CF = 0x2, // Control flow instruction (branch, call, return, throw, etc)
-  FF = 0x4, // Instruction uses current FPI
+  /* No flags. */
+  NF = 0x0,
+
+  /* Terminal: next instruction is not reachable via fall through or the callee
+   * returning control. This includes instructions like Throw and Unwind that
+   * always throw exceptions. */
+  TF = 0x1,
+
+  /* Control flow: If this instruction finishes executing (doesn't throw an
+   * exception), vmpc() is not guaranteed to point to the next instruction in
+   * the bytecode stream. This does not take VM reentry into account, as that
+   * operation is part of the instruction that performed the reentry, and does
+   * not affect what vmpc() is set to after the instruction completes. */
+  CF = 0x2,
+
+  /* Instruction uses current FPI. */
+  FF = 0x4,
+
+  /* Shorthand for common combinations. */
   CF_TF = (CF | TF),
   CF_FF = (CF | FF)
 };
@@ -129,9 +149,9 @@ enum LocationCode {
   // Base is a function return value.
   LR,
 
-  NumLocationCodes,
-  InvalidLocationCode = NumLocationCodes
+  InvalidLocationCode, // keep this last
 };
+constexpr int NumLocationCodes = InvalidLocationCode;
 
 inline int numLocationCodeImms(LocationCode lc) {
   switch (lc) {
@@ -139,9 +159,10 @@ inline int numLocationCodeImms(LocationCode lc) {
     return 1;
   case LC: case LH: case LGC: case LNC: case LSC: case LR:
     return 0;
-  default:
-    not_reached();
+  case InvalidLocationCode:
+    break;
   }
+  not_reached();
 }
 
 inline int numLocationCodeStackVals(LocationCode lc) {
@@ -152,9 +173,10 @@ inline int numLocationCodeStackVals(LocationCode lc) {
     return 1;
   case LSC:
     return 2;
-  default:
-    not_reached();
+  case InvalidLocationCode:
+    break;
   }
+  not_reached();
 }
 
 // Returns string representation of `lc'.  (Pointer to internal static
@@ -167,6 +189,12 @@ const char* locationCodeString(LocationCode lc);
 // is more junk after the first two bytes.
 LocationCode parseLocationCode(const char* s);
 
+
+/**
+ * E - an element, $x['y']
+ * P - a property, $x->y
+ * Q - a NullSafe version of P, $x?->y
+ */
 enum MemberCode {
   // Element and property, consuming a cell from the stack.
   MEC,
@@ -179,6 +207,7 @@ enum MemberCode {
   // Element and property, using a string immediate
   MET,
   MPT,
+  MQT,
 
   // Element, using an int64 immediate
   MEI,
@@ -186,9 +215,10 @@ enum MemberCode {
   // New element operation.  (No real stack element.)
   MW,
 
-  NumMemberCodes,
-  InvalidMemberCode = NumMemberCodes
+  InvalidMemberCode,
 };
+
+constexpr int NumMemberCodes = InvalidMemberCode;
 
 enum MInstrAttr {
   MIA_none         = 0x00,
@@ -212,6 +242,8 @@ enum MInstrAttr {
     MIA_none
 #endif
 };
+
+std::string show(MInstrAttr);
 
 // MII(instr,  * in *M
 //     attrs,  operation attributes
@@ -286,7 +318,8 @@ struct MInstrInfo {
 };
 
 inline bool memberCodeHasImm(MemberCode mc) {
-  return mc == MEL || mc == MPL || mc == MET || mc == MPT || mc == MEI;
+  return mc == MEL || mc == MPL || mc == MET ||
+    mc == MPT || mc == MEI || mc == MQT;
 }
 
 inline bool memberCodeImmIsLoc(MemberCode mc) {
@@ -294,7 +327,7 @@ inline bool memberCodeImmIsLoc(MemberCode mc) {
 }
 
 inline bool memberCodeImmIsString(MemberCode mc) {
-  return mc == MET || mc == MPT;
+  return mc == MET || mc == MPT || mc == MQT;
 }
 
 inline bool memberCodeImmIsInt(MemberCode mc) {
@@ -457,6 +490,78 @@ enum class OODeclExistsOp : uint8_t {
 #undef OO_DECL_EXISTS_OP
 };
 
+#define OBJMETHOD_OPS                             \
+  OBJMETHOD_OP(NullThrows)                        \
+  OBJMETHOD_OP(NullSafe)
+
+enum class ObjMethodOp : uint8_t {
+#define OBJMETHOD_OP(x) x,
+  OBJMETHOD_OPS
+#undef OBJMETHOD_OP
+};
+
+#define SWITCH_KINDS                            \
+  KIND(Unbounded)                               \
+  KIND(Bounded)
+
+enum class SwitchKind : uint8_t {
+#define KIND(x) x,
+  SWITCH_KINDS
+#undef KIND
+};
+
+#define M_OP_FLAGS                                 \
+  FLAG(None,             0)                        \
+  FLAG(Warn,       (1 << 0))                       \
+  FLAG(Define,     (1 << 1))                       \
+  FLAG(Unset,      (1 << 2))                       \
+  FLAG(DefineReffy,(Define | (1 << 3)))            \
+  FLAG(WarnDefine, (Warn | Define))
+
+enum class MOpFlags : uint8_t {
+#define FLAG(name, val) name = val,
+  M_OP_FLAGS
+#undef FLAG
+};
+
+inline constexpr bool operator&(MOpFlags a, MOpFlags b) {
+  return uint8_t(a) & uint8_t(b);
+}
+
+inline MInstrAttr mOpFlagsToAttr(MOpFlags f) {
+  switch (f) {
+    case MOpFlags::None:        return MIA_none;
+    case MOpFlags::Warn:        return MIA_warn;
+    case MOpFlags::Define:      return MIA_define;
+    case MOpFlags::Unset:       return MIA_unset;
+    case MOpFlags::DefineReffy: return MInstrAttr(MIA_reffy | MIA_define);
+    case MOpFlags::WarnDefine:  return MInstrAttr(MIA_warn | MIA_define);
+  }
+  always_assert(false);
+}
+
+#define QUERY_M_OPS                               \
+  OP(CGet)                                        \
+  OP(Isset)                                       \
+  OP(Empty)
+
+enum class QueryMOp : uint8_t {
+#define OP(name) name,
+  QUERY_M_OPS
+#undef OP
+};
+
+#define PROP_ELEM_OPS                           \
+  OP(Prop)                                      \
+  OP(PropQ)                                     \
+  OP(Elem)
+
+enum class PropElemOp : uint8_t {
+#define OP(name) name,
+  PROP_ELEM_OPS
+#undef OP
+};
+
 constexpr int32_t kMaxConcatN = 4;
 
 //  name             immediates        inputs           outputs     flags
@@ -475,6 +580,7 @@ constexpr int32_t kMaxConcatN = 4;
   O(BoxRNop,         NA,               ONE(RV),         ONE(VV),    NF) \
   O(UnboxR,          NA,               ONE(RV),         ONE(CV),    NF) \
   O(UnboxRNop,       NA,               ONE(RV),         ONE(CV),    NF) \
+  O(RGetCNop,        NA,               ONE(CV),         ONE(RV),    NF) \
   O(Null,            NA,               NOV,             ONE(CV),    NF) \
   O(NullUninit,      NA,               NOV,             ONE(UV),    NF) \
   O(True,            NA,               NOV,             ONE(CV),    NF) \
@@ -485,9 +591,6 @@ constexpr int32_t kMaxConcatN = 4;
   O(Array,           ONE(AA),          NOV,             ONE(CV),    NF) \
   O(NewArray,        ONE(IVA),         NOV,             ONE(CV),    NF) \
   O(NewMixedArray,   ONE(IVA),         NOV,             ONE(CV),    NF) \
-  O(NewVArray,       ONE(IVA),         NOV,             ONE(CV),    NF) \
-  O(NewMIArray,      ONE(IVA),         NOV,             ONE(CV),    NF) \
-  O(NewMSArray,      ONE(IVA),         NOV,             ONE(CV),    NF) \
   O(NewLikeArrayL,   TWO(LA,IVA),      NOV,             ONE(CV),    NF) \
   O(NewPackedArray,  ONE(IVA),         CMANY,           ONE(CV),    NF) \
   O(NewStructArray,  ONE(VSA),         SMANY,           ONE(CV),    NF) \
@@ -495,8 +598,9 @@ constexpr int32_t kMaxConcatN = 4;
   O(AddElemV,        NA,               THREE(VV,CV,CV), ONE(CV),    NF) \
   O(AddNewElemC,     NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(AddNewElemV,     NA,               TWO(VV,CV),      ONE(CV),    NF) \
-  O(NewCol,          TWO(IVA,IVA),     NOV,             ONE(CV),    NF) \
-  O(ColAddElemC,     NA,               THREE(CV,CV,CV), ONE(CV),    NF) \
+  O(NewCol,          ONE(IVA),         NOV,             ONE(CV),    NF) \
+  O(ColFromArray,    ONE(IVA),         ONE(CV),         ONE(CV),    NF) \
+  O(MapAddElemC,     NA,               THREE(CV,CV,CV), ONE(CV),    NF) \
   O(ColAddNewElemC,  NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(Cns,             ONE(SA),          NOV,             ONE(CV),    NF) \
   O(CnsE,            ONE(SA),          NOV,             ONE(CV),    NF) \
@@ -517,7 +621,6 @@ constexpr int32_t kMaxConcatN = 4;
   O(Div,             NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(Mod,             NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(Pow,             NA,               TWO(CV,CV),      ONE(CV),    NF) \
-  O(Sqrt,            NA,               ONE(CV),         ONE(CV),    NF) \
   O(Xor,             NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(Not,             NA,               ONE(CV),         ONE(CV),    NF) \
   O(Same,            NA,               TWO(CV,CV),      ONE(CV),    NF) \
@@ -528,6 +631,7 @@ constexpr int32_t kMaxConcatN = 4;
   O(Lte,             NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(Gt,              NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(Gte,             NA,               TWO(CV,CV),      ONE(CV),    NF) \
+  O(Cmp,             NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(BitAnd,          NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(BitOr,           NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(BitXor,          NA,               TWO(CV,CV),      ONE(CV),    NF) \
@@ -545,19 +649,20 @@ constexpr int32_t kMaxConcatN = 4;
   O(Print,           NA,               ONE(CV),         ONE(CV),    NF) \
   O(Clone,           NA,               ONE(CV),         ONE(CV),    NF) \
   O(Exit,            NA,               ONE(CV),         ONE(CV),    NF) \
-  O(Fatal,           ONE(OA(FatalOp)), ONE(CV),         NOV,        CF_TF) \
+  O(Fatal,           ONE(OA(FatalOp)), ONE(CV),         NOV,        TF) \
   O(Jmp,             ONE(BA),          NOV,             NOV,        CF_TF) \
   O(JmpNS,           ONE(BA),          NOV,             NOV,        CF_TF) \
   O(JmpZ,            ONE(BA),          ONE(CV),         NOV,        CF) \
   O(JmpNZ,           ONE(BA),          ONE(CV),         NOV,        CF) \
-  O(Switch,          THREE(BLA,I64A,IVA),                               \
+  O(Switch,          THREE(BLA,I64A,OA(SwitchKind)),                    \
                                        ONE(CV),         NOV,        CF_TF) \
   O(SSwitch,         ONE(SLA),         ONE(CV),         NOV,        CF_TF) \
   O(RetC,            NA,               ONE(CV),         NOV,        CF_TF) \
   O(RetV,            NA,               ONE(VV),         NOV,        CF_TF) \
-  O(Unwind,          NA,               NOV,             NOV,        CF_TF) \
-  O(Throw,           NA,               ONE(CV),         NOV,        CF_TF) \
+  O(Unwind,          NA,               NOV,             NOV,        TF) \
+  O(Throw,           NA,               ONE(CV),         NOV,        TF) \
   O(CGetL,           ONE(LA),          NOV,             ONE(CV),    NF) \
+  O(CUGetL,          ONE(LA),          NOV,             ONE(CUV),   NF) \
   O(CGetL2,          ONE(LA),          NOV,             INS_1(CV),  NF) \
   O(CGetL3,          ONE(LA),          NOV,             INS_2(CV),  NF) \
   O(PushL,           ONE(LA),          NOV,             ONE(CV),    NF) \
@@ -572,6 +677,7 @@ constexpr int32_t kMaxConcatN = 4;
   O(VGetM,           ONE(MA),          MMANY,           ONE(VV),    NF) \
   O(AGetC,           NA,               ONE(CV),         ONE(AV),    NF) \
   O(AGetL,           ONE(LA),          NOV,             ONE(AV),    NF) \
+  O(GetMemoKey,      NA,               ONE(CV),         ONE(CV),    NF) \
   O(AKExists,        NA,               TWO(CV,CV),      ONE(CV),    NF) \
   O(IssetL,          ONE(LA),          NOV,             ONE(CV),    NF) \
   O(IssetN,          NA,               ONE(CV),         ONE(CV),    NF) \
@@ -622,8 +728,10 @@ constexpr int32_t kMaxConcatN = 4;
   O(FPushFunc,       ONE(IVA),         ONE(CV),         NOV,        NF) \
   O(FPushFuncD,      TWO(IVA,SA),      NOV,             NOV,        NF) \
   O(FPushFuncU,      THREE(IVA,SA,SA), NOV,             NOV,        NF) \
-  O(FPushObjMethod,  ONE(IVA),         TWO(CV,CV),      NOV,        NF) \
-  O(FPushObjMethodD, TWO(IVA,SA),      ONE(CV),         NOV,        NF) \
+  O(FPushObjMethod,  TWO(IVA,                                           \
+                       OA(ObjMethodOp)), TWO(CV,CV),    NOV,        NF) \
+  O(FPushObjMethodD, THREE(IVA,SA,                                      \
+                       OA(ObjMethodOp)), ONE(CV),       NOV,        NF) \
   O(FPushClsMethod,  ONE(IVA),         TWO(AV,CV),      NOV,        NF) \
   O(FPushClsMethodF, ONE(IVA),         TWO(AV,CV),      NOV,        NF) \
   O(FPushClsMethodD, THREE(IVA,SA,SA), NOV,             NOV,        NF) \
@@ -648,7 +756,7 @@ constexpr int32_t kMaxConcatN = 4;
   O(FCallD,          THREE(IVA,SA,SA), FMANY,           ONE(RV),    CF_FF) \
   O(FCallUnpack,     ONE(IVA),         FMANY,           ONE(RV),    CF_FF) \
   O(FCallArray,      NA,               ONE(FV),         ONE(RV),    CF_FF) \
-  O(FCallBuiltin,    THREE(IVA,IVA,SA),CVUMANY,         ONE(RV),    CF) \
+  O(FCallBuiltin,    THREE(IVA,IVA,SA),CVUMANY,         ONE(RV),    NF) \
   O(CufSafeArray,    NA,               THREE(RV,CV,CV), ONE(CV),    NF) \
   O(CufSafeReturn,   NA,               THREE(RV,CV,CV), ONE(RV),    NF) \
   O(IterInit,        THREE(IA,BA,LA),  ONE(CV),         NOV,        CF) \
@@ -696,58 +804,81 @@ constexpr int32_t kMaxConcatN = 4;
   O(Parent,          NA,               NOV,             ONE(AV),    NF) \
   O(LateBoundCls,    NA,               NOV,             ONE(AV),    NF) \
   O(NativeImpl,      NA,               NOV,             NOV,        CF_TF) \
-  O(CreateCl,        TWO(IVA,SA),      CVMANY,          ONE(CV),    NF) \
+  O(CreateCl,        TWO(IVA,SA),      CVUMANY,         ONE(CV),    NF) \
   O(CreateCont,      NA,               NOV,             ONE(CV),    CF) \
   O(ContEnter,       NA,               ONE(CV),         ONE(CV),    CF) \
   O(ContRaise,       NA,               ONE(CV),         ONE(CV),    CF) \
-  O(Yield,           NA,               ONE(CV),         ONE(CV),    NF) \
-  O(YieldK,          NA,               TWO(CV,CV),      ONE(CV),    NF) \
+  O(Yield,           NA,               ONE(CV),         ONE(CV),    CF) \
+  O(YieldK,          NA,               TWO(CV,CV),      ONE(CV),    CF) \
   O(ContCheck,       ONE(IVA),         NOV,             NOV,        NF) \
   O(ContValid,       NA,               NOV,             ONE(CV),    NF) \
   O(ContKey,         NA,               NOV,             ONE(CV),    NF) \
   O(ContCurrent,     NA,               NOV,             ONE(CV),    NF) \
-  O(Await,           ONE(IVA),         ONE(CV),         ONE(CV),    NF) \
-  O(Strlen,          NA,               ONE(CV),         ONE(CV),    NF) \
+  O(WHResult,        NA,               ONE(CV),         ONE(CV),    NF) \
+  O(Await,           ONE(IVA),         ONE(CV),         ONE(CV),    CF) \
   O(IncStat,         TWO(IVA,IVA),     NOV,             NOV,        NF) \
-  O(Abs,             NA,               ONE(CV),         ONE(CV),    NF) \
   O(Idx,             NA,               THREE(CV,CV,CV), ONE(CV),    NF) \
   O(ArrayIdx,        NA,               THREE(CV,CV,CV), ONE(CV),    NF) \
-  O(Floor,           NA,               ONE(CV),         ONE(CV),    NF) \
-  O(Ceil,            NA,               ONE(CV),         ONE(CV),    NF) \
   O(CheckProp,       ONE(SA),          NOV,             ONE(CV),    NF) \
   O(InitProp,        TWO(SA,                                            \
                        OA(InitPropOp)),ONE(CV),         NOV,        NF) \
-  O(Silence,         TWO(LA,OA(SilenceOp)),                          \
+  O(Silence,         TWO(LA,OA(SilenceOp)),                             \
                                        NOV,             NOV,        NF) \
+  O(BaseL,           TWO(LA, OA(MOpFlags)),                             \
+                                       NOV,             NOV,        NF) \
+  O(BaseH,           NA,               NOV,             NOV,        NF) \
+  O(DimL,            THREE(LA, OA(PropElemOp), OA(MOpFlags)),           \
+                                       NOV,             NOV,        NF) \
+  O(DimC,            THREE(IVA, OA(PropElemOp), OA(MOpFlags)),          \
+                                       NOV,             NOV,        NF) \
+  O(DimInt,          THREE(I64A, OA(PropElemOp), OA(MOpFlags)),         \
+                                       NOV,             NOV,        NF) \
+  O(DimStr,          THREE(SA, OA(PropElemOp), OA(MOpFlags)),           \
+                                       NOV,             NOV,        NF) \
+  O(QueryML,         FOUR(IVA, OA(QueryMOp), OA(PropElemOp), LA),       \
+                                       MFINAL,          ONE(CV),    NF) \
+  O(QueryMC,         THREE(IVA, OA(QueryMOp), OA(PropElemOp)),          \
+                                       MFINAL,          ONE(CV),    NF) \
+  O(QueryMInt,       FOUR(IVA, OA(QueryMOp), OA(PropElemOp), I64A),     \
+                                       MFINAL,          ONE(CV),    NF) \
+  O(QueryMStr,       FOUR(IVA, OA(QueryMOp), OA(PropElemOp), SA),       \
+                                       MFINAL,          ONE(CV),    NF) \
   O(HighInvalid,     NA,               NOV,             NOV,        NF)
 
-enum class Op : uint8_t {
+enum class Op : uint16_t {
 #define O(name, ...) name,
   OPCODES
 #undef O
 };
-auto constexpr Op_count = uint8_t(Op::HighInvalid) + 1;
+auto constexpr Op_count = size_t(Op::HighInvalid) + 1;
 
-/* Also put Op* in the enclosing namespace, to avoid having to change
- * every existing usage site of the enum values. */
+/*
+ * Also put Op* in the enclosing namespace, to avoid having to change every
+ * existing usage site of the enum values.
+ */
 #define O(name, ...) UNUSED auto constexpr Op##name = Op::name;
   OPCODES
 #undef O
 
-inline constexpr bool operator<(Op a, Op b) { return uint8_t(a) < uint8_t(b); }
-inline constexpr bool operator>(Op a, Op b) { return uint8_t(a) > uint8_t(b); }
+// These are comparable by default under MSVC.
+#ifndef _MSC_VER
+inline constexpr bool operator<(Op a, Op b) { return size_t(a) < size_t(b); }
+inline constexpr bool operator>(Op a, Op b) { return size_t(a) > size_t(b); }
 inline constexpr bool operator<=(Op a, Op b) {
-  return uint8_t(a) <= uint8_t(b);
+  return size_t(a) <= size_t(b);
 }
 inline constexpr bool operator>=(Op a, Op b) {
-  return uint8_t(a) >= uint8_t(b);
+  return size_t(a) >= size_t(b);
 }
+#endif
 
-inline bool isValidOpcode(Op op) {
+constexpr bool isValidOpcode(Op op) {
   return op > OpLowInvalid && op < OpHighInvalid;
 }
 
 const MInstrInfo& getMInstrInfo(Op op);
+
+MOpFlags getMOpFlags(QueryMOp op);
 
 enum AcoldOp {
   OpAcoldStart = Op_count-1,
@@ -811,6 +942,10 @@ struct ImmVector {
   const int32_t* vec32() const {
     return reinterpret_cast<const int32_t*>(m_start);
   }
+  folly::Range<const int32_t*> range32() const {
+    auto base = vec32();
+    return {base, base + size()};
+  }
   const StrVecItem* strvec() const {
     return reinterpret_cast<const StrVecItem*>(m_start);
   }
@@ -824,9 +959,9 @@ struct ImmVector {
   int32_t size() const { return m_length; }
 
   /*
-   * Returns the number of elements on the execution stack that this
-   * vector will need to access.  (Includes stack elements for both
-   * the base and members.)
+   * Returns the number of elements on the execution stack that this vector
+   * will need to access.  Includes stack elements for both the base and
+   * members, but not the RHS of any set operations.
    */
   int numStackValues() const { return m_numStack; }
 
@@ -852,7 +987,7 @@ private:
 };
 
 // Must be an opcode that actually has an ImmVector.
-ImmVector getImmVector(const Op* opcode);
+ImmVector getImmVector(PC opcode);
 
 struct MInstrLocation {
   LocationCode lcode;
@@ -864,7 +999,7 @@ struct MInstrLocation {
     return count;
   }
 };
-MInstrLocation getMLocation(const Op* opcode);
+MInstrLocation getMLocation(PC opcode);
 
 struct MVectorItem {
   MemberCode mcode;
@@ -875,16 +1010,16 @@ struct MVectorItem {
   }
 };
 bool hasMVector(Op op);
-std::vector<MVectorItem> getMVector(const Op* opcode);
+std::vector<MVectorItem> getMVector(PC opcode);
 
 // Some decoding helper functions.
 int numImmediates(Op opcode);
 ArgType immType(Op opcode, int idx);
-int immSize(const Op* opcode, int idx);
+int immSize(PC opcode, int idx);
 bool immIsVector(Op opcode, int idx);
 bool hasImmVector(Op opcode);
-int instrLen(const Op* opcode);
-int numSuccs(const Op* opcode);
+int instrLen(PC opcode);
+int numSuccs(PC opcode);
 bool pushesActRec(Op opcode);
 
 /*
@@ -892,10 +1027,10 @@ bool pushesActRec(Op opcode);
  *
  * Don't use with RATA immediates.
  */
-ArgUnion getImm(const Op* opcode, int idx);
+ArgUnion getImm(PC opcode, int idx);
 
 // Don't use this with variable-sized immediates!
-ArgUnion* getImmPtr(const Op* opcode, int idx);
+ArgUnion* getImmPtr(PC opcode, int idx);
 
 // Pass a pointer to the pointer to the immediate; this function will advance
 // the pointer past the immediate
@@ -930,7 +1065,7 @@ void encodeToVector(std::vector<unsigned char>& vec, T val) {
 
 void staticStreamer(const TypedValue* tv, std::stringstream& out);
 
-std::string instrToString(const Op* it, const Unit* u = nullptr);
+std::string instrToString(PC it, const Unit* u = nullptr);
 void staticArrayStreamer(ArrayData*, std::ostream&);
 
 /*
@@ -945,6 +1080,11 @@ const char* subopToName(IncDecOp);
 const char* subopToName(BareThisOp);
 const char* subopToName(SilenceOp);
 const char* subopToName(OODeclExistsOp);
+const char* subopToName(ObjMethodOp);
+const char* subopToName(SwitchKind);
+const char* subopToName(MOpFlags);
+const char* subopToName(QueryMOp);
+const char* subopToName(PropElemOp);
 
 /*
  * Try to parse a string into a subop name of a given type.
@@ -958,11 +1098,18 @@ folly::Optional<SubOpType> nameToSubop(const char*);
 // returns a pointer to the location within the bytecode containing the jump
 //   Offset, or NULL if the instruction cannot jump. Note that this offset is
 //   relative to the current instruction.
-Offset* instrJumpOffset(const Op* instr);
+Offset* instrJumpOffset(PC instr);
 
 // returns absolute address of target, or InvalidAbsoluteOffset if instruction
 //   cannot jump
-Offset instrJumpTarget(const Op* instrs, Offset pos);
+Offset instrJumpTarget(PC instrs, Offset pos);
+
+/*
+ * Returns the set of bytecode offsets for the instructions that may
+ * be executed immediately after opc.
+ */
+using OffsetSet = hphp_hash_set<Offset>;
+OffsetSet instrSuccOffsets(PC opc, const Unit* unit);
 
 struct StackTransInfo {
   enum class Kind {
@@ -970,12 +1117,27 @@ struct StackTransInfo {
     InsertMid
   };
   Kind kind;
-  int numPops;
-  int numPushes;
-  int pos;
+  int numPops;   // only for PushPop
+  int numPushes; // only for PushPop
+  int pos;       // only for InsertMid
 };
 
+/*
+ * Some CF instructions can be treated as non-CF instructions for most analysis
+ * purposes, such as bytecode verification and HHBBC. These instructions change
+ * vmpc() to point somewhere in a different function, but the runtime
+ * guarantees that if excution ever returns to the original frame, it will be
+ * at the location immediately following the instruction in question. This
+ * creates the illusion that the instruction fell through normally to the
+ * instruction after it, within the context of its execution frame.
+ *
+ * The canonical example of this behavior is the FCall instruction, so we use
+ * "non-call control flow" to describe the set of CF instruction that do not
+ * exhibit this behavior. This function returns true if `opcode' is a non-call
+ * control flow instruction.
+ */
 bool instrIsNonCallControlFlow(Op opcode);
+
 bool instrHasConditionalBranch(Op opcode);
 bool instrAllowsFallThru(Op opcode);
 bool instrReadsCurrentFpi(Op opcode);
@@ -986,28 +1148,44 @@ constexpr InstrFlags instrFlagsData[] = {
 #undef O
 };
 
-constexpr inline InstrFlags instrFlags(Op opcode) {
-  return instrFlagsData[uint8_t(opcode)];
+constexpr InstrFlags instrFlags(Op opcode) {
+  return instrFlagsData[size_t(opcode)];
 }
 
-constexpr inline bool instrIsControlFlow(Op opcode) {
+constexpr bool instrIsControlFlow(Op opcode) {
   return (instrFlags(opcode) & CF) != 0;
 }
 
-constexpr inline bool isUnconditionalJmp(Op opcode) {
+constexpr bool isUnconditionalJmp(Op opcode) {
   return opcode == Op::Jmp || opcode == Op::JmpNS;
 }
 
-constexpr inline bool isConditionalJmp(Op opcode) {
+constexpr bool isConditionalJmp(Op opcode) {
   return opcode == Op::JmpZ || opcode == Op::JmpNZ;
 }
 
-constexpr inline bool isJmp(Op opcode) {
+constexpr bool isJmp(Op opcode) {
   return opcode >= Op::Jmp && opcode <= Op::JmpNZ;
 }
 
-inline bool isFPush(Op opcode) {
+constexpr bool isFPush(Op opcode) {
   return opcode >= OpFPushFunc && opcode <= OpFPushCufSafe;
+}
+
+constexpr bool isFPushCuf(Op opcode) {
+  return opcode >= OpFPushCufIter && opcode <= OpFPushCufSafe;
+}
+
+constexpr bool isFPushClsMethod(Op opcode) {
+  return opcode >= OpFPushClsMethod && opcode <= OpFPushClsMethodD;
+}
+
+constexpr bool isFPushCtor(Op opcode) {
+  return opcode == OpFPushCtor || opcode == OpFPushCtorD;
+}
+
+constexpr bool isFPushFunc(Op opcode) {
+  return opcode >= OpFPushFunc && opcode <= OpFPushFuncU;
 }
 
 inline bool isFCallStar(Op opcode) {
@@ -1041,16 +1219,26 @@ inline bool isFPassStar(Op opcode) {
   }
 }
 
-inline bool isLiteral(Op op) {
+constexpr bool isRet(Op op) {
+  return op == OpRetC || op == OpRetV;
+}
+
+constexpr bool isReturnish(Op op) {
+  return isRet(op) || op == Op::NativeImpl;
+}
+
+constexpr bool isSwitch(Op op) {
+  return op == OpSwitch || op == OpSSwitch;
+}
+
+constexpr bool isTypeAssert(Op op) {
+  return op == OpAssertRATL || op == OpAssertRATStk;
+}
+
+inline bool isMemberBaseOp(Op op) {
   switch (op) {
-    case OpNull:
-    case OpNullUninit:
-    case OpTrue:
-    case OpFalse:
-    case OpInt:
-    case OpDouble:
-    case OpString:
-    case OpArray:
+    case OpBaseL:
+    case OpBaseH:
       return true;
 
     default:
@@ -1058,11 +1246,12 @@ inline bool isLiteral(Op op) {
   }
 }
 
-inline bool isThisSelfOrParent(Op op) {
+inline bool isMemberDimOp(Op op) {
   switch (op) {
-    case OpThis:
-    case OpSelf:
-    case OpParent:
+    case OpDimL:
+    case OpDimC:
+    case OpDimInt:
+    case OpDimStr:
       return true;
 
     default:
@@ -1070,10 +1259,12 @@ inline bool isThisSelfOrParent(Op op) {
   }
 }
 
-inline bool isRet(Op op) {
+inline bool isMemberFinalOp(Op op) {
   switch (op) {
-    case OpRetC:
-    case OpRetV:
+    case OpQueryML:
+    case OpQueryMC:
+    case OpQueryMInt:
+    case OpQueryMStr:
       return true;
 
     default:
@@ -1081,85 +1272,33 @@ inline bool isRet(Op op) {
   }
 }
 
-inline bool isSwitch(Op op) {
-  switch (op) {
-    case OpSwitch:
-    case OpSSwitch:
-      return true;
+int instrNumPops(PC opcode);
+int instrNumPushes(PC opcode);
+FlavorDesc instrInputFlavor(PC op, uint32_t idx);
+StackTransInfo instrStackTransInfo(PC opcode);
+int instrSpToArDelta(PC opcode);
 
-    default:
-      return false;
-  }
+constexpr bool mcodeIsLiteral(MemberCode mcode) {
+  return mcode == MET || mcode == MEI || mcode == MPT || mcode == MQT;
 }
 
-inline bool isTypeAssert(Op op) {
-  switch (op) {
-    case OpAssertRATL:
-    case OpAssertRATStk:
-      return true;
-
-    default:
-      return false;
-  }
+constexpr bool mcodeIsProp(MemberCode mcode) {
+  return mcode == MPC || mcode == MPL || mcode == MPT || mcode == MQT;
 }
 
-template<typename Out, typename In>
-Out& readData(In*& it) {
-  Out& r = *(Out*)it;
-  // XXX: illegal wrt strict-aliasing?
-  (char*&)it += sizeof(Out);
-  return r;
-}
-
-template<typename L>
-void foreachSwitchTarget(const Op* op, L func) {
-  assert(isSwitch(*op));
-  bool isStr = readData<Op>(op) == OpSSwitch;
-  int32_t size = readData<int32_t>(op);
-  for (int i = 0; i < size; ++i) {
-    if (isStr) readData<Id>(op);
-    func(readData<Offset>(op));
-  }
-}
-
-template<typename L>
-void foreachSwitchString(const Op* op, L func) {
-  assert(*op == Op::SSwitch);
-  readData<Op>(op);
-  int32_t size = readData<int32_t>(op) - 1; // the last item is the default
-  for (int i = 0; i < size; ++i) {
-    func(readData<Id>(op));
-    readData<Offset>(op);
-  }
-}
-
-int instrNumPops(const Op* opcode);
-int instrNumPushes(const Op* opcode);
-FlavorDesc instrInputFlavor(const Op* op, uint32_t idx);
-StackTransInfo instrStackTransInfo(const Op* opcode);
-int instrSpToArDelta(const Op* opcode);
-
-inline bool mcodeIsLiteral(MemberCode mcode) {
-  return mcode == MET || mcode == MEI || mcode == MPT;
-}
-
-inline bool mcodeIsProp(MemberCode mcode) {
-  return mcode == MPC || mcode == MPL || mcode == MPT;
-}
-
-inline bool mcodeIsElem(MemberCode mcode) {
+constexpr bool mcodeIsElem(MemberCode mcode) {
   return mcode == MEC || mcode == MEL || mcode == MET || mcode == MEI;
 }
 
-inline bool mcodeMaybeArrayStringKey(MemberCode mcode) {
+constexpr bool mcodeMaybeArrayStringKey(MemberCode mcode) {
   return mcode == MEC || mcode == MEL || mcode == MET;
 }
 
-inline bool mcodeMaybeArrayIntKey(MemberCode mcode) {
+constexpr bool mcodeMaybeArrayIntKey(MemberCode mcode) {
   return mcode == MEC || mcode == MEL || mcode == MEI;
 }
 
-inline bool mcodeMaybeVectorKey(MemberCode mcode) {
+constexpr bool mcodeMaybeVectorKey(MemberCode mcode) {
   return mcode == MEC || mcode == MEL || mcode == MEI;
 }
 

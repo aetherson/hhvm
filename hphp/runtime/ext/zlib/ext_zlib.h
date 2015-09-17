@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -18,13 +18,13 @@
 #ifndef incl_HPHP_EXT_ZLIB_H_
 #define incl_HPHP_EXT_ZLIB_H_
 
-#include "hphp/runtime/base/base-includes.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/ext/extension.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 
 namespace HPHP {
 
-extern const long k_FORCE_GZIP;
-extern const long k_FORCE_DEFLATE;
+extern const int64_t k_FORCE_GZIP;
+extern const int64_t k_FORCE_DEFLATE;
 
 ///////////////////////////////////////////////////////////////////////////////
 // zlib functions

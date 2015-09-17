@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,12 +16,15 @@
 #ifndef incl_HPHP_PROXY_ARRAY_H
 #define incl_HPHP_PROXY_ARRAY_H
 
-#include "hphp/runtime/vm/name-value-table.h"
 #include "hphp/runtime/base/array-data.h"
+#include "hphp/runtime/base/req-ptr.h"
+#include "hphp/runtime/base/type-variant.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
+
+struct RefData;
 
 /*
  * A proxy for an underlying ArrayData. The Zend compatibility layer needs
@@ -35,7 +38,7 @@ namespace HPHP {
  *
  * TODO: rename to ZendArray
  */
-struct ProxyArray : public ArrayData {
+struct ProxyArray : ArrayData {
   static ProxyArray* Make(ArrayData*);
 
 public:
@@ -112,14 +115,14 @@ private:
    * Zend compat caller. This will retrieve the underlying data pointer from
    * the ZendCustomElement resource, if applicable.
    */
-  void * elementToData(Variant* v) const;
+  void* elementToData(Variant* v) const;
 
   /**
    * Make a ZendCustomElement resource wrapping the given data block. If pDest
    * is non-null, it will be set to the newly-allocated location for the block.
    */
-  ResourceData * makeElementResource(void *pData, uint nDataSize,
-                                     void **pDest) const;
+  req::ptr<ResourceData> makeElementResource(void *pData, uint32_t nDataSize,
+                                             void **pDest) const;
 
   DtorFunc m_destructor;
 
@@ -179,7 +182,7 @@ public:
   static bool AdvanceMArrayIter(ArrayData*, MArrayIter&);
   static bool IsVectorData(const ArrayData*);
 
-  static ArrayData* EscalateForSort(ArrayData*);
+  static ArrayData* EscalateForSort(ArrayData*, SortFunction);
   static void Ksort(ArrayData*, int sort_flags, bool ascending);
   static void Sort(ArrayData*, int sort_flags, bool ascending);
   static void Asort(ArrayData*, int sort_flags, bool ascending);
@@ -192,7 +195,7 @@ public:
   static ArrayData* ZAppend(ArrayData* ad, RefData* v, int64_t* key_ptr);
 
   static ArrayData* CopyWithStrongIterators(const ArrayData*);
-  static ArrayData* NonSmartCopy(const ArrayData*);
+  static ArrayData* CopyStatic(const ArrayData*);
 
 private:
   static ProxyArray* asProxyArray(ArrayData* ad);
@@ -201,6 +204,11 @@ private:
 
   static ArrayData* innerArr(const ArrayData* ad);
   friend class c_AwaitAllWaitHandle;
+
+public:
+  template<class F> void scan(F& mark) const {
+    mark(m_ref);
+  }
 
 private:
   // The inner array. This is mutable since zend_hash_find() etc. has a
@@ -223,8 +231,8 @@ void ProxyArray::proxySet(K k,
       *dest = (void*)(&r->nvGet(k)->m_data.pref);
     }
   } else {
-    ResourceData * elt = makeElementResource(data, data_size, dest);
-    r = innerArr(this)->set(k, elt, false);
+    auto elt = makeElementResource(data, data_size, dest);
+    r = innerArr(this)->set(k, Variant(std::move(elt)), false);
   }
   reseatable(this, r);
 }

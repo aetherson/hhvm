@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -208,8 +208,8 @@ std::string Macro::desc(const char *indent) {
 
 void Macro::load(const IniSetting::Map& ini, Hdf node) {
   TRACE(2, "Macro::load\n");
-  m_name = Config::GetString(ini, node["name"]);
-  Config::Get(ini, node["cmds"], m_cmds);
+  Config::Bind(m_name, ini, node["name"]);
+  Config::Bind(m_cmds, ini, node["cmds"]);
 }
 
 void Macro::save(std::ostream &stream, int key) {
@@ -340,6 +340,7 @@ static void get_color(int tokid, int prev, int next,
     COLOR_ENTRY(T_IS_EQUAL,                 None        );
     COLOR_ENTRY(T_IS_GREATER_OR_EQUAL,      None        );
     COLOR_ENTRY(T_IS_SMALLER_OR_EQUAL,      None        );
+    COLOR_ENTRY(T_SPACESHIP,                None        );
     COLOR_ENTRY(T_SR,                       None        );
     COLOR_ENTRY(T_SL,                       None        );
     COLOR_ENTRY(T_DEC,                      None        );
@@ -487,8 +488,8 @@ string check_char_highlight(int lineFocus0, int charFocus0,
   TRACE(7, "debugger_base:check_char_highlight\n");
   if (DebuggerClient::HighlightBgColor &&
       lineFocus0 && charFocus0 && lineFocus1 && charFocus1 &&
-      loc.line0 * 1000 + loc.char0 >= lineFocus0 * 1000 + charFocus0 &&
-      loc.line1 * 1000 + loc.char1 <= lineFocus1 * 1000 + charFocus1) {
+      loc.r.line0 * 1000 + loc.r.char0 >= lineFocus0 * 1000 + charFocus0 &&
+      loc.r.line1 * 1000 + loc.r.char1 <= lineFocus1 * 1000 + charFocus1) {
     return add_bgcolor(DebuggerClient::HighlightForeColor,
                        DebuggerClient::HighlightBgColor);
   }

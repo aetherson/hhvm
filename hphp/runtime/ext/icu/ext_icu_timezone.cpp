@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -16,7 +16,7 @@
 */
 #include "hphp/runtime/ext/icu/ext_icu_timezone.h"
 #include "hphp/runtime/ext/icu/ext_icu_iterator.h"
-#include "hphp/runtime/ext/ext_datetime.h"
+#include "hphp/runtime/ext/datetime/ext_datetime.h"
 
 #include <unicode/locid.h>
 
@@ -53,8 +53,9 @@ icu::TimeZone* IntlTimeZone::ParseArg(const Variant& arg,
         ((cls == IntlTimeZone_Class) || cls->classof(IntlTimeZone_Class))) {
       return IntlTimeZone::Get(objarg.get())->timezone()->clone();
     }
-    if (auto dtz = objarg.getTyped<c_DateTimeZone>(true, true)) {
-      tzstr = dtz->t_getname();
+    if (objarg.instanceof(DateTimeZoneData::getClass())) {
+      auto* dtz = Native::data<DateTimeZoneData>(objarg);
+      tzstr = dtz->getName();
     } else {
       tzstr = arg.toString();
     }
@@ -168,7 +169,7 @@ static Variant HHVM_STATIC_METHOD(IntlTimeZone, getCanonicalID,
     return false;
   }
 
-  isSystemID = (bool)system;
+  isSystemID.assignIfRef((bool)system);
   error = U_ZERO_ERROR;
   String ret(u8(result, error));
   if (U_FAILURE(error)) {
@@ -267,8 +268,8 @@ static bool HHVM_METHOD(IntlTimeZone, getOffset,
     data->setError(error, "intltz_get_offset: error obtaining offset");
     return false;
   }
-  rawOffset = rawOff;
-  dstOffset = dstOff;
+  rawOffset.assignIfRef(rawOff);
+  dstOffset.assignIfRef(dstOff);
   return true;
 }
 
@@ -360,7 +361,7 @@ static Variant HHVM_STATIC_METHOD(IntlTimeZone, getRegion,
 // ICU >= 4.9
 
 #if U_ICU_VERSION_MAJOR_NUM * 10 + U_ICU_VERSION_MINOR_NUM >= 49
-static Variant HHVM_STATIC_METHOD(IntlTimeZone, getUnknown) {
+static Object HHVM_STATIC_METHOD(IntlTimeZone, getUnknown) {
   return IntlTimeZone::newInstance(
     const_cast<icu::TimeZone*>(&icu::TimeZone::getUnknown()), false);
 }

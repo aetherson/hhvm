@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,7 +18,8 @@
 #define incl_HPHP_VM_EDGE_H_
 
 #include <boost/intrusive/list.hpp>
-#include <boost/noncopyable.hpp>
+
+#include "hphp/runtime/vm/jit/containers.h"
 
 namespace HPHP { namespace jit {
 
@@ -30,14 +31,10 @@ struct IRInstruction;
  * successor block that maintains a list of predecessors of each block.
  * The predecessor list is updated by calling setTo().
  */
-struct Edge : private boost::noncopyable {
-  Edge() : m_to(nullptr), m_inst(nullptr) {}
-  Edge(const Edge& other) : m_to(nullptr), m_inst(nullptr) {
-    setTo(other.m_to);
-  }
-  explicit Edge(IRInstruction* inst, Block* to) : m_to(nullptr), m_inst(inst) {
-    setTo(to);
-  }
+struct Edge {
+  Edge() {}
+  Edge(const Edge&) = delete;
+  explicit Edge(IRInstruction* inst, Block* to) : m_inst(inst) { setTo(to); }
 
   // The instruction that owns this edge
   IRInstruction* inst() const { return m_inst; }
@@ -48,27 +45,31 @@ struct Edge : private boost::noncopyable {
   Block* to() const { return m_to; }
   void setTo(Block* to);
 
+  // The block this edge comes from.
+  Block* from() const;
+
   // set the to field but don't update any predecessor lists. Only used
   // for transient instructions.
-  void setTransientTo(Block* to) {
-    m_to = to;
-  }
+  void setTransientTo(Block* to) { m_to = to; }
 
   // Use to/from accessors to access or mutate pointers
-  Edge& operator=(const Edge& other) = delete;
+  Edge& operator=(const Edge&) = delete;
 
  private:
-  Block* m_to;
-  IRInstruction* m_inst;
+  Block* m_to{nullptr};
+  IRInstruction* m_inst{nullptr};
  public:
   boost::intrusive::list_member_hook<> m_node; // for Block::m_preds
 };
 
-typedef boost::intrusive::member_hook<Edge,
-                                      boost::intrusive::list_member_hook<>,
-                                      &Edge::m_node>
-        EdgeHookOption;
-typedef boost::intrusive::list<Edge, EdgeHookOption> EdgeList;
+using EdgeHookOption = boost::intrusive::member_hook<
+  Edge,
+  boost::intrusive::list_member_hook<>,
+  &Edge::m_node
+>;
+
+using EdgeList = boost::intrusive::list<Edge, EdgeHookOption>;
+using EdgeSet = jit::flat_set<Edge*>;
 
 }}
 

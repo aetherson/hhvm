@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,7 +17,8 @@
 #define incl_HPHP_RUNTIME_BASE_RDS_UTIL_H_
 
 #include "hphp/runtime/base/rds.h"
-#include "hphp/runtime/base/complex-types.h"
+#include "hphp/runtime/base/ref-data.h"
+#include "hphp/runtime/base/typed-value.h"
 
 namespace HPHP {
   struct NamedEntity;
@@ -25,7 +26,7 @@ namespace HPHP {
   struct StringData;
 }
 
-namespace HPHP { namespace RDS {
+namespace HPHP { namespace rds {
 
 //////////////////////////////////////////////////////////////////////
 
@@ -53,4 +54,3 @@ Link<TypedValue> bindClassConstant(const StringData* className,
 }}
 
 #endif
-

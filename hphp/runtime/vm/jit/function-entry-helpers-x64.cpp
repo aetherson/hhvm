@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -21,8 +21,7 @@
 
 #include "hphp/vixl/a64/simulator-a64.h"
 
-namespace HPHP {
-namespace jit {
+namespace HPHP { namespace jit {
 
 static void setupAfterPrologue(ActRec* fp, void* sp) {
   auto& regs = vmRegsUnsafe();
@@ -48,67 +47,61 @@ static void setupAfterPrologue(ActRec* fp, void* sp) {
   }
 }
 
-TCA fcallHelper(ActRec* ar, void* sp) {
+TCA fcallHelper(ActRec* ar) {
+  assert_native_stack_aligned();
   try {
-    assert(!ar->resumed());
-    TCA tca =
-      mcg->getFuncPrologue((Func*)ar->m_func, ar->numArgs(), ar);
-    if (tca) {
-      return tca;
+    assertx(!ar->resumed());
+    auto const tca = mcg->getFuncPrologue(
+      const_cast<Func*>(ar->m_func),
+      ar->numArgs(),
+      ar
+    );
+    if (tca) return tca;
+
+    VMRegAnchor _(ar);
+    if (doFCall(ar, vmpc())) {
+      return mcg->tx().uniqueStubs.resumeHelperRet;
     }
-    if (!ar->m_func->isClonedClosure()) {
-      /*
-       * If the func is a cloned closure, then the original
-       * closure has already run the prologue, and the prologues
-       * array is just being used as entry points for the
-       * dv funclets. Dont run the prologue again.
-       */
-      VMRegAnchor _(ar);
-      if (g_context->doFCall(ar, vmpc())) {
-        return mcg->tx().uniqueStubs.resumeHelperRet;
-      }
-      // We've been asked to skip the function body
-      // (fb_intercept). frame, stack and pc have
-      // already been fixed - flag that with a negative
-      // return address.
-      return (TCA)-ar->m_savedRip;
-    }
-    setupAfterPrologue(ar, sp);
-    assert(ar == vmRegsUnsafe().fp);
-    return mcg->tx().uniqueStubs.resumeHelper;
+    // We've been asked to skip the function body (fb_intercept).  The vmregs
+    // have already been fixed; indicate this with a nullptr return.
+    return nullptr;
   } catch (...) {
-    /*
-      The return address is set to __fcallHelperThunk,
-      which has no unwind information. Its "logically"
-      part of the tc, but the c++ unwinder wont know
-      that. So point our return address at the called
-      function's return address (which will be in the
-      tc).
-      Note that the registers really are clean - we
-      cleaned them in the try above - so we just
-      have to tell the unwinder that.
-    */
-    DECLARE_FRAME_POINTER(framePtr);
+    // We cleaned the VM registers above, but we need to tell the unwinder.
     tl_regState = VMRegState::CLEAN;
-    framePtr->m_savedRip = ar->m_savedRip;
+    if (ar < vmfp()) {
+      // We're in a really weird state; fcallHelper's frame points to
+      // ar, but ar isn't active yet (it probably failed the stack
+      // check).
+      // Make it look like we were called directly from ar's caller
+      DECLARE_FRAME_POINTER(framePtr);
+      framePtr->m_sfp = ar->m_sfp;
+      framePtr->m_savedRip = ar->m_savedRip;
+
+      while (vmsp() < static_cast<void*>(ar)) {
+        vmStack().popTV();
+      }
+      vmStack().popAR();
+    }
     throw;
   }
 }
 
 /*
- * This is used to generate an entry point for the entry
- * to a function, after the prologue has run.
+ * This is used to generate an entry point for the entry to a function, after
+ * the prologue has run.
  */
-TCA funcBodyHelper(ActRec* fp, void* sp) {
+TCA funcBodyHelper(ActRec* fp) {
+  assert_native_stack_aligned();
+  void* const sp = reinterpret_cast<Cell*>(fp) - fp->func()->numSlotsInFrame();
   setupAfterPrologue(fp, sp);
   tl_regState = VMRegState::CLEAN;
-  Func* func = const_cast<Func*>(fp->m_func);
 
-  TCA tca = mcg->getCallArrayPrologue(func);
-
+  auto const func = const_cast<Func*>(fp->m_func);
+  auto tca = mcg->getFuncBody(func);
   if (!tca) {
     tca = mcg->tx().uniqueStubs.resumeHelper;
   }
+
   tl_regState = VMRegState::DIRTY;
   return tca;
 }
@@ -141,4 +134,4 @@ int64_t decodeCufIterHelper(Iter* it, TypedValue func) {
   return true;
 }
 
-} } // HPHP::jit
+}}

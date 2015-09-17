@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,6 +18,8 @@
 #define incl_HPHP_CONCURRENCY_ASYNC_FUNC_H_
 
 #include <pthread.h>
+
+#include <folly/Portability.h>
 
 #include "hphp/util/synchronizable.h"
 #include "hphp/util/lock.h"
@@ -94,9 +96,17 @@ namespace HPHP {
  *   };
  *
  */
-class AsyncFuncImpl {
-public:
+struct AsyncFuncImpl {
   typedef void PFN_THREAD_FUNC(void *);
+
+  static const size_t kStackSizeMinimum =
+#ifdef FOLLY_SANITIZE_ADDRESS
+  // asan modifies the generated code in ways that cause abnormally high C++
+  // stack usage.
+  16 << 20;
+#else
+  8 << 20;
+#endif
 
   /**
    * The global static to feed into pthread_create(), and this will delegate
@@ -176,8 +186,6 @@ private:
   int m_node;
   bool m_stopped;
   bool m_noInit;
-
-  static const size_t m_stackSizeMinimum = 8388608; // 8MB
 
   /**
    * Called by ThreadFunc() to delegate the work.

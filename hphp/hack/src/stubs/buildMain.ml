@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,4 +8,6 @@
  *
  *)
 
-let go _ _ _ _ _ _ = ()
+let go _ _ _ _ = Some (fun _ _ _ _ -> ())
+let incremental_update _ _ _ _ = ()
+let get_all_targets () = []

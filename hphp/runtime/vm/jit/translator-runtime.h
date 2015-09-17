@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -13,55 +13,33 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #ifndef incl_HPHP_TRANSLATOR_RUNTIME_H_
 #define incl_HPHP_TRANSLATOR_RUNTIME_H_
 
-#include "hphp/runtime/base/types.h"
-#include "hphp/runtime/vm/jit/types.h"
-#include "hphp/runtime/vm/jit/abi-x64.h"
 #include "hphp/runtime/base/rds.h"
-#include "hphp/runtime/vm/type-constraint.h"
+#include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/vm/bytecode.h"
 
-namespace HPHP { namespace jit {
+#include "hphp/runtime/vm/jit/types.h"
 
+struct _Unwind_Exception;
 
-/* MInstrState is stored right above the reserved spill space on the C++
- * stack. */
-#define MISOFF(nm)                                         \
-  (offsetof(MInstrState, nm) + kReservedRSPSpillSpace)
-
-const size_t kReservedRSPMInstrStateSpace = RESERVED_STACK_MINSTR_STATE_SPACE;
-const size_t kReservedRSPSpillSpace       = RESERVED_STACK_SPILL_SPACE;
-const size_t kReservedRSPTotalSpace       = RESERVED_STACK_TOTAL_SPACE;
-
+namespace HPHP {
 //////////////////////////////////////////////////////////////////////
 
-struct MInstrState {
-  // Room for this structure is allocated on the stack before we
-  // make a call into the tc, so this first element is padding for
-  // the return address pushed by the call.
-  uintptr_t returnAddress;
-  uintptr_t padding; // keep the following TV's SSE friendly.
-  union {
-    // This space is used for both vector instructions and
-    // the return value of builtin functions that return by reference.
-    // Since we don't ever use the two at the same time, it is
-    // OK to use a union.
-    TypedValue tvScratch;
-    TypedValue tvBuiltinReturn;
-  };
-  TypedValue tvRef;
-  TypedValue tvRef2;
-  TypedValue tvResult;
-  TypedValue tvVal;
-} __attribute__((__aligned__(16)));
-static_assert(offsetof(MInstrState, tvScratch) % 16 == 0,
-              "MInstrState members require 16-byte alignment for SSE");
-static_assert(sizeof(MInstrState) - sizeof(uintptr_t) // return address
-              < kReservedRSPTotalSpace,
-              "MInstrState is too large for the rsp scratch space "
-              "in enterTCHelper");
+class Func;
+class c_Pair;
+class c_Vector;
+struct MInstrState;
+
+namespace jit {
+//////////////////////////////////////////////////////////////////////
+
+struct ClassProfile;
+struct TypeConstraint;
+
+//////////////////////////////////////////////////////////////////////
 
 /* Helper functions for translated code */
 
@@ -118,18 +96,26 @@ TypedValue incDecElem(TypedValue* base, TypedValue key,
  * complicated to inline
  */
 ArrayData* convCellToArrHelper(TypedValue tv);
+int64_t convObjToDblHelper(const ObjectData* o);
 int64_t convArrToDblHelper(ArrayData* a);
 int64_t convStrToDblHelper(const StringData* s);
+int64_t convResToDblHelper(const ResourceHdr* r);
 int64_t convCellToDblHelper(TypedValue tv);
 int64_t convArrToIntHelper(ArrayData* a);
 ObjectData* convCellToObjHelper(TypedValue tv);
 StringData* convDblToStrHelper(int64_t i);
 StringData* convIntToStrHelper(int64_t i);
 StringData* convObjToStrHelper(ObjectData* o);
-StringData* convResToStrHelper(ResourceData* o);
+StringData* convResToStrHelper(ResourceHdr* o);
 StringData* convCellToStrHelper(TypedValue tv);
 
-void raisePropertyOnNonObject();
+
+bool coerceCellToBoolHelper(TypedValue tv, int64_t argNum, const Func* func);
+int64_t coerceStrToDblHelper(StringData* sd, int64_t argNum, const Func* func);
+int64_t coerceCellToDblHelper(TypedValue tv, int64_t argNum, const Func* func);
+int64_t coerceStrToIntHelper(StringData* sd, int64_t argNum, const Func* func);
+int64_t coerceCellToIntHelper(TypedValue tv, int64_t argNum, const Func* func);
+
 void raiseUndefProp(ObjectData* base, const StringData* name);
 void raiseUndefVariable(StringData* nm);
 void VerifyParamTypeSlow(const Class* cls,
@@ -159,6 +145,9 @@ TypedValue arrayIdxS(ArrayData*, StringData*, TypedValue);
 TypedValue arrayIdxSi(ArrayData*, StringData*, TypedValue);
 
 TypedValue genericIdx(TypedValue, TypedValue, TypedValue);
+TypedValue mapIdx(ObjectData*, StringData*, TypedValue);
+
+TypedValue getMemoKeyHelper(TypedValue tv);
 
 int32_t arrayVsize(ArrayData*);
 
@@ -179,6 +168,8 @@ TCA sswitchHelperFast(const StringData* val, const SSwitchMap* table, TCA* def);
 
 void tv_release_generic(TypedValue* tv);
 
+void profileObjClassHelper(ClassProfile*, ObjectData*);
+
 Cell lookupCnsHelper(const TypedValue* tv,
                      StringData* nm,
                      bool error);
@@ -191,7 +182,7 @@ void lookupClsMethodHelper(Class* cls,
                            ActRec* fp);
 
 void checkFrame(ActRec* fp, Cell* sp, bool fullCheck, Offset bcOff);
-void traceCallback(ActRec* fp, Cell* sp, Offset pcOff, void* rip);
+void traceCallback(ActRec* fp, Cell* sp, Offset pcOff);
 
 void loadArrayFunctionContext(ArrayData*, ActRec* preLiveAR, ActRec* fp);
 void fpushCufHelperArray(ArrayData*, ActRec* preLiveAR, ActRec* fp);
@@ -208,7 +199,6 @@ TypedValue lookupClassConstantTv(TypedValue* cache,
                                  const StringData* cls,
                                  const StringData* cns);
 
-ObjectData* newColHelper(uint32_t type, uint32_t size);
 ObjectData* colAddNewElemCHelper(ObjectData* coll, TypedValue value);
 ObjectData* colAddElemCHelper(ObjectData* coll, TypedValue key,
                               TypedValue value);
@@ -222,7 +212,7 @@ void shuffleExtraArgsVariadicAndVV(ActRec* ar);
 
 void raiseMissingArgument(const Func* func, int got);
 
-RDS::Handle lookupClsRDSHandle(const StringData* name);
+rds::Handle lookupClsRDSHandle(const StringData* name);
 
 /*
  * Insert obj into the set of live objects to be destructed at the end of the
@@ -231,9 +221,25 @@ RDS::Handle lookupClsRDSHandle(const StringData* name);
 void registerLiveObj(ObjectData* obj);
 
 /*
+ * Throw a VMSwitchMode exception.
+ */
+ATTRIBUTE_NORETURN void throwSwitchMode();
+
+namespace MInstrHelpers {
+StringData* stringGetI(StringData*, uint64_t);
+uint64_t pairIsset(c_Pair*, int64_t);
+uint64_t vectorIsset(c_Vector*, int64_t);
+void bindElemC(TypedValue*, TypedValue, RefData*, MInstrState*);
+void setWithRefElemC(TypedValue*, TypedValue, TypedValue, MInstrState*);
+void setWithRefNewElem(TypedValue*, TypedValue, MInstrState*);
+}
+
+/*
  * Just calls tlsBase, but not inlined, so it can be called from the TC.
  */
 uintptr_t tlsBaseNoInline();
+
+//////////////////////////////////////////////////////////////////////
 
 }}
 

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -19,6 +19,23 @@
 #endif
 
 namespace HPHP {
+///////////////////////////////////////////////////////////////////////////////
+
+template<class SerDe>
+void EHEntEmitter::serde(SerDe& sd) {
+  sd(m_type)
+    (m_base)
+    (m_past)
+    (m_iterId)
+    (m_fault)
+    (m_itRef)
+    (m_parentIndex)
+    ;
+  if (m_type == EHEnt::Type::Catch) {
+    sd(m_catches);
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 inline UnitEmitter& FuncEmitter::ue() const {

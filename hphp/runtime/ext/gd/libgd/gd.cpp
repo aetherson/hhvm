@@ -1,11 +1,15 @@
-
-#include <math.h>
-#include <string.h>
-#include <stdlib.h>
 #include "gd.h"
-#include "gdhelpers.h"
 
+#include <cmath>
+#include <cstring>
+#include <cstdlib>
+
+#include "gdhelpers.h"
 #include "php.h"
+
+#include "hphp/runtime/base/memory-manager.h"
+
+using std::abs;
 
 #ifdef _MSC_VER
 # if _MSC_VER >= 1300
@@ -133,6 +137,15 @@ gdImagePtr gdImageCreate (int sx, int sy)
 		return NULL;
 	}
 
+	// Check for OOM before doing a potentially large allocation.
+	auto allocsz = sizeof(gdImage)
+		+ 2 * sy * sizeof(unsigned char *)
+		+ 2 * sx * sy * sizeof(unsigned char);
+	if (UNLIKELY(precheckOOM(allocsz))) {
+		// Don't throw here because GD might need to do its own cleanup.
+		return NULL;
+	}
+
 	im = (gdImage *) gdCalloc(1, sizeof(gdImage));
 
 	/* Row-major ever since gd 1.3 */
@@ -187,6 +200,15 @@ gdImagePtr gdImageCreateTrueColor (int sx, int sy)
 	}
 
 	if (overflow2(sizeof(int), sx)) {
+		return NULL;
+	}
+
+	// Check for OOM before doing a potentially large allocation.
+	auto allocsz = sizeof(gdImage)
+		+ sy * (sizeof(int *) + sizeof(unsigned char *))
+		+ sx * sy * (sizeof(int) + sizeof(unsigned char));
+	if (UNLIKELY(precheckOOM(allocsz))) {
+		// Don't throw here because GD might need to do its own cleanup.
 		return NULL;
 	}
 
@@ -1774,9 +1796,13 @@ void gdImageFillToBorder (gdImagePtr im, int x, int y, int border, int color)
 
 	if (x >= im->sx) {
 		x = im->sx - 1;
+	} else if (x < 0) {
+		x = 0;
 	}
 	if (y >= im->sy) {
 		y = im->sy - 1;
+	} else if (y < 0) {
+		y = 0;
 	}
 
 	for (i = x; i >= 0; i--) {
@@ -1876,7 +1902,7 @@ void gdImageFill(gdImagePtr im, int x, int y, int nc)
 		return;
 	}
 
-	alphablending_bak = im->alphaBlendingFlag;	
+	alphablending_bak = im->alphaBlendingFlag;
 	im->alphaBlendingFlag = 0;
 
 	if (nc==gdTiled) {
@@ -1888,7 +1914,7 @@ void gdImageFill(gdImagePtr im, int x, int y, int nc)
 	wx2=im->sx;wy2=im->sy;
 	oc = gdImageGetPixel(im, x, y);
 	if (oc==nc || x<0 || x>wx2 || y<0 || y>wy2) {
-		im->alphaBlendingFlag = alphablending_bak;	
+		im->alphaBlendingFlag = alphablending_bak;
 		return;
 	}
 
@@ -1951,7 +1977,7 @@ skip:			for (x++; x<=x2 && (gdImageGetPixel(im, x, y)!=oc); x++);
 	efree(stack);
 
 done:
-	im->alphaBlendingFlag = alphablending_bak;	
+	im->alphaBlendingFlag = alphablending_bak;
 }
 
 static void _gdImageFillTiled(gdImagePtr im, int x, int y, int nc)
@@ -2057,7 +2083,7 @@ void gdImageRectangle (gdImagePtr im, int x1, int y1, int x2, int y2, int color)
 
 		x1ul = x1 - half;
 		y1ul = y1 - half;
-		
+
 		x2lr = x2 + half;
 		y2lr = y2 + half;
 
@@ -2255,7 +2281,7 @@ void gdImageCopyMerge (gdImagePtr dst, gdImagePtr src, int dstX, int dstY, int s
 	int tox, toy;
 	int ncR, ncG, ncB;
 	toy = dstY;
-	
+
 	for (y = srcY; y < (srcY + h); y++) {
 		tox = dstX;
 		for (x = srcX; x < (srcX + w); x++) {
@@ -2352,11 +2378,14 @@ void gdImageCopyResized (gdImagePtr dst, gdImagePtr src, int dstX, int dstY, int
 	int colorMap[gdMaxColors];
 	/* Stretch vectors */
 	int *stx, *sty;
-	
+
 	if (overflow2(sizeof(int), srcW)) {
 		return;
 	}
 	if (overflow2(sizeof(int), srcH)) {
+		return;
+	}
+	if (UNLIKELY(precheckOOM(sizeof(int) * (srcW + srcH)))) {
 		return;
 	}
 
@@ -3078,4 +3107,3 @@ clean_on_error:
 	}
 	return 0;
 }
-

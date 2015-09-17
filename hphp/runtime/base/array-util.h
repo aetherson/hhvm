@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -29,7 +29,7 @@ class Array;
 /**
  * Utility array functions.
  */
-class ArrayUtil {
+class ArrayUtil final {
 public:
   /////////////////////////////////////////////////////////////////////////////
   // Compositions.
@@ -58,16 +58,6 @@ public:
 
   /////////////////////////////////////////////////////////////////////////////
   // Information and calculations.
-
-  /**
-   * Computes the sum of the array entries as int64 or double.
-   */
-  static DataType Sum(const Array& input, int64_t *isum, double *dsum);
-
-  /**
-   * Computes the product of the array entries as int64 or double.
-   */
-  static DataType Product(const Array& input, int64_t *iprod, double *dprod);
 
   /**
    * Return the value as key and the frequency of that value in input
@@ -121,9 +111,9 @@ public:
   /**
    * Apply a user function to every member of an array.
    */
-  typedef void (*PFUNC_WALK)(VRefParam value, const Variant& key, const Variant& userdata,
-                             const void *data);
-  static void Walk(VRefParam input, PFUNC_WALK walk_function, const void *data,
+  typedef void (*PFUNC_WALK)(Variant& value, const Variant& key,
+                             const Variant& userdata, const void *data);
+  static void Walk(Variant &input, PFUNC_WALK walk_function, const void *data,
                    bool recursive = false, PointerSet *seen = nullptr,
                    const Variant& userdata = null_variant);
 

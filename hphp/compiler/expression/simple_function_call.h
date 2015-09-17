@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -25,8 +25,7 @@ namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
 DECLARE_BOOST_TYPES(SimpleFunctionCall);
-class SimpleFunctionCall : public FunctionCall {
-public:
+struct SimpleFunctionCall final : FunctionCall {
   static void InitFunctionTypeMap();
 
 public:
@@ -35,8 +34,7 @@ public:
                      ExpressionListPtr params, ExpressionPtr cls);
 
   DECLARE_BASE_EXPRESSION_VIRTUAL_FUNCTIONS;
-  ExpressionPtr preOptimize(AnalysisResultConstPtr ar);
-  ExpressionPtr postOptimize(AnalysisResultConstPtr ar);
+  ExpressionPtr preOptimize(AnalysisResultConstPtr ar) override;
   void deepCopy(SimpleFunctionCallPtr exp);
 
   bool isDefineWithoutImpl(AnalysisResultConstPtr ar);
@@ -53,22 +51,17 @@ public:
 
   // define(<literal-string>, <scalar>);
   bool isSimpleDefine(StringData **name, TypedValue *value) const;
-  virtual TypePtr inferAndCheck(AnalysisResultPtr ar, TypePtr type,
-                                bool coerce);
 
-  virtual int getLocalEffects() const;
+  int getLocalEffects() const override;
 
   // implementing IParseHandler
-  virtual void onParse(AnalysisResultConstPtr ar, FileScopePtr fs);
+  void onParse(AnalysisResultConstPtr ar, FileScopePtr fs) override;
 
-  virtual void beforeCheck(AnalysisResultPtr ar) {}
-
-  void addDependencies(AnalysisResultPtr ar);
   void addLateDependencies(AnalysisResultConstPtr ar);
   void setSafeCall(int flag) { m_safe = flag; }
   void setSafeDefault(ExpressionPtr def) { m_safeDef = def; }
-  virtual ConstructPtr getNthKid(int n) const;
-  virtual void setNthKid(int n, ConstructPtr cp);
+  ConstructPtr getNthKid(int n) const override;
+  void setNthKid(int n, ConstructPtr cp) override;
   static SimpleFunctionCallPtr GetFunctionCallForCallUserFunc(
     AnalysisResultConstPtr ar, SimpleFunctionCallPtr call, int testOnly,
     int firstParam, bool &error);
@@ -80,16 +73,10 @@ public:
   bool isCallToFunction(const char *name) const;
   void resolveNSFallbackFunc(AnalysisResultConstPtr ar, FileScopePtr fs);
 
-  void setOptimizable() {
-    m_optimizable = true;
-  }
-  bool isOptimizable() const {
-    return m_optimizable;
-  }
   void changeToBytecode() {
     m_changedToBytecode = true;
   }
-  virtual bool allowCellByRef() const override {
+  bool hasBeenChangedToBytecode() {
     return m_changedToBytecode;
   }
 
@@ -100,6 +87,7 @@ protected:
     Create,
     VariableArgument,
     Extract,
+    Assert,
     Compact,
     StaticCompact, // compact() with statically known variable names
     ShellExec,
@@ -116,11 +104,10 @@ protected:
     ClassAlias,
   };
 
-  static std::map<std::string,FunType> FunctionTypeMap;
+  static std::map<std::string,FunType,stdltistr> FunctionTypeMap;
   FunType m_type;
   unsigned m_dynamicConstant : 1;
   unsigned m_builtinFunction : 1;
-  unsigned m_invokeFewArgsDecision : 1;
   unsigned m_dynamicInvoke : 1;
   unsigned m_transformed : 1;
   unsigned m_changedToBytecode : 1; // true if it morphed into a bytecode
@@ -132,7 +119,6 @@ protected:
 
   ExpressionPtr optimize(AnalysisResultConstPtr ar);
 private:
-  int checkObjCall(AnalysisResultPtr ar);
   FunctionScopePtr
   getFuncScopeFromParams(AnalysisResultPtr ar,
                          BlockScopeRawPtr scope,
@@ -143,7 +129,6 @@ private:
   void mungeIfSpecialFunction(AnalysisResultConstPtr ar, FileScopePtr fs);
 
   std::string m_localThis;
-  void *m_extra; // e.g., raw pointer to the symbol defined
 };
 
 SimpleFunctionCallPtr NewSimpleFunctionCall(

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -87,34 +87,6 @@ void ReturnStatement::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-void ReturnStatement::inferTypes(AnalysisResultPtr ar) {
-  assert(getFunctionScope().get() == getScope().get());
-  IMPLEMENT_INFER_AND_CHECK_ASSERT(getScope());
-
-  FunctionScopePtr funcScope = getFunctionScope();
-  if (m_exp) {
-    if (funcScope) {
-      TypePtr ret;
-      if (funcScope->isOverriding()) {
-        if (funcScope->getReturnType()) {
-          ret = m_exp->inferAndCheck(ar, funcScope->getReturnType(), false);
-        } else {
-          ConstructPtr self = shared_from_this();
-          ret = m_exp->inferAndCheck(ar, Type::Some, false);
-        }
-      } else {
-        ret = m_exp->inferAndCheck(ar, Type::Some, false);
-        funcScope->setReturnType(ar, ret);
-        funcScope->addRetExprToFix(m_exp);
-      }
-    } else {
-      m_exp->inferAndCheck(ar, Type::Int64, false);
-    }
-  } else {
-    funcScope->setReturnType(ar, TypePtr());
-  }
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void ReturnStatement::outputCodeModel(CodeGenerator &cg) {
@@ -125,7 +97,7 @@ void ReturnStatement::outputCodeModel(CodeGenerator &cg) {
     m_exp->outputCodeModel(cg);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

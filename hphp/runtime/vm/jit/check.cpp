@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -13,22 +13,34 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/vm/jit/check.h"
 
-#include <boost/next_prior.hpp>
-#include <unordered_set>
-#include <bitset>
-
-#include "hphp/runtime/vm/jit/ir.h"
-#include "hphp/runtime/vm/jit/ir-unit.h"
-#include "hphp/runtime/vm/jit/phys-reg.h"
+#include "hphp/runtime/vm/jit/analysis.h"
 #include "hphp/runtime/vm/jit/block.h"
 #include "hphp/runtime/vm/jit/cfg.h"
 #include "hphp/runtime/vm/jit/id-set.h"
-#include "hphp/runtime/vm/jit/reg-alloc.h"
+#include "hphp/runtime/vm/jit/ir-instruction.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
+#include "hphp/runtime/vm/jit/ir-unit.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/state-vector.h"
+#include "hphp/runtime/vm/jit/phys-reg.h"
+#include "hphp/runtime/vm/jit/reg-alloc.h"
+#include "hphp/runtime/vm/jit/type.h"
+
+#include <folly/Format.h>
+
+#include <bitset>
+#include <iostream>
+#include <string>
+#include <unordered_set>
+
+#include <boost/dynamic_bitset.hpp>
 
 namespace HPHP { namespace jit {
+
+//////////////////////////////////////////////////////////////////////
 
 namespace {
 
@@ -36,38 +48,9 @@ namespace {
 
 TRACE_SET_MOD(hhir);
 
-struct RegState {
-  RegState();
-  SSATmp*& tmp(const PhysLoc&, int i);
-  void merge(const RegState& other);
-  PhysReg::Map<SSATmp*> regs;  // which tmp is in each register
-  SSATmp* slots[NumPreAllocatedSpillLocs]; // which tmp is in each spill slot
-};
-
-RegState::RegState() {
-  memset(slots, 0, sizeof(slots));
-}
-
-SSATmp*& RegState::tmp(const PhysLoc& loc, int i) {
-  if (loc.spilled()) {
-    assert(loc.slot(i) < NumPreAllocatedSpillLocs);
-    return slots[loc.slot(i)];
-  }
-  auto r = loc.reg(i);
-  assert(r != jit::InvalidReg);
-  return regs[r];
-}
-
-void RegState::merge(const RegState& other) {
-  for (auto r : regs) {
-    if (regs[r] != other.regs[r]) regs[r] = nullptr;
-  }
-  for (unsigned i = 0; i < NumPreAllocatedSpillLocs; i++) {
-    if (slots[i] != other.slots[i]) slots[i] = nullptr;
-  }
-}
-
-// Return the number of parameters required for this block
+/*
+ * Return the number of parameters required for this block.
+ */
 DEBUG_ONLY static int numBlockParams(Block* b) {
   return b->empty() || b->front().op() != DefLabel ? 0 :
          b->front().numDsts();
@@ -82,7 +65,7 @@ DEBUG_ONLY static int numBlockParams(Block* b) {
  * 3. If this block is a catch block, it must have at most one predecessor.
  * 4. The last instruction must be isBlockEnd() and the middle instructions
  *    must not be isBlockEnd().  Therefore, blocks cannot be empty.
- * 5. If the last instruction isTerminal(), block->next() must be null.
+ * 5. block->next() must be null iff the last instruction isTerminal().
  * 6. Every instruction must have a catch block attached to it if and only if it
  *    has the MayRaiseError flag.
  * 7. Any path from this block to a Block that expects values must be
@@ -90,12 +73,15 @@ DEBUG_ONLY static int numBlockParams(Block* b) {
  * 8. Every instruction's BCMarker must point to a valid bytecode instruction.
  */
 bool checkBlock(Block* b) {
+  SCOPE_ASSERT_DETAIL("checkBlock") { return folly::sformat("B{}", b->id()); };
   auto it = b->begin();
   auto end = b->end();
-  assert(!b->empty());
+  always_assert(!b->empty());
 
   // Invariant #1
-  if (it->op() == DefLabel) ++it;
+  if (it->op() == DefLabel) {
+    ++it;
+  }
 
   // Invariant #1
   if (it != end && it->op() == BeginCatch) {
@@ -103,45 +89,92 @@ bool checkBlock(Block* b) {
   }
 
   // Invariants #2, #4
-  assert(it != end && b->back().isBlockEnd());
+  always_assert(it != end && b->back().isBlockEnd());
   --end;
-  for (DEBUG_ONLY IRInstruction& inst : folly::range(it, end)) {
-    assert(inst.op() != DefLabel);
-    assert(inst.op() != BeginCatch);
-    assert(!inst.isBlockEnd());
+  for (IRInstruction& inst : folly::range(it, end)) {
+    always_assert(inst.op() != DefLabel);
+    always_assert(inst.op() != BeginCatch);
+    always_assert(!inst.isBlockEnd());
   }
-  for (DEBUG_ONLY IRInstruction& inst : *b) {
+  for (IRInstruction& inst : *b) {
     // Invariant #8
-    assert(inst.marker().valid());
-    assert(inst.block() == b);
-    // Invariant #6. CoerceStk is special: t3213636
-    assert_log((inst.mayRaiseError() && !inst.is(CoerceStk)) ==
-               (inst.taken() && inst.taken()->isCatch()),
-               [&]{ return inst.toString(); });
+    always_assert(inst.marker().valid());
+    always_assert(inst.block() == b);
+    // Invariant #6
+    always_assert_flog(
+      inst.mayRaiseError() == (inst.taken() && inst.taken()->isCatch()),
+      "{}", inst
+    );
   }
 
   // Invariant #5
-  assert(IMPLIES(b->back().isTerminal(), !b->next()));
+  always_assert(b->back().isTerminal() == (b->next() == nullptr));
 
   // Invariant #7
   if (b->taken()) {
     // only Jmp can branch to a join block expecting values.
-    DEBUG_ONLY IRInstruction* branch = &b->back();
-    DEBUG_ONLY auto numArgs = branch->op() == Jmp ? branch->numSrcs() : 0;
-    assert(numBlockParams(b->taken()) == numArgs);
+    IRInstruction* branch = &b->back();
+    auto numArgs = branch->op() == Jmp ? branch->numSrcs() : 0;
+    always_assert(numBlockParams(b->taken()) == numArgs);
   }
 
   // Invariant #3
   if (b->isCatch()) {
     // keyed off a tca, so there needs to be exactly one
-    assert(b->preds().size() <= 1);
+    always_assert(b->preds().size() <= 1);
   }
 
   return true;
 }
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*
+ * Check some invariants around InitCtx:
+ * 1. At most one should exist in a given unit.
+ * 2. If present, InitCtx must dominate all occurrences of LdCtx and LdCctx.
+ */
+bool DEBUG_ONLY checkInitCtxInvariants(const IRUnit& unit) {
+  auto const blocks = rpoSortCfg(unit);
+
+  const Block* init_ctx_block = nullptr;
+
+  for (auto& blk : blocks) {
+    for (auto& inst : blk->instrs()) {
+      if (!inst.is(InitCtx)) continue;
+      if (init_ctx_block) return false;
+      init_ctx_block = blk;
+    }
+  }
+
+  if (!init_ctx_block) return true;
+
+  auto const rpoIDs = numberBlocks(unit, blocks);
+  auto const idoms = findDominators(unit, blocks, rpoIDs);
+
+  for (auto& blk : blocks) {
+    bool found_init_ctx = false;
+
+    for (auto& inst : blk->instrs()) {
+      if (inst.is(InitCtx)) {
+        found_init_ctx = true;
+        continue;
+      }
+      if (!inst.is(LdCtx, LdCctx)) continue;
+
+      if (init_ctx_block == blk && !found_init_ctx) return false;
+      if (!dominates(init_ctx_block, blk, idoms)) return false;
+    }
+  }
+
+  return true;
 }
 
-//////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+
+}
+
+///////////////////////////////////////////////////////////////////////////////
 
 /*
  * Build the CFG, then the dominator tree, then use it to validate SSA.
@@ -152,81 +185,105 @@ bool checkBlock(Block* b) {
  * 4. Treat tmps defined by DefConst as always defined.
  * 5. Each predecessor of a reachable block must be reachable (deleted
  *    blocks must not have out-edges to reachable blocks).
+ * 6. The entry block must not have any predecessors.
+ * 7. The entry block starts with a DefFP instruction.
  */
 bool checkCfg(const IRUnit& unit) {
-  // Check valid successor/predecessor edges.
-  auto const blocksIds = rpoSortCfgWithIds(unit);
-  auto const& blocks = blocksIds.blocks;
-  std::unordered_set<const Edge*> edges;
+  auto const blocks = rpoSortCfg(unit);
+  auto const rpoIDs = numberBlocks(unit, blocks);
+  auto reachable    = boost::dynamic_bitset<>(unit.numBlocks());
+
+  // Entry block can't have predecessors.
+  always_assert(unit.entry()->numPreds() == 0);
+
+  // Entry block starts with DefFP.
+  always_assert(!unit.entry()->empty() &&
+                unit.entry()->begin()->op() == DefFP);
+
+  // Check valid successor/predecessor edges, and identify reachable blocks.
   for (Block* b : blocks) {
+    reachable.set(b->id());
     auto checkEdge = [&] (const Edge* e) {
-      assert(e->inst()->block() == b);
-      edges.insert(e);
+      always_assert(e->from() == b);
       for (auto& p : e->to()->preds()) if (&p == e) return;
-      assert(false); // did not find edge.
+      always_assert(false); // did not find edge.
     };
     checkBlock(b);
-    if (auto *e = b->nextEdge())  checkEdge(e);
-    if (auto *e = b->takenEdge()) checkEdge(e);
+    if (auto e = b->nextEdge())  checkEdge(e);
+    if (auto e = b->takenEdge()) checkEdge(e);
   }
   for (Block* b : blocks) {
-    for (DEBUG_ONLY auto const &e : b->preds()) {
-      assert(&e == e.inst()->takenEdge() || &e == e.inst()->nextEdge());
-      assert(e.to() == b);
+    for (auto const& e : b->preds()) {
+      always_assert(&e == e.inst()->takenEdge() || &e == e.inst()->nextEdge());
+      always_assert(e.to() == b);
+
+      // Invariant #5
+      always_assert_flog(reachable.test(e.from()->id()),
+        "unreachable: B{}\n", e.from()->id());
     }
   }
 
-  // visit dom tree in preorder, checking all tmps
-  auto const children = findDomChildren(unit, blocksIds);
-  StateVector<SSATmp, bool> defined0(unit, false);
-  forPreorderDoms(blocks.front(), children, defined0,
-                  [] (Block* block, StateVector<SSATmp, bool>& defined) {
-    for (IRInstruction& inst : *block) {
-      for (DEBUG_ONLY SSATmp* src : inst.srcs()) {
-        assert(src->inst() != &inst);
-        assert_log(src->inst()->op() == DefConst ||
-                   defined[src],
-                   [&]{ return folly::format(
-                       "src '{}' in '{}' came from '{}', which is not a "
-                       "DefConst and is not defined at this use site",
-                       src->toString(), inst.toString(),
-                       src->inst()->toString()).str();
-                   });
+  auto defined_set = jit::sparse_idptr_set<SSATmp>{unit.numTmps()};
+
+  /*
+   * Visit every instruction and make sure their sources are either defined in
+   * a block that strictly dominates the block containing the instruction, or
+   * defined earlier in the same block as the instruction.
+   */
+  auto const idoms = findDominators(unit, blocks, rpoIDs);
+  for (auto& blk : blocks) {
+    for (auto& inst : blk->instrs()) {
+      for (auto src : inst.srcs()) {
+        if (src->inst()->is(DefConst)) continue;
+        auto const dom = findDefiningBlock(src, idoms);
+        auto const locally_defined =
+          src->inst()->block() == inst.block() && defined_set.contains(src);
+        auto const strictly_dominates =
+          src->inst()->block() != inst.block() &&
+          dom && dominates(dom, inst.block(), idoms);
+        always_assert_flog(
+          locally_defined || strictly_dominates,
+          "src '{}' in '{}' came from '{}', which is not a "
+          "DefConst and is not defined at this use site",
+          src->toString(), inst.toString(),
+          src->inst()->toString()
+        );
       }
-      for (SSATmp& dst : inst.dsts()) {
-        assert(dst.inst() == &inst && inst.op() != DefConst);
-        assert(!defined[dst]);
-        defined[dst] = true;
+      for (auto dst : inst.dsts()) defined_set.insert(dst);
+    }
+    defined_set.clear();
+  }
+
+  /*
+   * Check that each dst is defined only once.
+   */
+  defined_set.clear();
+  for (auto& blk : blocks) {
+    for (auto& inst : blk->instrs()) {
+      for (auto dst : inst.dsts()) {
+        always_assert_flog(
+          !defined_set.contains(dst),
+          "SSATmp ({}) was defined multiple times",
+          dst->toString()
+        );
+        defined_set.insert(dst);
       }
     }
-  });
+  }
+
   return true;
 }
 
 bool checkTmpsSpanningCalls(const IRUnit& unit) {
-  // CallBuiltin is ok because it is not a php-level call.  (It will
-  // call a C++ helper and we can push/pop around it normally.)
-  auto isCall = [&] (Opcode op) {
-    return op == Call || op == CallArray || op == ContEnter;
-  };
-
   auto ignoreSrc = [&](IRInstruction& inst, SSATmp* src) {
     /*
-     * ReDefSP, TakeStack, and FramePtr/StkPtr-typed tmps are used
-     * only for stack analysis in the simplifier and therefore may
-     * live across calls. In particular, ReDefSP are used to bridge
-     * the logical stack of the caller when a callee is inlined so
-     * that analysis does not scan into the callee stack when
-     * searching for a type of value in the caller.
+     * FramePtr/StkPtr-typed tmps may live across calls.
      *
-     * Tmps defined by DefConst are always available and may be
-     * assigned to registers if needed by the instructions using the
-     * const.
+     * Tmps defined by DefConst are always available and may be assigned to
+     * registers if needed by the instructions using the const.
      */
-    return (inst.is(ReDefSP) && src->isA(Type::StkPtr)) ||
-           inst.is(TakeStack) ||
-           src->isA(Type::StkPtr) ||
-           src->isA(Type::FramePtr) ||
+    return src->isA(TStkPtr) ||
+           src->isA(TFramePtr) ||
            src->inst()->is(DefConst);
   };
 
@@ -238,15 +295,20 @@ bool checkTmpsSpanningCalls(const IRUnit& unit) {
     if (auto next  = block->next()) live |= livein[next];
     for (auto it = block->end(); it != block->begin();) {
       auto& inst = *--it;
-      for (auto& dst : inst.dsts()) {
+      for (auto dst : inst.dsts()) {
         live.erase(dst);
       }
-      if (isCall(inst.op())) {
+      if (isCallOp(inst.op())) {
         live.forEach([&](uint32_t tmp) {
-          auto msg = folly::format("checkTmpsSpanningCalls failed\n"
-                                   "  instruction: {}\n"
-                                   "  src:         t{}\n",
-                                   inst.toString(), tmp).str();
+          auto msg = folly::sformat("checkTmpsSpanningCalls failed\n"
+                                    "  instruction: {}\n"
+                                    "  src:         t{}\n"
+                                    "\n"
+                                    "Unit:\n"
+                                    "{}\n",
+                                    inst.toString(),
+                                    tmp,
+                                    show(unit));
           std::cerr << msg;
           FTRACE(1, "{}", msg);
           isValid = false;
@@ -261,115 +323,247 @@ bool checkTmpsSpanningCalls(const IRUnit& unit) {
   return isValid;
 }
 
-bool checkNoShuffles(const IRUnit& unit) {
-  postorderWalk(unit, [] (Block* b) {
-    for (DEBUG_ONLY auto& inst : *b) assert(inst.op() != Shuffle);
-  });
-  return true;
+///////////////////////////////////////////////////////////////////////////////
+// checkOperandTypes().
+
+namespace {
+
+/*
+ * Return a union type containing all the types in the argument list.
+ */
+Type buildUnion() {
+  return TBottom;
+}
+
+template<class... Args>
+Type buildUnion(Type t, Args... ts) {
+  return t | buildUnion(ts...);
+}
+
 }
 
 /*
- * Check that each destination register or spill slot is unique,
- * and that sources have the same number or less operands than
- * destinations.
+ * Runtime typechecking for IRInstruction operands.
+ *
+ * This is generated using the table in ir-opcode.h.  We instantiate
+ * IR_OPCODES after defining all the various source forms to do type
+ * assertions according to their form (see ir-opcode.h for documentation on
+ * the notation).  The checkers appear in argument order, so each one
+ * increments curSrc, and at the end we can check that the argument
+ * count was also correct.
  */
-bool checkShuffle(const IRInstruction& inst, const RegAllocInfo& regs) {
-  auto n = inst.numSrcs();
-  assert(n == inst.extra<Shuffle>()->size);
-  RegSet destRegs;
-  std::bitset<NumPreAllocatedSpillLocs> destSlots;
-  auto& inst_regs = regs[inst];
-  for (uint32_t i = 0; i < n; ++i) {
-    DEBUG_ONLY auto& rs = inst_regs.src(i);
-    DEBUG_ONLY auto& rd = inst.extra<Shuffle>()->dests[i];
-    if (rd.numAllocated() == 0) continue; // dest was unused; ignore.
-    if (rd.spilled()) {
-      assert(!rs.spilled()); // no mem-mem copies
-    } else {
-      // rs could have less assigned registers/slots than rd, in these cases:
-      // - when rs is empty, because the source is a constant.
-      // - when rs has 1 register because it's untagged but rd needs 2 because
-      //   it's a more general (tagged) type, because of a phi.
-      assert(rs.numWords() <= rd.numWords());
-      assert(rs.spilled() || rs.isFullSIMD() == rd.isFullSIMD());
+bool checkOperandTypes(const IRInstruction* inst, const IRUnit* unit) {
+  int curSrc = 0;
+
+  auto bail = [&] (const std::string& msg) {
+    FTRACE(1, "{}", msg);
+    fprintf(stderr, "%s\n", msg.c_str());
+
+    always_assert_log(false, [&] { return msg; });
+  };
+
+  if (opHasExtraData(inst->op()) != (bool)inst->rawExtra()) {
+    bail(folly::format("opcode {} should{} have an ExtraData struct "
+                       "but instruction {} does{}",
+                       inst->op(),
+                       opHasExtraData(inst->op()) ? "" : "n't",
+                       *inst,
+                       inst->rawExtra() ? "" : "n't").str());
+  }
+
+  auto src = [&]() -> SSATmp* {
+    if (curSrc < inst->numSrcs()) {
+      return inst->src(curSrc);
     }
-    for (int j = 0; j < rd.numAllocated(); ++j) {
-      if (rd.spilled()) {
-        assert(!destSlots.test(rd.slot(j)));
-        destSlots.set(rd.slot(j));
-      } else {
-        assert(!destRegs.contains(rd.reg(j))); // no duplicate dests
-        destRegs.add(rd.reg(j));
-      }
+
+    bail(folly::format(
+      "Error: instruction had too few operands\n"
+      "   instruction: {}\n",
+        inst->toString()
+      ).str()
+    );
+    not_reached();
+  };
+
+  // If expected is not nullptr, it will be used. Otherwise, t.toString() will
+  // be used as the expected string.
+  auto check = [&] (bool cond, const Type t, const char* expected) {
+    if (cond) return true;
+
+    std::string expectStr = expected ? expected : t.toString();
+
+    bail(folly::format(
+      "Error: failed type check on operand {}\n"
+      "   instruction: {}\n"
+      "   was expecting: {}\n"
+      "   received: {}\n",
+        curSrc,
+        inst->toString(),
+        expectStr,
+        inst->src(curSrc)->type().toString()
+      ).str()
+    );
+    return true;
+  };
+
+  auto checkNoArgs = [&]{
+    if (inst->numSrcs() == 0) return true;
+    bail(folly::format(
+      "Error: instruction expected no operands\n"
+      "   instruction: {}\n",
+        inst->toString()
+      ).str()
+    );
+    return true;
+  };
+
+  auto countCheck = [&]{
+    if (inst->numSrcs() == curSrc) return true;
+    bail(folly::format(
+      "Error: instruction had too many operands\n"
+      "   instruction: {}\n"
+      "   expected {} arguments\n",
+        inst->toString(),
+        curSrc
+      ).str()
+    );
+    return true;
+  };
+
+  auto checkDst = [&] (bool cond, const std::string& errorMessage) {
+    if (cond) return true;
+
+    bail(folly::format("Error: failed type check on dest operand\n"
+                       "   instruction: {}\n"
+                       "   message: {}\n",
+                       inst->toString(),
+                       errorMessage).str());
+    return true;
+  };
+
+  auto requireTypeParam = [&] {
+    checkDst(inst->hasTypeParam() || inst->is(DefConst),
+             "Missing paramType for DParam instruction");
+  };
+
+  auto requireTypeParamPtr = [&] (Ptr kind) {
+    checkDst(inst->hasTypeParam(),
+      "Missing paramType for DParamPtr instruction");
+    if (inst->hasTypeParam()) {
+      checkDst(inst->typeParam() <= TGen.ptr(kind),
+               "Invalid paramType for DParamPtr instruction");
     }
+  };
+
+  auto checkVariadic = [&] (Type super) {
+    for (; curSrc < inst->numSrcs(); ++curSrc) {
+      auto const valid = (inst->src(curSrc)->type() <= super);
+      check(valid, Type(), nullptr);
+    }
+  };
+
+#define IRT(name, ...) UNUSED static constexpr Type name = T##name;
+#define IRTP(name, ...) IRT(name)
+  IR_TYPES
+#undef IRT
+#undef IRTP
+
+#define NA            return checkNoArgs();
+#define S(...)        {                                   \
+                        Type t = buildUnion(__VA_ARGS__); \
+                        check(src()->isA(t), t, nullptr); \
+                        ++curSrc;                         \
+                      }
+#define AK(kind)      {                                                 \
+                        Type t = Type::Array(ArrayData::k##kind##Kind); \
+                        check(src()->isA(t), t, nullptr);               \
+                        ++curSrc;                                       \
+                      }
+#define C(T)          check(src()->hasConstVal(T) ||     \
+                            src()->isA(TBottom),    \
+                            Type(),                      \
+                            "constant " #T);             \
+                      ++curSrc;
+#define CStr          C(StaticStr)
+#define SVar(...)     checkVariadic(buildUnion(__VA_ARGS__));
+#define ND
+#define DMulti
+#define DSetElem
+#define D(...)
+#define DBuiltin
+#define DSubtract(src, t)checkDst(src < inst->numSrcs(),  \
+                             "invalid src num");
+#define DofS(src)   checkDst(src < inst->numSrcs(),  \
+                             "invalid src num");
+#define DRefineS(src) checkDst(src < inst->numSrcs(),  \
+                               "invalid src num");     \
+                      requireTypeParam();
+#define DParamMayRelax requireTypeParam();
+#define DParam         requireTypeParam();
+#define DParamPtr(k)   requireTypeParamPtr(Ptr::k);
+#define DUnboxPtr
+#define DBoxPtr
+#define DAllocObj
+#define DArrElem
+#define DArrPacked
+#define DCol
+#define DThis
+#define DCtx
+#define DCns
+
+#define O(opcode, dstinfo, srcinfo, flags) \
+  case opcode: dstinfo srcinfo countCheck(); return true;
+
+  switch (inst->op()) {
+    IR_OPCODES
+  default: always_assert(false);
+  }
+
+#undef O
+
+#undef NA
+#undef S
+#undef AK
+#undef C
+#undef CStr
+#undef SVar
+
+#undef ND
+#undef D
+#undef DBuiltin
+#undef DSubtract
+#undef DMulti
+#undef DSetElem
+#undef DofS
+#undef DRefineS
+#undef DParamMayRelax
+#undef DParam
+#undef DParamPtr
+#undef DUnboxPtr
+#undef DBoxPtr
+#undef DAllocObj
+#undef DArrElem
+#undef DArrPacked
+#undef DCol
+#undef DThis
+#undef DCtx
+#undef DCns
+
+  return true;
+}
+
+bool checkEverything(const IRUnit& unit) {
+  assertx(checkCfg(unit));
+  assertx(checkTmpsSpanningCalls(unit));
+  assertx(checkInitCtxInvariants(unit));
+  if (debug) {
+    forEachInst(rpoSortCfg(unit), [&](IRInstruction* inst) {
+      assertx(checkOperandTypes(inst, &unit));
+    });
   }
   return true;
 }
 
-bool checkRegisters(const IRUnit& unit, const RegAllocInfo& regs) {
-  assert(checkCfg(unit));
-  auto blocks = rpoSortCfg(unit);
-  StateVector<Block, RegState> states(unit, RegState());
-  StateVector<Block, bool> reached(unit, false);
-  for (auto* block : blocks) {
-    RegState state = states[block];
-    for (IRInstruction& inst : *block) {
-      if (inst.op() == Jmp) continue; // handled by Shuffle
-      auto& inst_regs = regs[inst];
-      for (int i = 0, n = inst.numSrcs(); i < n; ++i) {
-        auto const &rs = inst_regs.src(i);
-        if (!rs.spilled()) {
-          // hack - ignore rbx and rbp
-          if (rs.reg(0) == mcg->backEnd().rVmSp() ||
-              rs.reg(0) == mcg->backEnd().rVmFp()) {
-            continue;
-          }
-        }
-        DEBUG_ONLY auto src = inst.src(i);
-        assert(rs.numWords() == src->numWords() ||
-               (src->isConst() && rs.numWords() == 0));
-        DEBUG_ONLY auto allocated = rs.numAllocated();
-        if (allocated == 2) {
-          if (rs.spilled()) {
-            assert(rs.slot(0) != rs.slot(1));
-          } else {
-            assert(rs.reg(0) != rs.reg(1));
-          }
-        }
-        for (unsigned i = 0, n = rs.numAllocated(); i < n; ++i) {
-          assert(state.tmp(rs, i) == src);
-        }
-      }
-      auto update = [&](SSATmp* tmp, const PhysLoc& loc) {
-        for (unsigned i = 0, n = loc.numAllocated(); i < n; ++i) {
-          state.tmp(loc, i) = tmp;
-        }
-      };
-      if (inst.op() == Shuffle) {
-        checkShuffle(inst, regs);
-        for (unsigned i = 0; i < inst.numSrcs(); ++i) {
-          update(inst.src(i), inst.extra<Shuffle>()->dests[i]);
-        }
-      } else {
-        for (unsigned i = 0; i < inst.numDsts(); ++i) {
-          update(inst.dst(i), inst_regs.dst(i));
-        }
-      }
-    }
-    // State contains the PhysLoc->SSATmp reverse mappings at block end;
-    // propagate the state to succ
-    auto updateEdge = [&](Block* succ) {
-      if (!reached[succ]) {
-        states[succ] = state;
-      } else {
-        states[succ].merge(state);
-      }
-    };
-    if (auto* next = block->next()) updateEdge(next);
-    if (auto* taken = block->taken()) updateEdge(taken);
-  }
-
-  return true;
-}
+//////////////////////////////////////////////////////////////////////
 
 }}

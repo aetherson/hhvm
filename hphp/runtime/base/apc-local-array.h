@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -22,7 +22,6 @@
 #include <sys/types.h>
 
 #include "hphp/runtime/base/array-data.h"
-#include "hphp/runtime/base/sweepable.h"
 #include "hphp/runtime/base/apc-array.h"
 
 namespace HPHP {
@@ -41,8 +40,7 @@ struct MArrayIter;
  * via APC. It has a pointer to the APCArray that it represents and it may
  * cache values locally depending on the type accessed and/or the operation.
  */
-struct APCLocalArray : private ArrayData
-                     , private Sweepable {
+struct APCLocalArray : private ArrayData {
   template<class... Args> static APCLocalArray* Make(Args&&...);
 
   static size_t Vsize(const ArrayData*);
@@ -82,14 +80,14 @@ struct APCLocalArray : private ArrayData
   static ssize_t IterRewind(const ArrayData*, ssize_t prev);
   static bool ValidMArrayIter(const ArrayData*, const MArrayIter& fp);
   static bool AdvanceMArrayIter(ArrayData*, MArrayIter& fp);
-  static ArrayData* NonSmartCopy(const ArrayData*);
+  static ArrayData* CopyStatic(const ArrayData*);
   static constexpr auto Pop = &ArrayCommon::Pop;
   static constexpr auto Dequeue = &ArrayCommon::Dequeue;
   static void Renumber(ArrayData*);
   static void OnSetEvalScalar(ArrayData*);
   static void Release(ArrayData*);
   static ArrayData* Escalate(const ArrayData*);
-  static ArrayData* EscalateForSort(ArrayData*);
+  static ArrayData* EscalateForSort(ArrayData*, SortFunction);
   static void Ksort(ArrayData*, int, bool);
   static void Sort(ArrayData*, int, bool);
   static void Asort(ArrayData*, int, bool);
@@ -113,37 +111,37 @@ public:
   ArrayData* asArrayData() { return this; }
   const ArrayData* asArrayData() const { return this; }
 
-  // Pre: ad->isSharedArray()
-  static APCLocalArray* asSharedArray(ArrayData*);
-  static const APCLocalArray* asSharedArray(const ArrayData*);
+  // Pre: ad->isApcArray()
+  static APCLocalArray* asApcArray(ArrayData*);
+  static const APCLocalArray* asApcArray(const ArrayData*);
 
 private:
-  explicit APCLocalArray(APCArray* source)
-    : ArrayData(kSharedKind)
-    , m_arr(source)
-    , m_localCache(nullptr)
-  {
-    m_size = m_arr->size();
-    source->getHandle()->reference();
-  }
-
+  explicit APCLocalArray(const APCArray* source);
   ~APCLocalArray();
 
-private:
   static bool checkInvariants(const ArrayData*);
   ssize_t getIndex(int64_t k) const;
   ssize_t getIndex(const StringData* k) const;
-
-private: // implements Sweepable
-  void sweep() override;
-
-private:
   ArrayData* loadElems() const;
   Variant getKey(ssize_t pos) const;
+  void sweep();
+
+public:
+  void reap();
+  template<class F> void scan(F& mark) const {
+    //mark(m_arr);
+    if (m_localCache) {
+      for (unsigned i = 0, n = m_arr->capacity(); i < n; ++i) {
+        mark(m_localCache[i]);
+      }
+    }
+  }
 
 private:
-  APCArray* m_arr;
+  const APCArray* m_arr;
   mutable TypedValue* m_localCache;
+  unsigned m_sweep_index;
+  friend struct MemoryManager; // access to m_sweep_index
 };
 
 //////////////////////////////////////////////////////////////////////

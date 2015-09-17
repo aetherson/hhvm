@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,21 +16,24 @@
 
 #include "hphp/util/synchronizable-multi.h"
 #include "hphp/util/compatibility.h"
+#include "hphp/util/lock.h"
 #include "hphp/util/timer.h"
 
+#ifndef _MSC_VER
 #include <sys/errno.h>
+#endif
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-SynchronizableMulti::SynchronizableMulti(int size, int groups) :
+SynchronizableMulti::SynchronizableMulti(int size) :
     m_mutex(RankLeaf), m_group(0) {
-  assert(size > 0 && groups > 0);
+  assert(size > 0);
   m_conds.resize(size);
   for (unsigned int i = 0; i < m_conds.size(); i++) {
     pthread_cond_init(&m_conds[i], nullptr);
   }
-  m_cond_list_vec.resize(groups);
+  m_cond_list_vec.resize(1);
 }
 
 SynchronizableMulti::~SynchronizableMulti() {
@@ -89,6 +92,14 @@ bool SynchronizableMulti::waitImpl(int id, int q, bool front, timespec *ts) {
   }
 
   return ret != ETIMEDOUT;
+}
+
+void SynchronizableMulti::setNumGroups(int num_groups) {
+  Lock l(this);
+  if (num_groups != m_cond_list_vec.size()) {
+    assert(num_groups > m_cond_list_vec.size());
+    m_cond_list_vec.resize(num_groups);
+  }
 }
 
 void SynchronizableMulti::notify() {

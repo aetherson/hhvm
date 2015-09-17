@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -22,6 +22,7 @@ namespace Strings {
 
 const char* const FATAL_NULL_THIS = "$this is null";
 const char* const WARN_NULL_THIS = "Undefined variable: this";
+const char* const ASSIGN_THIS_ERROR = "Cannot re-assign $this";
 const char* const FUNCTION_ALREADY_DEFINED = "Function already defined: %s";
 const char* const CONSTANT_ALREADY_DEFINED = "Constant %s already defined";
 const char* const CONSTANTS_MUST_BE_SCALAR =
@@ -48,6 +49,9 @@ const char* const CANNOT_USE_SCALAR_AS_ARRAY =
   "Cannot use a scalar value as an array";
 const char* const CREATING_DEFAULT_OBJECT =
   "Creating default object from empty value";
+const char* const NULLSAFE_PROP_WRITE_ERROR =
+  "?-> is not allowed in write context";
+const char* const NULLSAFE_THIS_BASE_ERROR = "?-> is not allowed with $this";
 const char* const FUNCTION_NAME_MUST_BE_STRING =
   "Function name must be a string";
 const char* const METHOD_NAME_MUST_BE_STRING =
@@ -73,10 +77,10 @@ const char* const METHOD_IN_MULTIPLE_TRAITS =
   "Method '%s' declared in multiple traits";
 const char* const TRAIT_REQ_EXTENDS =
   "Class '%s' required to extend class '%s'"
-  " by trait '%s' (via %s)";
+  " by trait '%s'";
 const char* const TRAIT_REQ_IMPLEMENTS =
   "Class '%s' required to implement interface '%s'"
-  " by trait '%s' (via %s)";
+  " by trait '%s'";
 const char* const TRAIT_BAD_REQ_EXTENDS =
   "Trait '%s' requires extension of '%s', but %s "
   "is not an extendable class";

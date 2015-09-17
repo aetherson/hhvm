@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -72,10 +72,6 @@ void ExtendedLogger::log(LogLevelType level, const char *type,
                          int line /* = 0 */) {
   if (!IsEnabled()) return;
   Logger::log(level, type, e, file, line);
-
-  if (auto const ee = dynamic_cast<const ExtendedException*>(&e)) {
-    Log(level, ee->getBacktrace());
-  }
 }
 
 void ExtendedLogger::log(LogLevelType level, const std::string &msg,

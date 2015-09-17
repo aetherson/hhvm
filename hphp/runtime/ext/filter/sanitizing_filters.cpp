@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -16,9 +16,10 @@
 */
 
 #include "hphp/runtime/ext/filter/sanitizing_filters.h"
-#include "hphp/runtime/ext/ext_filter.h"
-#include "hphp/runtime/ext/ext_string.h"
-#include "hphp/runtime/base/complex-types.h"
+
+#include "hphp/runtime/ext/filter/ext_filter.h"
+#include "hphp/runtime/ext/string/ext_string.h"
+#include "hphp/runtime/base/string-buffer.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/system/constants.h"
 
@@ -229,7 +230,7 @@ Variant php_filter_full_special_chars(PHP_INPUT_FILTER_PARAM_DECL) {
   } else {
     quotes = k_ENT_NOQUOTES;
   }
-  return f_htmlentities(value, quotes);
+  return HHVM_FN(htmlentities)(value, quotes);
 }
 
 Variant php_filter_unsafe_raw(PHP_INPUT_FILTER_PARAM_DECL) {
@@ -323,7 +324,7 @@ Variant php_filter_number_float(PHP_INPUT_FILTER_PARAM_DECL) {
 
 Variant php_filter_magic_quotes(PHP_INPUT_FILTER_PARAM_DECL) {
   /* just call addslashes quotes */
-  return f_addslashes(value);
+  return HHVM_FN(addslashes)(value);
 }
 
 }

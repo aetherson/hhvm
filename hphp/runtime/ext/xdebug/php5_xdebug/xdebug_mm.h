@@ -16,16 +16,16 @@
    +----------------------------------------------------------------------+
  */
 
-// TODO(#4489053) This is probably unnecessary in the long run
+// TODO(#3704) This should be removed
 
 #ifndef incl_XDEBUG_MM_H_
 #define incl_XDEBUG_MM_H_
 
 #include "hphp/runtime/base/memory-manager.h"
 
-#define xdmalloc    HPHP::smart_malloc
-#define xdcalloc    HPHP::smart_calloc
-#define xdrealloc   HPHP::smart_realloc
-#define xdfree      HPHP::smart_free
+#define xdmalloc    HPHP::req::malloc
+#define xdcalloc    HPHP::req::calloc
+#define xdrealloc   HPHP::req::realloc
+#define xdfree      HPHP::req::free
 
 #endif

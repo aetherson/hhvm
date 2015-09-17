@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -79,17 +79,6 @@ void DoStatement::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-void DoStatement::inferTypes(AnalysisResultPtr ar) {
-  if (m_stmt) {
-    getScope()->incLoopNestedLevel();
-    m_stmt->inferTypes(ar);
-    m_condition->inferAndCheck(ar, Type::Boolean, false);
-    getScope()->decLoopNestedLevel();
-  } else {
-    m_condition->inferAndCheck(ar, Type::Boolean, false);
-  }
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void DoStatement::outputCodeModel(CodeGenerator &cg) {
@@ -99,7 +88,7 @@ void DoStatement::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("condition");
   m_condition->outputCodeModel(cg);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

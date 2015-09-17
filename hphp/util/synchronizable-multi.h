@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -36,7 +36,7 @@ namespace HPHP {
  */
 class SynchronizableMulti {
 public:
-  explicit SynchronizableMulti(int size, int groups);
+  explicit SynchronizableMulti(int size);
   virtual ~SynchronizableMulti();
 
   /**
@@ -52,6 +52,7 @@ public:
   bool wait(int id, int q, bool front, long seconds, long long nanosecs);
   void notify();
   void notifyAll();
+  void setNumGroups(int num_groups);
 
   Mutex &getMutex() { return m_mutex;}
 

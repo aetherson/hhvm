@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -19,9 +19,10 @@
 #define incl_HPHP_EXT_IMAGE_H_
 
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/zend-php-config.h"
-#include "hphp/runtime/ext/gd/libgd/gd.h"
+
+typedef struct gdImageStruct* gdImagePtr;
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -38,15 +39,15 @@ public:
   Image() : m_gdImage(nullptr) {}
   explicit Image(gdImagePtr gdImage) : m_gdImage(gdImage) {}
   ~Image();
-  void sweep() FOLLY_OVERRIDE;
   gdImagePtr get() { return m_gdImage;}
-  void reset() { m_gdImage = nullptr;}
+  void reset();
 
   CLASSNAME_IS("gd")
   // overriding ResourceData
-  virtual const String& o_getClassNameHook() const { return classnameof(); }
-  virtual bool isInvalid() const { return m_gdImage == nullptr; }
+  const String& o_getClassNameHook() const override { return classnameof(); }
+  bool isInvalid() const override { return m_gdImage == nullptr; }
 
+  DECLARE_RESOURCE_ALLOCATION(Image)
 private:
   gdImagePtr m_gdImage;
 };
@@ -215,6 +216,8 @@ bool HHVM_FUNCTION(imagerectangle, const Resource& image,
 Variant HHVM_FUNCTION(imagerotate,
   const Resource& source_image, double angle, int64_t bgd_color,
   int64_t ignore_transparent = 0);
+Variant HHVM_FUNCTION(imagescale,const Resource& image, int64_t newwidth,
+  int64_t newheight = -1, int64_t method = -1);
 bool HHVM_FUNCTION(imagesavealpha, const Resource& image, bool saveflag);
 bool HHVM_FUNCTION(imagesetbrush, const Resource& image,
   const Resource& brush);

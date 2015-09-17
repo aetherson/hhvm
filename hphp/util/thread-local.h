@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -20,7 +20,7 @@
 #include <pthread.h>
 #include "hphp/util/exception.h"
 #include <errno.h>
-#include "folly/String.h"
+#include <folly/String.h>
 #include <type_traits>
 
 namespace HPHP {
@@ -33,6 +33,13 @@ inline uintptr_t tlsBase() {
   // mrs == "move register <-- system"
   // tpidr_el0 == "thread process id register for exception level 0"
   asm ("mrs %0, tpidr_el0" : "=r" (retval));
+#elif defined (__powerpc64__)
+  asm ("xor %0,%0,%0\n\t"
+       "or  %0,%0,13\n\t"
+      : "=r" (retval));
+#elif defined(_M_X64)
+  retval = (uintptr_t)_readfsbase_u64();
+  retval = *(uintptr_t*)(retval + 88);
 #else
 # error How do you access thread-local storage on this machine?
 #endif
@@ -67,11 +74,11 @@ inline uintptr_t tlsBase() {
 // IMPLEMENT_THREAD_LOCAL() macros to access either __thread or the emulation
 // as appropriate.
 
-#if !defined(NO_TLS) && !defined(__APPLE__) &&                \
+#if !defined(NO_TLS) &&                                       \
     !defined(__CYGWIN__) && !defined(__MINGW__) &&            \
    ((__llvm__ && __clang__) ||                                \
    __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ > 3) ||   \
-   __INTEL_COMPILER)
+   __INTEL_COMPILER || defined(_MSC_VER))
 #define USE_GCC_FAST_TLS
 #endif
 
@@ -97,6 +104,10 @@ inline void ThreadLocalSetValue(pthread_key_t key, const void* value) {
   int ret = pthread_setspecific(key, value);
   ThreadLocalCheckReturn(ret, "pthread_setspecific");
 }
+
+#ifdef __APPLE__
+typedef struct __darwin_pthread_handler_rec darwin_pthread_handler;
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -132,19 +143,31 @@ struct ThreadLocalNode {
 };
 
 struct ThreadLocalManager {
-  ThreadLocalManager() : m_key(0) {
-    ThreadLocalCreateKey(&m_key, ThreadLocalManager::OnThreadExit);
+  template<class T>
+  static void PushTop(ThreadLocalNode<T>& node) { PushTop(&node); }
+private:
+  static void PushTop(void* node);
+  struct ThreadLocalList {
+    void* head{nullptr};
+#ifdef __APPLE__
+    ThreadLocalList();
+    darwin_pthread_handler handler;
+#endif
   };
-  void * getTop() {
-    return pthread_getspecific(m_key);
+  static ThreadLocalList* getList(void* p) {
+    return static_cast<ThreadLocalList*>(p);
   }
-  void setTop(void * p) {
-    ThreadLocalSetValue(m_key, p);
-  }
+  ThreadLocalManager() : m_key(0) {
+#ifdef __APPLE__
+    ThreadLocalCreateKey(&m_key, nullptr);
+#else
+    ThreadLocalCreateKey(&m_key, ThreadLocalManager::OnThreadExit);
+#endif
+  };
   static void OnThreadExit(void *p);
   pthread_key_t m_key;
 
-  static ThreadLocalManager s_manager;
+  static ThreadLocalManager& GetManager();
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -171,7 +194,7 @@ struct ThreadLocal {
     return m_node.m_p;
   }
 
-  void create() NEVER_INLINE;
+  NEVER_INLINE void create();
 
   bool isNull() const { return m_node.m_p == nullptr; }
 
@@ -199,8 +222,7 @@ template<typename T>
 void ThreadLocal<T>::create() {
   if (m_node.m_on_thread_exit_fn == nullptr) {
     m_node.m_on_thread_exit_fn = ThreadLocalOnThreadExit<T>;
-    m_node.m_next = ThreadLocalManager::s_manager.getTop();
-    ThreadLocalManager::s_manager.setTop((void*)(&m_node));
+    ThreadLocalManager::PushTop(m_node);
   }
   assert(m_node.m_p == nullptr);
   m_node.m_p = new T();
@@ -213,13 +235,13 @@ void ThreadLocal<T>::create() {
  */
 template<typename T>
 struct ThreadLocalNoCheck {
-  T *getCheck() const NEVER_INLINE;
+  NEVER_INLINE T *getCheck() const;
   T* getNoCheck() const {
     assert(m_node.m_p);
     return m_node.m_p;
   }
 
-  void create() NEVER_INLINE;
+  NEVER_INLINE void create();
 
   bool isNull() const { return m_node.m_p == nullptr; }
 
@@ -237,14 +259,15 @@ struct ThreadLocalNoCheck {
   }
 
   ThreadLocalNode<T> m_node;
+private:
+  void setNull() { m_node.m_p = nullptr; }
 };
 
 template<typename T>
 void ThreadLocalNoCheck<T>::create() {
   if (m_node.m_on_thread_exit_fn == nullptr) {
     m_node.m_on_thread_exit_fn = ThreadLocalOnThreadExit<T>;
-    m_node.m_next = ThreadLocalManager::s_manager.getTop();
-    ThreadLocalManager::s_manager.setTop((void*)(&m_node));
+    ThreadLocalManager::PushTop(m_node);
   }
   assert(m_node.m_p == nullptr);
   m_node.m_p = new T();
@@ -272,7 +295,7 @@ class ThreadLocalSingleton {
 public:
   ThreadLocalSingleton() { s_inited = true; }
 
-  static T *getCheck() NEVER_INLINE;
+  NEVER_INLINE static T *getCheck();
 
   static T* getNoCheck() {
     assert(s_inited);
@@ -374,19 +397,19 @@ struct ThreadLocalProxy {
  */
 
 #define DECLARE_THREAD_LOCAL(T, f) \
-  __thread ThreadLocal<T> f
+  __thread HPHP::ThreadLocal<T> f
 #define IMPLEMENT_THREAD_LOCAL(T, f) \
   __thread HPHP::ThreadLocal<T> f
 
 #define DECLARE_THREAD_LOCAL_NO_CHECK(T, f) \
-  __thread ThreadLocalNoCheck<T> f
+  __thread HPHP::ThreadLocalNoCheck<T> f
 #define IMPLEMENT_THREAD_LOCAL_NO_CHECK(T, f) \
-  __thread ThreadLocalNoCheck<T> f
+  __thread HPHP::ThreadLocalNoCheck<T> f
 
 #define DECLARE_THREAD_LOCAL_PROXY(T, N, f) \
-  __thread ThreadLocalProxy<T, N> f
+  __thread HPHP::ThreadLocalProxy<T, N> f
 #define IMPLEMENT_THREAD_LOCAL_PROXY(T, N, f) \
-  __thread ThreadLocalProxy<T, N> f
+  __thread HPHP::ThreadLocalProxy<T, N> f
 
 #else /* USE_GCC_FAST_TLS */
 
@@ -397,6 +420,46 @@ template<typename T>
 void ThreadLocalOnThreadExit(void *p) {
   delete (T*)p;
 }
+
+#ifdef __APPLE__
+// The __thread variables in class T will be freed when pthread calls
+// the destructor function on Mac. We can register a handler in
+// pthread_t->__cleanup_stack similar to pthread_cleanup_push(). The handler
+// will be called earlier so the __thread variables will still exist in the
+// handler when the thread exits.
+//
+// See the details at:
+// https://github.com/facebook/hhvm/issues/4444#issuecomment-92497582
+typedef struct __darwin_pthread_handler_rec darwin_pthread_handler;
+
+template<typename T>
+void ThreadLocalOnThreadCleanup(void *key) {
+  void *obj = pthread_getspecific((pthread_key_t)key);
+  if (obj) {
+    ThreadLocalOnThreadExit<T>(obj);
+  }
+}
+
+inline void ThreadLocalSetCleanupHandler(pthread_key_t cleanup_key,
+                                         pthread_key_t key,
+                                         void (*del)(void*)) {
+  // Prevent from adding the handler for multiple times.
+  darwin_pthread_handler *handler =
+      (darwin_pthread_handler*)pthread_getspecific(cleanup_key);
+  if (handler)
+    return;
+
+  pthread_t self = pthread_self();
+
+  handler = new darwin_pthread_handler();
+  handler->__routine = del;
+  handler->__arg = (void*)key;
+  handler->__next = self->__cleanup_stack;
+  self->__cleanup_stack = handler;
+
+  ThreadLocalSetValue(cleanup_key, handler);
+}
+#endif
 
 /**
  * This is the emulation version of ThreadLocal. In this case, the ThreadLocal
@@ -410,7 +473,13 @@ public:
    * Constructor that has to be called from a thread-neutral place.
    */
   ThreadLocal() : m_key(0) {
+#ifdef __APPLE__
+    ThreadLocalCreateKey(&m_key, nullptr);
+    ThreadLocalCreateKey(&m_cleanup_key,
+                         ThreadLocalOnThreadExit<darwin_pthread_handler>);
+#else
     ThreadLocalCreateKey(&m_key, ThreadLocalOnThreadExit<T>);
+#endif
   }
 
   T *get() const {
@@ -418,6 +487,10 @@ public:
     if (obj == nullptr) {
       obj = new T();
       ThreadLocalSetValue(m_key, obj);
+#ifdef __APPLE__
+      ThreadLocalSetCleanupHandler(m_cleanup_key, m_key,
+                                   ThreadLocalOnThreadCleanup<T>);
+#endif
     }
     return obj;
   }
@@ -446,6 +519,10 @@ public:
 
 private:
   pthread_key_t m_key;
+
+#ifdef __APPLE__
+  pthread_key_t m_cleanup_key;
+#endif
 };
 
 template<typename T>
@@ -455,10 +532,16 @@ public:
    * Constructor that has to be called from a thread-neutral place.
    */
   ThreadLocalNoCheck() : m_key(0) {
+#ifdef __APPLE__
+    ThreadLocalCreateKey(&m_key, nullptr);
+    ThreadLocalCreateKey(&m_cleanup_key,
+                         ThreadLocalOnThreadExit<darwin_pthread_handler>);
+#else
     ThreadLocalCreateKey(&m_key, ThreadLocalOnThreadExit<T>);
+#endif
   }
 
-  T *getCheck() const NEVER_INLINE;
+  NEVER_INLINE T *getCheck() const;
 
   T* getNoCheck() const {
     T *obj = (T*)pthread_getspecific(m_key);
@@ -485,7 +568,12 @@ public:
   }
 
 public:
+  void setNull() { ThreadLocalSetValue(m_key, nullptr); }
   pthread_key_t m_key;
+
+#ifdef __APPLE__
+  pthread_key_t m_cleanup_key;
+#endif
 };
 
 template<typename T>
@@ -494,6 +582,10 @@ T *ThreadLocalNoCheck<T>::getCheck() const {
   if (obj == nullptr) {
     obj = new T();
     ThreadLocalSetValue(m_key, obj);
+#ifdef __APPLE__
+    ThreadLocalSetCleanupHandler(m_cleanup_key, m_key,
+                                 ThreadLocalOnThreadCleanup<T>);
+#endif
   }
   return obj;
 }
@@ -507,13 +599,23 @@ void ThreadLocalSingletonOnThreadExit(void *obj) {
   free(obj);
 }
 
+#ifdef __APPLE__
+template<typename T>
+void ThreadLocalSingletonOnThreadCleanup(void *key) {
+  void *obj = pthread_getspecific((pthread_key_t)key);
+  if (obj) {
+    ThreadLocalSingletonOnThreadExit<T>(obj);
+  }
+}
+#endif
+
 // ThreadLocalSingleton has NoCheck property
 template<typename T>
 class ThreadLocalSingleton {
 public:
   ThreadLocalSingleton() { getKey(); }
 
-  static T *getCheck() NEVER_INLINE;
+  NEVER_INLINE static T *getCheck();
   static T* getNoCheck() {
     assert(s_inited);
     T *obj = (T*)pthread_getspecific(s_key);
@@ -521,7 +623,9 @@ public:
     return obj;
   }
 
-  static bool isNull() { return pthread_getspecific(s_key) == nullptr; }
+  static bool isNull() {
+    return !s_inited || pthread_getspecific(s_key) == nullptr;
+  }
 
   static void destroy() {
     void* p = pthread_getspecific(s_key);
@@ -542,10 +646,20 @@ private:
   static pthread_key_t s_key;
   static bool s_inited; // pthread_key_t has no portable valid sentinel
 
+#ifdef __APPLE__
+  static pthread_key_t s_cleanup_key;
+#endif
+
   static pthread_key_t getKey() {
     if (!s_inited) {
       s_inited = true;
+#ifdef __APPLE__
+      ThreadLocalCreateKey(&s_key, nullptr);
+      ThreadLocalCreateKey(&s_cleanup_key,
+                           ThreadLocalOnThreadExit<darwin_pthread_handler>);
+#else
       ThreadLocalCreateKey(&s_key, ThreadLocalSingletonOnThreadExit<T>);
+#endif
     }
     return s_key;
   }
@@ -559,6 +673,10 @@ T *ThreadLocalSingleton<T>::getCheck() {
     obj = (T*)malloc(sizeof(T));
     T::Create(obj);
     ThreadLocalSetValue(s_key, obj);
+#ifdef __APPLE__
+    ThreadLocalSetCleanupHandler(s_cleanup_key, s_key,
+                                 ThreadLocalSingletonOnThreadCleanup<T>);
+#endif
   }
   return obj;
 }
@@ -567,6 +685,11 @@ template<typename T>
 pthread_key_t ThreadLocalSingleton<T>::s_key;
 template<typename T>
 bool ThreadLocalSingleton<T>::s_inited = false;
+
+#ifdef __APPLE__
+template<typename T>
+pthread_key_t ThreadLocalSingleton<T>::s_cleanup_key;
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 // some classes don't need new/delete at all
@@ -617,14 +740,14 @@ public:
 /**
  * The emulation version of the thread-local macros
  */
-#define DECLARE_THREAD_LOCAL(T, f) ThreadLocal<T> f
-#define IMPLEMENT_THREAD_LOCAL(T, f) ThreadLocal<T> f
+#define DECLARE_THREAD_LOCAL(T, f) HPHP::ThreadLocal<T> f
+#define IMPLEMENT_THREAD_LOCAL(T, f) HPHP::ThreadLocal<T> f
 
-#define DECLARE_THREAD_LOCAL_NO_CHECK(T, f) ThreadLocalNoCheck<T> f
-#define IMPLEMENT_THREAD_LOCAL_NO_CHECK(T, f) ThreadLocalNoCheck<T> f
+#define DECLARE_THREAD_LOCAL_NO_CHECK(T, f) HPHP::ThreadLocalNoCheck<T> f
+#define IMPLEMENT_THREAD_LOCAL_NO_CHECK(T, f) HPHP::ThreadLocalNoCheck<T> f
 
-#define DECLARE_THREAD_LOCAL_PROXY(T, N, f) ThreadLocalProxy<T, N> f
-#define IMPLEMENT_THREAD_LOCAL_PROXY(T, N, f) ThreadLocalProxy<T, N> f
+#define DECLARE_THREAD_LOCAL_PROXY(T, N, f) HPHP::ThreadLocalProxy<T, N> f
+#define IMPLEMENT_THREAD_LOCAL_PROXY(T, N, f) HPHP::ThreadLocalProxy<T, N> f
 
 #endif /* USE_GCC_FAST_TLS */
 

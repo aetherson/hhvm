@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -20,16 +20,17 @@
 #include <memory>
 #include <vector>
 
-#include "folly/Conv.h"
-#include "folly/Format.h"
-#include "folly/String.h"
-#include "folly/Range.h"
-#include "folly/gen/Base.h"
-#include "folly/gen/String.h"
+#include <folly/Conv.h>
+#include <folly/Format.h>
+#include <folly/String.h>
+#include <folly/Range.h>
+#include <folly/gen/Base.h>
+#include <folly/gen/String.h>
 
 #include "hphp/hhbbc/cfg.h"
 #include "hphp/hhbbc/type-system.h"
 #include "hphp/hhbbc/index.h"
+#include "hphp/hhbbc/func-util.h"
 
 namespace HPHP { namespace HHBBC {
 
@@ -63,14 +64,7 @@ std::string escaped_string(SString str) {
     return ret;
   }
   auto const sl = str->slice();
-  folly::toAppend(
-    "\"",
-    folly::cEscape<std::string>(
-      folly::StringPiece(sl.ptr, sl.len)
-    ),
-    "\"",
-    &ret
-  );
+  folly::toAppend("\"", folly::cEscape<std::string>(sl), "\"", &ret);
   return ret;
 };
 
@@ -172,7 +166,7 @@ std::string show(const Func& func) {
 #undef X
 
   ret += folly::format("digraph {} {{\n  node [shape=box];\n{}}}\n",
-    func.name->data(), indent(2, dot_cfg(func))).str();
+    func.name, indent(2, dot_cfg(func))).str();
 
   for (auto& blk : func.blocks) {
     ret += folly::format(
@@ -299,7 +293,7 @@ std::string show(const Bytecode& bc) {
         folly::toAppend(":", m.immInt, &ret);
         break;
       case MCodeImm::Local:
-        folly::toAppend(":$", m.immLoc->name->data(), &ret);
+        folly::toAppend(":$", local_string(m.immLoc), &ret);
         break;
       }
     }
@@ -353,9 +347,8 @@ std::string show(const Bytecode& bc) {
 #define IMM_RATA(n)    folly::toAppend(" ", show(data.rat), &ret);
 #define IMM_AA(n)      ret += " " + array_string(data.arr##n);
 #define IMM_BA(n)      folly::toAppend(" <blk:", data.target->id, ">", &ret);
-#define IMM_OA_IMPL(n) /* empty */
-#define IMM_OA(type)   folly::toAppend(" ", subopToName(data.subop), &ret); \
-                       IMM_OA_IMPL
+#define IMM_OA_IMPL(n) folly::toAppend(" ", subopToName(data.subop##n), &ret);
+#define IMM_OA(type)   IMM_OA_IMPL
 #define IMM_VSA(n)     ret += " "; append_vsa(data.keys);
 
 #define IMM_NA
@@ -577,6 +570,11 @@ std::string show(Type t) {
 
 std::string show(Context ctx) {
   auto ret = std::string{};
+  if (is_pseudomain(ctx.func)) {
+    ret = ctx.func->unit->filename->data();
+    ret += ";pseudomain";
+    return ret;
+  }
   if (ctx.cls) {
     ret = ctx.cls->name->data();
     ret += "::";

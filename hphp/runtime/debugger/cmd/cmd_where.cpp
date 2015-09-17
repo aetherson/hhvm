@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,13 +15,15 @@
 */
 
 #include "hphp/runtime/debugger/cmd/cmd_where.h"
+
 #include "hphp/runtime/base/array-iterator.h"
-#include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/backtrace.h"
-#include "hphp/runtime/ext/ext_asio.h"
-#include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/asio/async_function_wait_handle.h"
-#include "hphp/runtime/ext/asio/waitable_wait_handle.h"
+#include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/debugger/debugger_client.h"
+#include "hphp/runtime/ext/asio/ext_async-function-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_asio.h"
+#include "hphp/runtime/ext/asio/ext_waitable-wait-handle.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
@@ -190,7 +192,7 @@ void addAsyncFunctionLocation(Array& frameData,
 // args, wait handle status, etc.
 static Array createAsyncStacktrace() {
   Array trace;
-  auto currentWaitHandle = f_asio_get_running();
+  auto currentWaitHandle = HHVM_FN(asio_get_running)();
   if (currentWaitHandle.isNull()) return trace;
   Array depStack =
     objToWaitableWaitHandle(currentWaitHandle)->t_getdependencystack();

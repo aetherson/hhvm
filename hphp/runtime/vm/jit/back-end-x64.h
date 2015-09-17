@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,14 +18,13 @@
 
 #include "hphp/runtime/vm/jit/back-end.h"
 
-namespace HPHP { namespace jit { namespace X64 {
+namespace HPHP { namespace jit { namespace x64 {
 
-constexpr int kJmpLen = 5;
-constexpr int kCallLen = 5;
-constexpr int kJmpccLen = 6;
-constexpr int kJmpImmBytes = 4;
+//////////////////////////////////////////////////////////////////////
 
 std::unique_ptr<BackEnd> newBackEnd();
+
+//////////////////////////////////////////////////////////////////////
 
 }}}
 

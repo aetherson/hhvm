@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -19,24 +19,18 @@
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
-
-inline StringData* StringData::Make() {
-  return Make(SmallStringReserve);
-}
-
-//////////////////////////////////////////////////////////////////////
 // CopyString
 
 inline StringData* StringData::Make(const char* data) {
   return Make(data, CopyString);
 }
 
-inline StringData* StringData::Make(const char* data, CopyStringMode) {
-  return Make(data, strlen(data), CopyString);
+inline StringData* StringData::Make(const std::string& data) {
+  return Make(data.data(), data.length(), CopyString);
 }
 
-inline StringData* StringData::Make(const StringData* s, CopyStringMode) {
-  return Make(s->slice(), CopyString);
+inline StringData* StringData::Make(const char* data, CopyStringMode) {
+  return Make(data, strlen(data), CopyString);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -53,11 +47,7 @@ inline StringData* StringData::Make(char* data, AttachStringMode) {
 // Concat creation
 
 inline StringData* StringData::Make(const StringData* s1,
-                                    const StringData* s2) {
-  return Make(s1->slice(), s2->slice());
-}
-
-inline StringData* StringData::Make(const StringData* s1, StringSlice s2) {
+                                    folly::StringPiece s2) {
   return Make(s1->slice(), s2);
 }
 
@@ -67,35 +57,13 @@ inline StringData* StringData::Make(const StringData* s1, const char* lit2) {
 
 //////////////////////////////////////////////////////////////////////
 
-inline void StringData::destruct() {
-  assert(checkSane());
-
-  // N.B. APC code assumes it is legal to call destruct() on a static
-  // string.  Probably it shouldn't do that....
-  if (!isStatic()) {
-    assert(m_data == static_cast<void*>(this + 1));
-    free(this);
-  }
+inline folly::StringPiece StringData::slice() const {
+  return folly::StringPiece{m_data, m_len};
 }
 
-//////////////////////////////////////////////////////////////////////
-
-inline void StringData::setRefCount(RefCount n) { m_count = n; }
-inline bool StringData::isStatic() const {
-  return m_count == StaticValue;
-}
-
-inline bool StringData::isUncounted() const {
-  return m_count == UncountedValue;
-}
-
-inline StringSlice StringData::slice() const {
-  return StringSlice(m_data, m_len);
-}
-
-inline MutableSlice StringData::bufferSlice() {
+inline folly::MutableStringPiece StringData::bufferSlice() {
   assert(!isImmutable());
-  return MutableSlice(m_data, capacity() - 1);
+  return folly::MutableStringPiece{m_data, capacity()};
 }
 
 inline void StringData::invalidateHash() {
@@ -106,11 +74,11 @@ inline void StringData::invalidateHash() {
 }
 
 inline void StringData::setSize(int len) {
-  assert(len >= 0 && len < capacity() && !isImmutable());
+  assert(len >= 0 && len <= capacity() && !isImmutable());
   assert(!hasMultipleRefs());
   m_data[len] = 0;
-  m_len = len;
-  m_hash = 0;
+  m_lenAndHash = len;
+  assert(m_hash == 0);
   assert(checkSane());
 }
 
@@ -120,14 +88,25 @@ inline void StringData::checkStack() const {
 
 inline const char* StringData::data() const {
   // TODO: t1800106: re-enable this assert
-  //assert(m_data[size()] == 0); // all strings must be null-terminated
+  // assert(m_data[size()] == 0); // all strings must be null-terminated
   return m_data;
 }
 
-inline char* StringData::mutableData() const { return m_data; }
+inline char* StringData::mutableData() const {
+  assert(!isImmutable());
+  return m_data;
+}
+
 inline int StringData::size() const { return m_len; }
 inline bool StringData::empty() const { return size() == 0; }
-inline uint32_t StringData::capacity() const { return m_cap; }
+inline uint32_t StringData::capacity() const {
+  return m_hdr.aux.decode();
+}
+
+inline size_t StringData::heapSize() const {
+  return isFlat() ? sizeof(StringData) + 1 + capacity() :
+         sizeof(StringData) + sizeof(SharedPayload);
+}
 
 inline bool StringData::isStrictlyInteger(int64_t& res) const {
   // Exploit the NUL terminator and unsigned comparison. This single comparison
@@ -140,7 +119,7 @@ inline bool StringData::isStrictlyInteger(int64_t& res) const {
   }
   if (isStatic() && m_hash < 0) return false;
   auto const s = slice();
-  return is_strictly_integer(s.ptr, s.len, res);
+  return is_strictly_integer(s.data(), s.size(), res);
 }
 
 inline bool StringData::isZero() const  {
@@ -164,13 +143,12 @@ inline strhash_t StringData::hash() const {
 
 inline bool StringData::same(const StringData* s) const {
   assert(s);
-  size_t len = m_len;
-  if (len != s->m_len) return false;
-  // The underlying buffer and its length are 32-bit aligned, ensured by
-  // StringData layout, smart_malloc, or malloc. So compare words.
-  assert(uintptr_t(data()) % 4 == 0);
-  assert(uintptr_t(s->data()) % 4 == 0);
-  return wordsame(data(), s->data(), len);
+  if (m_len != s->m_len) return false;
+  // The underlying buffer and its length are 8-byte aligned, ensured by
+  // StringData layout, req::malloc, or malloc. So compare words.
+  assert(uintptr_t(data()) % 8 == 0);
+  assert(uintptr_t(s->data()) % 8 == 0);
+  return wordsame(data(), s->data(), m_len);
 }
 
 inline bool StringData::isame(const StringData* s) const {
@@ -191,10 +169,10 @@ inline StringData::SharedPayload* StringData::sharedPayload() {
   return static_cast<SharedPayload*>(voidPayload());
 }
 
-inline bool StringData::isShared() const { return !m_cap; }
 inline bool StringData::isFlat() const { return m_data == voidPayload(); }
+inline bool StringData::isShared() const { return m_data != voidPayload(); }
 inline bool StringData::isImmutable() const {
-  return isStatic() || isShared() ||  isUncounted();
+  return !isRefCounted() || isShared();
 }
 
 //////////////////////////////////////////////////////////////////////

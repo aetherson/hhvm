@@ -1,4 +1,5 @@
 <?hh
+
 require_once __DIR__.'/SortedIterator.php';
 require_once __DIR__.'/Options.php';
 
@@ -8,7 +9,7 @@ class TimeoutException extends Exception {
 # There's an outer timeout of 300s; this number must be less than that (with
 # fudge factor)
 const INSTALL_TIMEOUT_SECS = 240;
-const NETWORK_RETRIES = 3;
+const NETWORK_RETRIES = 1;
 
 // For determining number of processes
 function num_cpus() {
@@ -77,10 +78,10 @@ function find_first_file_recursive(Set $filenames, string $root_dir,
   $sit = new SortedIterator($rit);
 
   foreach ($sit as $fileinfo) {
-    if ($filenames->contains($fileinfo->getFileName())) {
+    if ($filenames->contains($fileinfo->getFilename())) {
       return $just_path_to_file
              ? $fileinfo->getPath()
-             : $fileinfo->getPathName();
+             : $fileinfo->getPathname();
     }
   }
 
@@ -99,11 +100,11 @@ function find_all_files(string $pattern, string $root_dir,
   $rit = new RecursiveIteratorIterator($dit);
   $sit = new SortedIterator($rit);
   foreach ($sit as $fileinfo) {
-    if (preg_match($pattern, $fileinfo->getFileName()) === 1 &&
-        preg_match($exclude_file_pattern, $fileinfo->getFileName()) === 0 &&
+    if (preg_match($pattern, $fileinfo->getFilename()) === 1 &&
+        preg_match($exclude_file_pattern, $fileinfo->getFilename()) === 0 &&
         strstr($fileinfo->getPath(), '/vendor/') === false &&
         !nullthrows($exclude_dirs)->contains(dirname($fileinfo->getPath()))) {
-      $files[] = $fileinfo->getPathName();
+      $files[] = $fileinfo->getPathname();
     }
   }
 
@@ -125,19 +126,15 @@ function find_all_files_containing_text(
   $rit = new RecursiveIteratorIterator($dit);
   $sit = new SortedIterator($rit);
   foreach ($sit as $fileinfo) {
-    if (strpos(file_get_contents($fileinfo->getPathName()), $text) !== false &&
-        preg_match($exclude_file_pattern, $fileinfo->getFileName()) === 0 &&
+    if (strpos(file_get_contents($fileinfo->getPathname()), $text) !== false &&
+        preg_match($exclude_file_pattern, $fileinfo->getFilename()) === 0 &&
         strstr($fileinfo->getPath(), '/vendor/') === false &&
         !nullthrows($exclude_dirs)->contains(dirname($fileinfo->getPath()))) {
-      $files[] = $fileinfo->getPathName();
+      $files[] = $fileinfo->getPathname();
     }
   }
 
   return $files;
-}
-
-function idx(array $array, mixed $key, mixed $default = null): mixed {
-  return isset($array[$key]) ? $array[$key] : $default;
 }
 
 function command_exists(string $cmd): bool {
@@ -310,7 +307,10 @@ function get_runtime_build(bool $use_php = false): string {
   return nullthrows($command);
 }
 
-function error_and_exit(string $message): void {
+function error_and_exit(
+  string $message,
+  string $fbmake_action = 'skipped',
+): void {
   if (Options::$output_format === OutputFormat::FBMAKE) {
     fprintf(
       STDERR,
@@ -319,7 +319,7 @@ function error_and_exit(string $message): void {
         [
           'op' => 'test_done',
           'test' => 'framework test setup',
-          'status' => 'skipped',
+          'status' => $fbmake_action,
           'details' => 'ERROR: '.$message,
         ],
         /* assoc array = */ true,
@@ -343,14 +343,13 @@ function include_all_php($folder){
 function run_install(
   string $proc,
   string $path,
-  ?Map $env,
+  ?Map $env = null,
   int $retries = NETWORK_RETRIES
 ): ?int {
-  $tries = 0;
   // We need to output something every once in a while - if we go quiet, fbmake
   // kills us.
   for ($try = 1; $try <= $retries; ++$try) {
-    $test_name = $proc.' - attempt '.++$try;
+    $test_name = $proc.' - attempt '.$try;
     try {
       fbmake_json(Map {'op' => 'start', 'test' => $test_name});
       $result = run_install_impl($proc, $path, $env);
@@ -360,6 +359,7 @@ function run_install(
       return $result;
     } catch (TimeoutException $e) {
       verbose((string) $e);
+      remove_dir_recursive(nullthrows($path));
       fbmake_json(
         Map {'op' => 'test_done', 'test' => $test_name, 'status' => 'skipped' }
       );
@@ -404,8 +404,13 @@ function run_install_impl(string $proc, string $path, ?Map $env): ?int
     $write = [];
     $except = $read;
     $ready = null;
-    while (true) {
-      $ready = stream_select($read, $write, $except, INSTALL_TIMEOUT_SECS);
+    $done_by = time() + INSTALL_TIMEOUT_SECS;
+    while ($done_by > time()) {
+      $remaining = $done_by - time();
+      $ready = stream_select(
+        $read, $write, $except,
+        $remaining > 0 ? $remaining : 1
+      );
       if ($ready === 0) {
         proc_terminate($process);
         throw new TimeoutException("Hit timeout reading from proc: ".$proc);
@@ -438,4 +443,11 @@ function nullthrows<T>(?T $x, ?string $message = null): T {
     $message = 'Unexpected null';
   }
   throw new Exception($message);
+}
+
+// Use this instead of unlink to avoid warnings
+function delete_file(?string $path): void {
+  if ($path !== null && file_exists($path)) {
+    unlink($path);
+  }
 }

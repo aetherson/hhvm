@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1998-2010 Zend Technologies Ltd. (http://www.zend.com) |
    +----------------------------------------------------------------------+
    | This source file is subject to version 2.00 of the Zend license,     |
@@ -20,6 +20,7 @@
 #include <unicode/utf8.h>
 
 #include "hphp/util/lock.h"
+#include "hphp/util/functional.h"
 
 namespace HPHP {
 
@@ -427,12 +428,12 @@ static void init_entity_table() {
     XHPEntityMap[charset]["amp"] = "&";
     // XHP-specific entities
     XHPEntityMap[charset]["apos"] = "\'";
-    XHPEntityMap[charset]["cloud"] = "\u2601";
-    XHPEntityMap[charset]["umbrella"] = "\u2602";
-    XHPEntityMap[charset]["snowman"] = "\u2603";
-    XHPEntityMap[charset]["snowflake"] = "\u2745";
-    XHPEntityMap[charset]["comet"] = "\u2604";
-    XHPEntityMap[charset]["thunderstorm"] = "\u2608";
+    XHPEntityMap[charset]["cloud"] = u8"\u2601";
+    XHPEntityMap[charset]["umbrella"] = u8"\u2602";
+    XHPEntityMap[charset]["snowman"] = u8"\u2603";
+    XHPEntityMap[charset]["snowflake"] = u8"\u2745";
+    XHPEntityMap[charset]["comet"] = u8"\u2604";
+    XHPEntityMap[charset]["thunderstorm"] = u8"\u2608";
   }
 
   // the first element is an empty table
@@ -442,12 +443,12 @@ static void init_entity_table() {
   EntityMap[cs_terminator]["amp"] = "&";
   // XHP-specific entities
   XHPEntityMap[cs_terminator]["apos"] = "\'";
-  XHPEntityMap[cs_terminator]["cloud"] = "\u2601";
-  XHPEntityMap[cs_terminator]["umbrella"] = "\u2602";
-  XHPEntityMap[cs_terminator]["snowman"] = "\u2603";
-  XHPEntityMap[cs_terminator]["snowflake"] = "\u2745";
-  XHPEntityMap[cs_terminator]["comet"] = "\u2604";
-  XHPEntityMap[cs_terminator]["thunderstorm"] = "\u2608";
+  XHPEntityMap[cs_terminator]["cloud"] = u8"\u2601";
+  XHPEntityMap[cs_terminator]["umbrella"] = u8"\u2602";
+  XHPEntityMap[cs_terminator]["snowman"] = u8"\u2603";
+  XHPEntityMap[cs_terminator]["snowflake"] = u8"\u2745";
+  XHPEntityMap[cs_terminator]["comet"] = u8"\u2604";
+  XHPEntityMap[cs_terminator]["thunderstorm"] = u8"\u2608";
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -462,8 +463,10 @@ inline static bool decode_entity(char *entity, int *len,
   if (entity[0] == '#') {
     int code;
     if (entity[1] == 'x' || entity[1] == 'X') {
+      if (!isxdigit(entity[2])) return false;
       code = strtol(entity + 2, nullptr, 16);
     } else {
+      if (!isdigit(entity[1])) return false;
       code = strtol(entity + 1, nullptr, 10);
     }
 
@@ -699,6 +702,23 @@ char *string_html_encode(const char *input, int &len,
       if (LIKELY(c < 0x80)) {
         *q++ = c;
         break;
+      } else if (htmlEnt && !utf8 && (c - 160) < sizeof(ent_iso_8859_1) - 1) {
+        /**
+          * https://github.com/facebook/hhvm/issues/2186
+          * If not UTF8, and we are converting to HTML entities, use known
+          * entity equivalent of the character, if possible.
+          * Since we only support ISO-8859-1 or UTF8 right now, and they use
+          * the same mapping array, use it.
+          * Start at 0xA0 = 160
+          */
+        *q++ = '&';
+        const char *s = ent_iso_8859_1[c - 160];
+        int len = strlen(s);
+        for (int n = 0; n < len; n++) {
+          *q++ = *s++;
+        }
+        *q++ = ';';
+        break;
       }
 
       bool should_skip =
@@ -713,40 +733,50 @@ char *string_html_encode(const char *input, int &len,
 
       auto avail = end - p;
       auto utf8_trail = [](unsigned char c) { return c >= 0x80 && c <= 0xbf; };
+      auto utf8_lead = [](unsigned char c) {
+        return c < 0x80 || (c >= 0xC2 && c <= 0xF4);
+      };
 
       // This has to be a macro since it needs to be able to break away from
       // the for loop we're in.
       // ENT_IGNORE has higher precedence than ENT_SUBSTITUTE
       // \uFFFD is Unicode Replacement Character (U+FFFD)
-      #define UTF8_ERROR_IF(cond) \
+      #define UTF8_ERROR_IF_LEN(cond, len) \
         if (cond) { \
+          p += (len) - 1; \
           if (should_skip) { break; } \
-          else if (should_replace) { strcpy(q, "\uFFFD"); q += 3; break; } \
+          else if (should_replace) { strcpy(q, u8"\uFFFD"); q += 3; break; } \
           else { goto exit_error; } \
         }
+
+      #define UTF8_ERROR_IF(cond) UTF8_ERROR_IF_LEN(cond, 1)
 
       if (utf8) {
         if (c < 0xc2) {
           UTF8_ERROR_IF(true);
         } else if (c < 0xe0) {
-          UTF8_ERROR_IF(avail < 2 || !utf8_trail(*(p + 1)));
+          UTF8_ERROR_IF(avail < 2);
+          UTF8_ERROR_IF_LEN(!utf8_trail(*(p + 1)), utf8_lead(*(p + 1)) ? 1 : 2);
 
           uint16_t tc = ((c & 0x1f) << 6) | (p[1] & 0x3f);
-          UTF8_ERROR_IF(tc < 0x80); // non-shortest form
+          UTF8_ERROR_IF_LEN(tc < 0x80, 2); // non-shortest form
 
           codeLength = 2;
           entity[0] = *p;
           entity[1] = *(p + 1);
           entity[2] = '\0';
         } else if (c < 0xf0) {
-          UTF8_ERROR_IF(avail < 3);
-          UTF8_ERROR_IF(!utf8_trail(*(p + 1)) || !utf8_trail(*(p + 2)));
+          if (avail < 3 || !utf8_trail(*(p + 1)) || !utf8_trail(*(p + 2))) {
+            UTF8_ERROR_IF_LEN(avail < 2 || utf8_lead(*(p + 1)), 1);
+            UTF8_ERROR_IF_LEN(avail < 3 || utf8_lead(*(p + 2)), 2);
+            UTF8_ERROR_IF_LEN(true, 3);
+          }
 
           uint32_t tc = ((c & 0x0f) << 12) |
                         ((*(p+1) & 0x3f) << 6) |
                         (*(p+2) & 0x3f);
-          UTF8_ERROR_IF(tc < 0x800); // non-shortest form
-          UTF8_ERROR_IF(tc >= 0xd800 && tc <= 0xdfff); // surrogate
+          UTF8_ERROR_IF_LEN(tc < 0x800, 3); // non-shortest form
+          UTF8_ERROR_IF_LEN(tc >= 0xd800 && tc <= 0xdfff, 3); // surrogate
 
           codeLength = 3;
           entity[0] = *p;
@@ -754,10 +784,13 @@ char *string_html_encode(const char *input, int &len,
           entity[2] = *(p + 2);
           entity[3] = '\0';
         } else if (c < 0xf5) {
-          UTF8_ERROR_IF(avail < 4);
-          UTF8_ERROR_IF(!utf8_trail(*(p + 1)));
-          UTF8_ERROR_IF(!utf8_trail(*(p + 2)));
-          UTF8_ERROR_IF(!utf8_trail(*(p + 3)));
+          if (avail < 4 || !utf8_trail(*(p + 1)) || !utf8_trail(*(p + 2)) ||
+              !utf8_trail(*(p + 3))) {
+            UTF8_ERROR_IF_LEN(avail < 2 || utf8_lead(*(p + 1)), 1);
+            UTF8_ERROR_IF_LEN(avail < 3 || utf8_lead(*(p + 2)), 2);
+            UTF8_ERROR_IF_LEN(avail < 4 || utf8_lead(*(p + 3)), 3);
+            UTF8_ERROR_IF_LEN(true, 4);
+          }
 
           uint32_t tc = ((c & 0x07) << 18) |
                         ((*(p+1) & 0x3f) << 12) |
@@ -765,7 +798,7 @@ char *string_html_encode(const char *input, int &len,
                         (*(p+3) & 0x3f);
 
           // non-shortest form or outside range
-          UTF8_ERROR_IF(tc < 0x10000 || tc > 0x10ffff);
+          UTF8_ERROR_IF_LEN(tc < 0x10000 || tc > 0x10ffff, 4);
 
           codeLength = 4;
           entity[0] = *p;
@@ -813,6 +846,7 @@ char *string_html_encode(const char *input, int &len,
   }
 
   #undef UTF8_ERROR_IF
+  #undef UTF8_ERROR_IF_LEN
 
   if (q - ret > INT_MAX) {
     goto exit_error;
@@ -849,7 +883,7 @@ char *string_html_encode_extra(const char *input, int &len,
     return nullptr;
   }
   char *q = ret;
-  const char *rep = "\ufffd";
+  const char *rep = u8"\ufffd";
   int32_t srcPosBytes;
   for (srcPosBytes = 0; srcPosBytes < len; /* incremented in-loop */) {
     unsigned char c = input[srcPosBytes];

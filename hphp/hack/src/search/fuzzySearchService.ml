@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,12 +8,12 @@
  *
  *)
 
+open Core
 open Utils
 
 module Make(S : SearchUtils.Searchable) = struct
 
-module SUtils = SearchUtils.Make(S)
-open SUtils
+open SearchUtils
 
 type search_result_type = S.t
 
@@ -24,7 +24,7 @@ module TMap = MyMap(struct
   let compare = S.compare_result_type
 end)
 
-type type_to_key_to_term_list = term list SMap.t TMap.t
+type type_to_key_to_term_list = (Pos.t, S.t) term list SMap.t TMap.t
 type type_to_keyset = SSet.t TMap.t
 
 (* Note only shared memory is modified within workers - and the keys are files
@@ -44,7 +44,7 @@ type type_to_keyset = SSet.t TMap.t
  *   }
  * }
  *)
-module SearchKeys = SharedMem.NoCache(struct
+module SearchKeys = SharedMem.NoCache (Relative_path.S) (struct
   type t = type_to_keyset
   let prefix = Prefix.make()
 end)
@@ -67,7 +67,7 @@ end)
  *   }
  * }
  *)
-module SearchKeyToTermMap = SharedMem.WithCache(struct
+module SearchKeyToTermMap = SharedMem.WithCache (Relative_path.S) (struct
   type t = type_to_key_to_term_list
   let prefix = Prefix.make()
 end)
@@ -92,7 +92,7 @@ let term_indexes = ref TMap.empty
  * This is never modified in a worker, it's built in the main process using the
  * results from the worker processes.
  *)
-let old_search_terms = Hashtbl.create 160000
+let old_search_terms = ref (Hashtbl.create 160000)
 
 (* Allows us to lookup by term name to find the files it is in - it's a reverse
  * map of SearchKeys.  It's not worth adding a type layer, since we only use
@@ -110,7 +110,17 @@ let old_search_terms = Hashtbl.create 160000
  *   ...
  * }
  *)
-let term_lookup = Hashtbl.create 250000
+let term_lookup = ref (Hashtbl.create 250000)
+
+let marshal chan =
+  Marshal.to_channel chan !term_indexes [];
+  Marshal.to_channel chan !old_search_terms [];
+  Marshal.to_channel chan !term_lookup []
+
+let unmarshal chan =
+  term_indexes := Marshal.from_channel chan;
+  old_search_terms := Marshal.from_channel chan;
+  term_lookup := Marshal.from_channel chan
 
 (* We take out special characters from the string for the query - they aren't
  * useful during searches *)
@@ -243,17 +253,17 @@ let remove_terms_from_index type_ terms =
 let update_term_lookup file add_terms remove_terms =
   SSet.iter begin fun term ->
     let old_val =
-      try Hashtbl.find term_lookup term
-      with Not_found -> SSet.empty
+      try Hashtbl.find !term_lookup term
+      with Not_found -> Relative_path.Set.empty
     in
-    Hashtbl.replace term_lookup term (SSet.remove file old_val);
+    Hashtbl.replace !term_lookup term (Relative_path.Set.remove file old_val);
   end remove_terms;
   SSet.iter begin fun term ->
     let old_val =
-      try Hashtbl.find term_lookup term
-      with Not_found -> SSet.empty
+      try Hashtbl.find !term_lookup term
+      with Not_found -> Relative_path.Set.empty
     in
-    Hashtbl.replace term_lookup term (SSet.add file old_val);
+    Hashtbl.replace !term_lookup term (Relative_path.Set.add file old_val);
   end add_terms
 
 (* Updates the keylist and defmap for a file (will be used to populate
@@ -280,9 +290,9 @@ let update fn fuzzy_defs =
   SearchKeyToTermMap.add fn fuzzy_defs;
   let fuzzy_keys = TMap.fold begin fun key value acc ->
     let terms_for_key = SMap.keys value in
-    let terms_for_key = List.fold_left begin fun acc x ->
+    let terms_for_key = List.fold_left terms_for_key ~f:begin fun acc x ->
       SSet.add x acc
-    end SSet.empty terms_for_key in
+    end ~init:SSet.empty in
     TMap.add key terms_for_key acc
   end fuzzy_defs TMap.empty in
   SearchKeys.add fn fuzzy_keys
@@ -291,16 +301,16 @@ let update fn fuzzy_defs =
 let index_files files =
   if TMap.is_empty !term_indexes
   then begin
-    term_indexes := List.fold_left begin fun acc x ->
+    term_indexes := List.fold_left all_types ~f:begin fun acc x ->
       TMap.add x (Hashtbl.create 30) acc
-    end TMap.empty all_types
+    end ~init:TMap.empty
   end;
-  SSet.iter begin fun file ->
+  Relative_path.Set.iter begin fun file ->
     let new_terms = try SearchKeys.find_unsafe file
     with Not_found -> TMap.empty in
-    let old_terms = try Hashtbl.find old_search_terms file
+    let old_terms = try Hashtbl.find !old_search_terms file
     with Not_found -> TMap.empty in
-    Hashtbl.replace old_search_terms file new_terms;
+    Hashtbl.replace !old_search_terms file new_terms;
 
     TMap.iter begin fun type_ new_terms ->
       let old_terms =
@@ -334,7 +344,7 @@ let get_terms needle type_ =
       with Not_found -> []
     end
     | None -> begin
-      List.fold_left begin fun acc type_ ->
+      List.fold_left all_types ~f:begin fun acc type_ ->
         let letter_val = get_index_for_type type_ in
         try
           let hset = Hashtbl.find letter_val key in
@@ -342,20 +352,20 @@ let get_terms needle type_ =
             (term, type_) :: acc
           end hset acc
         with Not_found -> acc
-      end [] all_types
+      end ~init:[]
     end
   with Invalid_argument _ -> [] (* Catches if the query is an empty string *)
 
 (* Looks up the actual `term` objects based on the given strings
- * i.e. use the preivously built `term_lookup` table so we can return
+ * i.e. use the previously built `term_lookup` table so we can return
  * `term` objects instead of just relevant strings *)
 let get_terms_from_string_and_type strings =
-  List.fold_left begin fun acc ((str, type_), score) ->
+  List.fold_left strings ~f:begin fun acc ((str, type_), score) ->
     let files =
-      try Hashtbl.find term_lookup str
-      with Not_found -> SSet.empty
+      try Hashtbl.find !term_lookup str
+      with Not_found -> Relative_path.Set.empty
     in
-    SSet.fold begin fun file acc ->
+    Relative_path.Set.fold begin fun file acc ->
       let defmap =
         try SearchKeyToTermMap.find_unsafe file
         with Not_found -> TMap.empty
@@ -367,17 +377,17 @@ let get_terms_from_string_and_type strings =
         in
 
         let term_list = SMap.find_unsafe str term_map in
-        List.fold_left begin fun acc term ->
+        List.fold_left term_list ~f:begin fun acc term ->
           (term, score) :: acc
-        end acc term_list
+        end ~init:acc
       with Not_found -> acc
     end files acc
-  end [] strings
+  end ~init:[]
 
 let query needle type_ =
   let needle = strip_special_characters needle in
   let terms = get_terms needle type_ in
-  let terms = List.fold_left begin fun acc (term, type_) ->
+  let terms = List.fold_left terms ~f:begin fun acc (term, type_) ->
     if check_if_matches_uppercase_chars needle term then
       ((term, type_), 0) :: acc
     else
@@ -399,7 +409,7 @@ let query needle type_ =
           ((term, type_), (snd cs)) :: acc
         else
           acc
-  end [] terms in
+  end ~init:[] in
   let terms = List.sort begin fun a b ->
     (snd a) - (snd b)
   end terms in

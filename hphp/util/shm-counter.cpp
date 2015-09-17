@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,9 +18,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <new>
+
+#ifdef ENABLE_SHM_COUNTER
 #include <sys/ipc.h>
 #include <sys/shm.h>
-#include <new>
+#endif
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -30,12 +33,12 @@ int ShmCounters::shmid;
 ShmCounters::logError_t ShmCounters::logError;
 ShmCounters *ShmCounters::s_shmCounters;
 
-#define LOG_ERROR(fmt, args...) \
+#define LOG_ERROR(fmt, ...) \
 do { \
   if (ShmCounters::logError) { \
-    ShmCounters::logError(fmt, ##args); \
+    ShmCounters::logError(fmt, ##__VA_ARGS__); \
   } else { \
-    fprintf(stderr, fmt, ##args); \
+    fprintf(stderr, fmt, ##__VA_ARGS__); \
   } \
 } while (false)
 
@@ -63,12 +66,12 @@ bool ShmCounters::initialize(bool create, logError_t logError /* = NULL */) {
   int shmid = shmget(SHM_COUNTER_KEY, sizeof(ShmCounters), flags);
   if (shmid == -1) {
     LOG_ERROR("shmget failed: %d\n", errno);
-    exit(-1);
+    return false;
   }
   struct shmid_ds sb;
   if (shmctl(shmid, IPC_STAT, &sb) == -1) {
     LOG_ERROR("shmctl failed: %d\n", errno);
-    exit(-1);
+    return false;
   }
   if (sb.shm_nattch == 0 && !create) {
     LOG_ERROR("no process attached, exiting...\n");
@@ -78,7 +81,7 @@ bool ShmCounters::initialize(bool create, logError_t logError /* = NULL */) {
   s_shmCounters = (ShmCounters *)shmat(shmid, 0, 0);
   if (s_shmCounters == (void *)-1) {
     LOG_ERROR("shmat failed: %d\n", errno);
-    exit(-1);
+    return false;
   }
   if (create) new (s_shmCounters) ShmCounters();
   ShmCounters::created = create;

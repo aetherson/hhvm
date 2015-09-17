@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,20 +16,19 @@
 #ifndef incl_HPHP_STATIC_STRING_TABLE_H_
 #define incl_HPHP_STATIC_STRING_TABLE_H_
 
-
-#include "hphp/runtime/base/types.h"
-
-#include "hphp/util/slice.h"
-
 #include <string>
+
+#include <folly/Range.h>
+
+#include "hphp/runtime/base/rds.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
+struct Array;
 struct StringData;
 struct String;
-struct Array;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -48,7 +47,7 @@ struct Array;
  *
  * Because all constants defined in hhvm programs create a
  * process-lifetime string for the constant name, this module also
- * manages a mapping from constant names to RDS::Handles.
+ * manages a mapping from constant names to rds::Handles.
  */
 
 //////////////////////////////////////////////////////////////////////
@@ -59,7 +58,7 @@ struct Array;
  * and return it.
  */
 StringData* makeStaticString(const StringData* str);
-StringData* makeStaticString(StringSlice);
+StringData* makeStaticString(folly::StringPiece);
 StringData* makeStaticString(const std::string& str);
 StringData* makeStaticString(const String& str);
 StringData* makeStaticString(const char* str, size_t len);
@@ -97,8 +96,14 @@ size_t makeStaticStringSize();
  * Functions mapping constants to RDS handles to their values in a
  * given request.
  */
-RDS::Handle lookupCnsHandle(const StringData* cnsName);
-RDS::Handle makeCnsHandle(const StringData* cnsName, bool persistent);
+rds::Handle lookupCnsHandle(const StringData* cnsName);
+rds::Handle makeCnsHandle(const StringData* cnsName, bool persistent);
+
+/*
+ * Return an array of all the static strings in the current
+ * execution context.
+ */
+std::vector<StringData*> lookupDefinedStaticStrings();
 
 /*
  * Return an array of all the defined constants in the current

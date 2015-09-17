@@ -12,7 +12,6 @@
 #include "cs_config.h"
 
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -20,6 +19,16 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <sys/stat.h>
+
+#ifdef _MSC_VER
+#include <windows.h>
+#include <direct.h>
+#include <io.h>
+#define PATH_MAX MAX_PATH
+#else
+#include <unistd.h>
+#endif
+
 #include "neo_misc.h"
 #include "neo_err.h"
 #include "neo_rand.h"
@@ -434,7 +443,7 @@ NEOERR* hdf_set_attr (HDF *hdf, const char *name, const char *key,
 
   _walk_hdf(hdf, name, &obj);
   if (obj == NULL)
-    return nerr_raise(NERR_ASSERT, "Unable to set attribute on none existant node");
+    return nerr_raise(NERR_ASSERT, "Unable to set attribute on none existent node");
 
   if (obj->attr != NULL)
   {
@@ -1776,7 +1785,11 @@ static NEOERR* _hdf_read_string (HDF *hdf, const char **str, NEOSTRING *line,
 	s+=2;
 	value = neos_strip(s);
 
+#ifdef _MSC_VER
+        FILE *f = _popen(value, "r");
+#else
         FILE *f = popen(value, "r");
+#endif
 	if (f == NULL)
         {
 	  err = nerr_raise(NERR_PARSE,

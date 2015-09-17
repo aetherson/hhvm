@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -18,18 +18,24 @@
 
 #include <iostream>
 
+#include <folly/Likely.h>
+#include <folly/Format.h>
+
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/exceptions.h"
+#include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/string-buffer.h"
 #include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/base/backtrace.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 #include "hphp/util/logger.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-const int64_t k_DEBUG_BACKTRACE_PROVIDE_OBJECT = 1;
-const int64_t k_DEBUG_BACKTRACE_IGNORE_ARGS = 2;
+const int64_t k_DEBUG_BACKTRACE_PROVIDE_OBJECT = (1 << 0);
+const int64_t k_DEBUG_BACKTRACE_IGNORE_ARGS = (1 << 1);
+const int64_t k_DEBUG_BACKTRACE_PROVIDE_METADATA = (1 << 16);
 
 const int64_t k_E_ERROR = (1 << 0);
 const int64_t k_E_WARNING = (1 << 1);
@@ -56,9 +62,11 @@ const int64_t k_E_ALL = k_E_ERROR | k_E_WARNING | k_E_PARSE | k_E_NOTICE |
 Array HHVM_FUNCTION(debug_backtrace, int64_t options /* = 1 */,
                                      int64_t limit /* = 0 */) {
   bool provide_object = options & k_DEBUG_BACKTRACE_PROVIDE_OBJECT;
+  bool provide_metadata = options & k_DEBUG_BACKTRACE_PROVIDE_METADATA;
   bool ignore_args = options & k_DEBUG_BACKTRACE_IGNORE_ARGS;
   return createBacktrace(BacktraceArgs()
                          .withThis(provide_object)
+                         .withMetadata(provide_metadata)
                          .ignoreArgs(ignore_args)
                          .setLimit(limit));
 }
@@ -156,8 +164,8 @@ Array HHVM_FUNCTION(error_get_last) {
 }
 
 bool HHVM_FUNCTION(error_log, const String& message, int message_type /* = 0 */,
-                              const String& destination /* = null_string */,
-                              const String& extra_headers /* = null_string */) {
+                              const Variant& destination /* = null */,
+                              const Variant& extra_headers /* = null */) {
   // error_log() should not invoke the user error handler,
   // so we use Logger::Error() instead of raise_warning() or raise_error()
   switch (message_type) {
@@ -171,13 +179,14 @@ bool HHVM_FUNCTION(error_log, const String& message, int message_type /* = 0 */,
   }
   case 3:
   {
-    Variant outfile = f_fopen(destination, "a"); // open for append only
+    // open for append only
+    auto outfile = HHVM_FN(fopen)(destination.toString(), "a");
     if (outfile.isNull()) {
       Logger::Error("can't open error_log file!\n");
       return false;
     }
-    f_fwrite(outfile.toResource(), message);
-    f_fclose(outfile.toResource());
+    HHVM_FN(fwrite)(outfile.toResource(), message);
+    HHVM_FN(fclose)(outfile.toResource());
     return true;
   }
   case 2: // not used per PHP
@@ -232,43 +241,72 @@ void HHVM_FUNCTION(hphp_clear_unflushed) {
 }
 
 bool HHVM_FUNCTION(trigger_error, const String& error_msg,
-                                  int error_type /* = k_E_USER_NOTICE */) {
-  std::string msg = error_msg.data();
-  if (g_context->getThrowAllErrors()) throw error_type;
+                   int error_type /* = k_E_USER_NOTICE */) {
+  std::string msg = error_msg.data(); // not toCppString()
+  if (UNLIKELY(g_context->getThrowAllErrors())) {
+    throw Exception(folly::sformat("throwAllErrors: {}", error_type));
+  }
   if (error_type == k_E_USER_ERROR) {
     g_context->handleError(msg, error_type, true,
-                       ExecutionContext::ErrorThrowMode::IfUnhandled,
-                       "\nFatal error: ");
-  } else if (error_type == k_E_USER_WARNING) {
+                           ExecutionContext::ErrorThrowMode::IfUnhandled,
+                           "\nFatal error: ");
+    return true;
+  }
+  if (error_type == k_E_USER_WARNING) {
     g_context->handleError(msg, error_type, true,
-                       ExecutionContext::ErrorThrowMode::Never,
-                       "\nWarning: ");
-  } else if (error_type == k_E_USER_NOTICE) {
+                           ExecutionContext::ErrorThrowMode::Never,
+                           "\nWarning: ");
+    return true;
+  }
+  if (error_type == k_E_USER_NOTICE) {
     g_context->handleError(msg, error_type, true,
-                       ExecutionContext::ErrorThrowMode::Never,
-                       "\nNotice: ");
-  } else if (error_type == k_E_USER_DEPRECATED) {
+                           ExecutionContext::ErrorThrowMode::Never,
+                           "\nNotice: ");
+    return true;
+  }
+  if (error_type == k_E_USER_DEPRECATED) {
     g_context->handleError(msg, error_type, true,
-                       ExecutionContext::ErrorThrowMode::Never,
-                       "\nDeprecated: ");
-  } else {
-    ActRec* fp = g_context->getStackFrame();
-    if (fp->m_func->isBuiltin() && error_type == k_E_ERROR) {
+                           ExecutionContext::ErrorThrowMode::Never,
+                           "\nDeprecated: ");
+    return true;
+  }
+  if (error_type == k_E_STRICT) {
+    // So that we can raise strict warnings for mismatched
+    // params in FCallBuiltin
+    raise_strict_warning(msg);
+    return true;
+  }
+
+  ActRec* fp = g_context->getStackFrame();
+
+  if (fp->m_func->isNative() &&
+      fp->m_func->nativeFuncPtr() == (BuiltinFunction)HHVM_FN(trigger_error)) {
+    fp = g_context->getOuterVMFrame(fp);
+  }
+  if (fp && fp->m_func->isBuiltin()) {
+    if (error_type == k_E_ERROR) {
       raise_error_without_first_frame(msg);
-    } else if (fp->m_func->isBuiltin() && error_type == k_E_WARNING) {
+      return true;
+    }
+    if (error_type == k_E_WARNING) {
       raise_warning_without_first_frame(msg);
-    } else if (fp->m_func->isBuiltin() && error_type == k_E_NOTICE) {
+      return true;
+    }
+    if (error_type == k_E_NOTICE) {
       raise_notice_without_first_frame(msg);
-    } else if (fp->m_func->isBuiltin() && error_type == k_E_DEPRECATED) {
+      return true;
+    }
+    if (error_type == k_E_DEPRECATED) {
       raise_deprecated_without_first_frame(msg);
-    } else if (fp->m_func->isBuiltin() && error_type == k_E_RECOVERABLE_ERROR) {
+      return true;
+    }
+    if (error_type == k_E_RECOVERABLE_ERROR) {
       raise_recoverable_error_without_first_frame(msg);
-    } else {
-    raise_warning("Invalid error type specified");
-    return false;
+      return true;
     }
   }
-  return true;
+  raise_warning("Invalid error type specified");
+  return false;
 }
 
 bool HHVM_FUNCTION(user_error, const String& error_msg,
@@ -299,6 +337,7 @@ void StandardExtension::initErrorFunc() {
                   (makeStaticString(#v), k_##v);
   INTCONST(DEBUG_BACKTRACE_PROVIDE_OBJECT);
   INTCONST(DEBUG_BACKTRACE_IGNORE_ARGS);
+  INTCONST(DEBUG_BACKTRACE_PROVIDE_METADATA);
   INTCONST(E_ERROR);
   INTCONST(E_WARNING);
   INTCONST(E_PARSE);

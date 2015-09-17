@@ -2,7 +2,7 @@
   +----------------------------------------------------------------------+
   | HipHop for PHP                                                       |
   +----------------------------------------------------------------------+
-  | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+  | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
   | Copyright (c) 1997-2014 The PHP Group                                |
   +----------------------------------------------------------------------+
   | This source file is subject to version 3.01 of the PHP license,      |
@@ -40,10 +40,6 @@ static bool utf8_trail(unsigned char c) {
   m_cursor = pos + (advance); \
   return -1; \
 } while (0)
-
-UTF8To16Decoder::UTF8To16Decoder(const char *utf8, int length, bool loose)
-    : m_str(utf8), m_strlen(length), m_cursor(0), m_loose(loose),
-      m_low_surrogate(0) {}
 
 // Inspired by ext/standard/html.c:get_next_char()
 unsigned int UTF8To16Decoder::getNextChar() {
@@ -129,20 +125,14 @@ unsigned int UTF8To16Decoder::getNextChar() {
   return this_char;
 }
 
-int UTF8To16Decoder::decode() {
-  if (m_low_surrogate) {
-    int ret = m_low_surrogate;
-    m_low_surrogate = 0;
-    return ret;
+int UTF8To16Decoder::decodeTail() {
+  int c = getNext();
+  if (c < 0x10000) {
+    return c;
   } else {
-    int c = getNext();
-    if (c < 0x10000) {
-      return c;
-    } else {
-      c -= 0x10000;
-      m_low_surrogate = (0xDC00 | (c & 0x3FF));
-      return (0xD800 | (c >> 10));
-    }
+    c -= 0x10000;
+    m_low_surrogate = (0xDC00 | (c & 0x3FF));
+    return (0xD800 | (c >> 10));
   }
 }
 

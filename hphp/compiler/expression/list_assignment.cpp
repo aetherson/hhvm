@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -63,102 +63,91 @@ using namespace HPHP;
 */
 static ListAssignment::RHSKind GetRHSKind(ExpressionPtr rhs) {
   switch (rhs->getKindOf()) {
-    case Expression::KindOfSimpleVariable:
-    case Expression::KindOfDynamicVariable:
-    case Expression::KindOfArrayElementExpression:
-    case Expression::KindOfObjectPropertyExpression:
-    case Expression::KindOfStaticMemberExpression:
-    case Expression::KindOfSimpleFunctionCall:
-    case Expression::KindOfDynamicFunctionCall:
-    case Expression::KindOfObjectMethodExpression:
-    case Expression::KindOfNewObjectExpression:
-    case Expression::KindOfAssignmentExpression:
-    case Expression::KindOfExpressionList:
-    case Expression::KindOfIncludeExpression:
-    case Expression::KindOfYieldExpression:
-    case Expression::KindOfAwaitExpression:
-    case Expression::KindOfQueryExpression:
-      return ListAssignment::Regular;
+  case Construct::KindOfSimpleVariable:
+  case Construct::KindOfDynamicVariable:
+  case Construct::KindOfArrayElementExpression:
+  case Construct::KindOfObjectPropertyExpression:
+  case Construct::KindOfStaticMemberExpression:
+  case Construct::KindOfSimpleFunctionCall:
+  case Construct::KindOfDynamicFunctionCall:
+  case Construct::KindOfObjectMethodExpression:
+  case Construct::KindOfNewObjectExpression:
+  case Construct::KindOfAssignmentExpression:
+  case Construct::KindOfExpressionList:
+  case Construct::KindOfIncludeExpression:
+  case Construct::KindOfYieldExpression:
+  case Construct::KindOfAwaitExpression:
+  case Construct::KindOfQueryExpression:
+    return ListAssignment::Regular;
 
-    case Expression::KindOfListAssignment:
-      return GetRHSKind(static_pointer_cast<ListAssignment>(rhs)->getArray());
+  case Construct::KindOfListAssignment:
+    return GetRHSKind(static_pointer_cast<ListAssignment>(rhs)->getArray());
 
-    case Expression::KindOfUnaryOpExpression: {
-      UnaryOpExpressionPtr u(static_pointer_cast<UnaryOpExpression>(rhs));
-      switch (u->getOp()) {
-        case '@':
-          return GetRHSKind(u->getExpression());
-        case T_INC:
-        case T_DEC:
-          return u->getFront() ?
-            ListAssignment::Regular : ListAssignment::Checked;
-        case T_EVAL:
-        case T_ARRAY:
-        case T_ARRAY_CAST:
-          return ListAssignment::Regular;
-        default:
-          return ListAssignment::Null;
-      }
-      break;
-    }
-
-    case Expression::KindOfBinaryOpExpression: {
-      BinaryOpExpressionPtr b(static_pointer_cast<BinaryOpExpression>(rhs));
-      if (b->isAssignmentOp() ||
-          b->getOp() == '+' ||
-          b->getOp() == T_COLLECTION) {
+  case Construct::KindOfUnaryOpExpression: {
+    auto u = static_pointer_cast<UnaryOpExpression>(rhs);
+    switch (u->getOp()) {
+      case '@':
+        return GetRHSKind(u->getExpression());
+      case T_INC:
+      case T_DEC:
+        return u->getFront() ?
+          ListAssignment::Regular : ListAssignment::Checked;
+      case T_EVAL:
+      case T_ARRAY:
+      case T_ARRAY_CAST:
         return ListAssignment::Regular;
-      }
-      return ListAssignment::Null;
+      default:
+        return ListAssignment::Null;
     }
-    case Expression::KindOfQOpExpression:
-      return ListAssignment::Checked;
+    break;
+  }
 
-    // invalid context
-    case Expression::KindOfArrayPairExpression:
-    case Expression::KindOfParameterExpression:
-    case Expression::KindOfModifierExpression:
-    case Expression::KindOfUserAttribute:
-    case Expression::KindOfFromClause:
-    case Expression::KindOfLetClause:
-    case Expression::KindOfWhereClause:
-    case Expression::KindOfSelectClause:
-    case Expression::KindOfIntoClause:
-    case Expression::KindOfJoinClause:
-    case Expression::KindOfGroupClause:
-    case Expression::KindOfOrderbyClause:
-    case Expression::KindOfOrdering:
-      always_assert(false);
+  case Construct::KindOfBinaryOpExpression: {
+    auto b = static_pointer_cast<BinaryOpExpression>(rhs);
+    if (b->isAssignmentOp() ||
+        b->getOp() == '+' ||
+        b->getOp() == T_COLLECTION) {
+      return ListAssignment::Regular;
+    }
+    return ListAssignment::Null;
+  }
+  case Construct::KindOfQOpExpression:
+    return ListAssignment::Checked;
 
-    // non-arrays
-    case Expression::KindOfScalarExpression:
-    case Expression::KindOfConstantExpression:
-    case Expression::KindOfClassConstantExpression:
-    case Expression::KindOfEncapsListExpression:
-    case Expression::KindOfClosureExpression:
-      return ListAssignment::Null;
+  // invalid context
+  case Construct::KindOfExpression:
+  case Construct::KindOfArrayPairExpression:
+  case Construct::KindOfParameterExpression:
+  case Construct::KindOfModifierExpression:
+  case Construct::KindOfUserAttribute:
+  case Construct::KindOfFromClause:
+  case Construct::KindOfLetClause:
+  case Construct::KindOfWhereClause:
+  case Construct::KindOfSelectClause:
+  case Construct::KindOfIntoClause:
+  case Construct::KindOfJoinClause:
+  case Construct::KindOfGroupClause:
+  case Construct::KindOfOrderbyClause:
+  case Construct::KindOfOrdering:
+    always_assert(false);
+
+  // non-arrays
+  case Construct::KindOfScalarExpression:
+  case Construct::KindOfConstantExpression:
+  case Construct::KindOfClassConstantExpression:
+  case Construct::KindOfEncapsListExpression:
+  case Construct::KindOfClosureExpression:
+    return ListAssignment::Null;
+
+#define STATEMENT_CASE(x) case Construct::KindOf##x:
+  DECLARE_STATEMENT_TYPES(STATEMENT_CASE) {
+    always_assert(false);
+  }
+#undef STATEMENT_CASE
   }
 
   // unreachable for known expression kinds
   always_assert(false);
-}
-
-static bool AssignmentCouldSet(ExpressionListPtr vars, ExpressionPtr var) {
-  for (int i = 0; i < vars->getCount(); i++) {
-    ExpressionPtr v = (*vars)[i];
-    if (!v) continue;
-    if (v->is(Expression::KindOfSimpleVariable) &&
-        v->canonCompare(var)) {
-      return true;
-    }
-    if (v->is(Expression::KindOfDynamicVariable)) return true;
-    if (v->is(Expression::KindOfListAssignment) &&
-        AssignmentCouldSet(static_pointer_cast<ListAssignment>(v)->
-                           getVariables(), var)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 ListAssignment::ListAssignment
@@ -172,9 +161,7 @@ ListAssignment::ListAssignment
   if (m_array) {
     m_rhsKind = GetRHSKind(m_array);
     if (m_array->is(KindOfSimpleVariable)) {
-      if (AssignmentCouldSet(m_variables, m_array)) {
-        m_array->setContext(LValue);
-      }
+      m_array->setContext(LValue);
     }
   }
 }
@@ -192,9 +179,8 @@ void ListAssignment::setLValue() {
     for (int i = 0; i < m_variables->getCount(); i++) {
       ExpressionPtr exp = (*m_variables)[i];
       if (exp) {
-        if (exp->is(Expression::KindOfListAssignment)) {
-          ListAssignmentPtr sublist =
-            dynamic_pointer_cast<ListAssignment>(exp);
+        if (exp->is(Construct::KindOfListAssignment)) {
+          auto sublist = dynamic_pointer_cast<ListAssignment>(exp);
           sublist->setLValue();
         } else {
           // Magic contexts I took from assignment expression
@@ -218,13 +204,12 @@ void ListAssignment::analyzeProgram(AnalysisResultPtr ar) {
   if (m_variables) m_variables->analyzeProgram(ar);
   if (m_array) m_array->analyzeProgram(ar);
   FunctionScopePtr func = getFunctionScope();
-  if (func) func->disableInline();
   if (ar->getPhase() == AnalysisResult::AnalyzeFinal) {
     if (m_variables) {
       for (int i = 0; i < m_variables->getCount(); i++) {
         ExpressionPtr exp = (*m_variables)[i];
         if (exp) {
-          if (!exp->is(Expression::KindOfListAssignment)) {
+          if (!exp->is(Construct::KindOfListAssignment)) {
             CheckNeeded(exp, ExpressionPtr());
           }
         }
@@ -264,25 +249,6 @@ void ListAssignment::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-TypePtr ListAssignment::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                   bool coerce) {
-  if (m_variables) {
-    for (int i = m_variables->getCount(); i--; ) {
-      ExpressionPtr exp = (*m_variables)[i];
-      if (exp) {
-        if (exp->is(Expression::KindOfListAssignment)) {
-          exp->inferAndCheck(ar, Type::Any, false);
-        } else {
-          inferAssignmentTypes(ar, Type::Variant, true, exp);
-        }
-      }
-    }
-  }
-
-  if (!m_array) return TypePtr();
-  return m_array->inferAndCheck(ar, Type::Variant, false);
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void ListAssignment::outputCodeModel(CodeGenerator &cg) {
@@ -295,7 +261,7 @@ void ListAssignment::outputCodeModel(CodeGenerator &cg) {
     m_array->outputCodeModel(cg);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

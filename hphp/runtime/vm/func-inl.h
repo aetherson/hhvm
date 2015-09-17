@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -23,21 +23,6 @@ namespace HPHP {
 // EH and FPI tables.
 
 template<class SerDe>
-void EHEnt::serde(SerDe& sd) {
-  sd(m_type)
-    (m_base)
-    (m_past)
-    (m_iterId)
-    (m_fault)
-    (m_itRef)
-    (m_parentIndex)
-    ;
-  if (m_type == Type::Catch) {
-    sd(m_catches);
-  }
-}
-
-template<class SerDe>
 void FPIEnt::serde(SerDe& sd) {
   sd(m_fpushOff)
     (m_fcallOff)
@@ -49,11 +34,43 @@ void FPIEnt::serde(SerDe& sd) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// ParamInfo.
+
+inline Func::ParamInfo::ParamInfo()
+  : defaultValue(make_tv<KindOfUninit>())
+{}
+
+template<class SerDe>
+inline void Func::ParamInfo::serde(SerDe& sd) {
+  sd(builtinType)
+    (funcletOff)
+    (defaultValue)
+    (phpCode)
+    (typeConstraint)
+    (variadic)
+    (userAttributes)
+    (userType)
+    ;
+}
+
+inline bool Func::ParamInfo::hasDefaultValue() const {
+  return funcletOff != InvalidAbsoluteOffset;
+}
+
+inline bool Func::ParamInfo::hasScalarDefaultValue() const {
+  return hasDefaultValue() && defaultValue.m_type != KindOfUninit;
+}
+
+inline bool Func::ParamInfo::isVariadic() const {
+  return variadic;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Func.
 
 inline void Func::validate() const {
 #ifdef DEBUG
-  assert(this && m_magic == kMagic);
+  assert(m_magic == kMagic);
 #endif
   assert(m_name != nullptr);
 }
@@ -78,6 +95,10 @@ inline Unit* Func::unit() const {
   return m_unit;
 }
 
+inline Class* Func::cls() const {
+  return m_cls;
+}
+
 inline PreClass* Func::preClass() const {
   return shared()->m_preClass;
 }
@@ -86,8 +107,8 @@ inline Class* Func::baseCls() const {
   return m_baseCls;
 }
 
-inline Class* Func::cls() const {
-  return m_cls;
+inline Class* Func::implCls() const {
+  return isClosureBody() ? baseCls() : cls();
 }
 
 inline const StringData* Func::name() const {
@@ -144,7 +165,13 @@ inline int Func::line1() const {
 }
 
 inline int Func::line2() const {
-  return shared()->m_line2;
+  auto const sd = shared();
+  auto const delta = sd->m_line2Delta;
+  if (UNLIKELY(delta == kSmallDeltaLimit)) {
+    assert(extShared());
+    return static_cast<const ExtendedSharedData*>(sd)->m_line2;
+  }
+  return line1() + delta;
 }
 
 inline const StringData* Func::docComment() const {
@@ -163,7 +190,13 @@ inline Offset Func::base() const {
 }
 
 inline Offset Func::past() const {
-  return shared()->m_past;
+  auto const sd = shared();
+  auto const delta = sd->m_pastDelta;
+  if (UNLIKELY(delta == kSmallDeltaLimit)) {
+    assert(extShared());
+    return static_cast<const ExtendedSharedData*>(sd)->m_past;
+  }
+  return base() + delta;
 }
 
 inline bool Func::contains(PC pc) const {
@@ -177,7 +210,7 @@ inline bool Func::contains(Offset offset) const {
 ///////////////////////////////////////////////////////////////////////////////
 // Return type.
 
-inline DataType Func::returnType() const {
+inline MaybeDataType Func::returnType() const {
   return shared()->m_returnType;
 }
 
@@ -252,6 +285,10 @@ inline int Func::maxStackCells() const {
   return m_maxStackCells;
 }
 
+inline bool Func::hasForeignThis() const {
+  return attrs() & AttrHasForeignThis;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // Static locals.
 
@@ -275,7 +312,7 @@ inline bool Func::isPseudoMain() const {
 }
 
 inline bool Func::isMethod() const {
-  return !isPseudoMain() && (bool)cls();
+  return !isPseudoMain() && (bool)baseCls();
 }
 
 inline bool Func::isTraitMethod() const {
@@ -296,7 +333,11 @@ inline bool Func::isAbstract() const {
 }
 
 inline bool Func::mayHaveThis() const {
-  return isPseudoMain() || (isMethod() && !isStatic());
+  return isPseudoMain() || (cls() && !isStatic());
+}
+
+inline bool Func::isPreFunc() const {
+  return m_isPreFunc;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -307,7 +348,8 @@ inline bool Func::isBuiltin() const {
 }
 
 inline bool Func::isCPPBuiltin() const {
-  return shared()->m_builtinFuncPtr;
+  auto const ex = extShared();
+  return UNLIKELY(!!ex) && ex->m_builtinFuncPtr;
 }
 
 inline bool Func::isNative() const {
@@ -315,15 +357,24 @@ inline bool Func::isNative() const {
 }
 
 inline BuiltinFunction Func::builtinFuncPtr() const {
-  return shared()->m_builtinFuncPtr;
+  if (auto const ex = extShared()) {
+    return ex->m_builtinFuncPtr;
+  }
+  return nullptr;
 }
 
 inline BuiltinFunction Func::nativeFuncPtr() const {
-  return shared()->m_nativeFuncPtr;
+  if (auto const ex = extShared()) {
+    return ex->m_nativeFuncPtr;
+  }
+  return nullptr;
 }
 
 inline const ClassInfo::MethodInfo* Func::methInfo() const {
-  return shared()->m_info;
+  if (auto const ex = extShared()) {
+    return ex->m_info;
+  }
+  return nullptr;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -331,11 +382,6 @@ inline const ClassInfo::MethodInfo* Func::methInfo() const {
 
 inline bool Func::isClosureBody() const {
   return shared()->m_isClosureBody;
-}
-
-inline Func*& Func::nextClonedClosure() const {
-  assert(isClosureBody());
-  return ((Func**)this)[-1];
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -373,7 +419,7 @@ inline bool Func::isResumable() const {
 // Methods.
 
 inline Slot Func::methodSlot() const {
-  assert(m_cls);
+  assert(isMethod());
   return m_methodSlot;
 }
 
@@ -461,7 +507,7 @@ inline const Func::FPIEntVec& Func::fpitab() const {
 ///////////////////////////////////////////////////////////////////////////////
 // JIT data.
 
-inline RDS::Handle Func::funcHandle() const {
+inline rds::Handle Func::funcHandle() const {
   return m_cachedFunc.handle();
 }
 
@@ -512,7 +558,7 @@ inline void Func::setBaseCls(Class* baseCls) {
   m_baseCls = baseCls;
 }
 
-inline void Func::setFuncHandle(RDS::Link<Func*> l) {
+inline void Func::setFuncHandle(rds::Link<Func*> l) {
   // TODO(#2950356): This assertion fails for create_function with an existing
   // declared function named __lambda_func.
   //assert(!m_cachedFunc.valid());
@@ -524,8 +570,21 @@ inline void Func::setHasPrivateAncestor(bool b) {
 }
 
 inline void Func::setMethodSlot(Slot s) {
-  assert(m_cls);
+  assert(isMethod());
   m_methodSlot = s;
+}
+
+//////////////////////////////////////////////////////////////////////
+
+inline const Func::ExtendedSharedData* Func::extShared() const {
+  return const_cast<Func*>(this)->extShared();
+}
+
+inline Func::ExtendedSharedData* Func::extShared() {
+  auto const s = shared();
+  return UNLIKELY(s->m_hasExtendedSharedData)
+    ? static_cast<ExtendedSharedData*>(s)
+    : nullptr;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

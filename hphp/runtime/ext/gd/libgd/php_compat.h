@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -29,16 +29,17 @@
 #include "hphp/runtime/base/stream-wrapper.h"
 #include "hphp/runtime/base/zend-printf.h"
 #include "hphp/runtime/base/zend-php-config.h"
+#include "hphp/util/string-vsnprintf.h"
 
 // And start the blasted C stuff again
 extern "C" {
 
 #define HAVE_LIBJPEG
 #define HAVE_LIBPNG
-#define emalloc HPHP::smart_malloc
-#define ecalloc HPHP::smart_calloc
-#define efree HPHP::smart_free
-#define erealloc HPHP::smart_realloc
+#define emalloc HPHP::req::malloc
+#define ecalloc HPHP::req::calloc
+#define efree HPHP::req::free
+#define erealloc HPHP::req::realloc
 #define vspprintf HPHP::vspprintf
 #define TSRMLS_CC
 #define TSRMLS_FETCH()
@@ -72,12 +73,15 @@ inline char *estrdup(const char *s) {
 #define E_NOTICE      (1<<3L)
 inline void php_verror(const char *docref, const char *params, int type,
                        const char *format, va_list args) {
+  std::string msg;
+  HPHP::string_vsnprintf(msg, format, args);
+
   if (type == E_ERROR) {
-    return HPHP::raise_error(format, args);
+    return HPHP::raise_error(msg);
   } else if (type == E_WARNING) {
-    return HPHP::raise_warning(format, args);
+    return HPHP::raise_warning(msg);
   } else if (type == E_NOTICE) {
-    return HPHP::raise_notice(format, args);
+    return HPHP::raise_notice(msg);
   }
   not_reached();
 }

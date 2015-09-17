@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,7 +8,7 @@
  *
  *)
 
-open Utils
+open Core
 
 (*****************************************************************************)
 (* The "static" environment, initialized first and then doesn't change *)
@@ -16,7 +16,9 @@ open Utils
 
 type genv = {
     options          : ServerArgs.options;
+    config           : ServerConfig.t;
     workers          : Worker.t list option;
+    dfind            : DfindLib.t option;
   }
 
 (*****************************************************************************)
@@ -29,31 +31,29 @@ type genv = {
  * The Ast.id are keys to index this shared space.
  *)
 type env = {
-    files_info     : FileInfo.t SMap.t;
+    files_info     : FileInfo.t Relative_path.Map.t;
     nenv           : Naming.env;
     errorl         : Errors.t;
     (* the strings in those sets represent filenames *)
-    failed_parsing : SSet.t;
-    failed_decl    : SSet.t;
-    failed_check   : SSet.t;
+    failed_parsing : Relative_path.Set.t;
+    failed_decl    : Relative_path.Set.t;
+    failed_check   : Relative_path.Set.t;
   }
 
-(*****************************************************************************)
-(* Killing the server  *)
-(*****************************************************************************)
-
-let die() =
-  exit(0)
+let typechecker_options env = (Naming.typechecker_options env.nenv)
 
 (*****************************************************************************)
 (* Listing all the files present in the environment *)
 (*****************************************************************************)
 
 let list_files env oc =
-  let acc = List.fold_right begin
-    fun error acc ->
+  let acc = List.fold_right
+    ~f:begin fun error acc ->
       let pos = Errors.get_pos error in
-      SSet.add pos.Pos.pos_file acc
-  end env.errorl SSet.empty in
-  SSet.iter (fun (s) -> Printf.fprintf oc "%s\n" s) acc;
+      Relative_path.Set.add (Pos.filename pos) acc
+    end
+    ~init:Relative_path.Set.empty
+    env.errorl in
+  Relative_path.Set.iter (fun s ->
+    Printf.fprintf oc "%s\n" (Relative_path.to_absolute s)) acc;
   flush oc

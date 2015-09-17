@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -26,7 +26,7 @@
 #include <algorithm>
 #include "hphp/util/alloc.h"
 #include "hphp/util/assertions.h"
-#include "hphp/util/compact-sized-ptr.h"
+#include "hphp/util/compact-tagged-ptrs.h"
 
 namespace HPHP {
 
@@ -99,10 +99,18 @@ struct TinyVector : private boost::noncopyable {
   }
 
   void push_back(const T& t) {
+    alloc_back() = t;
+  }
+
+  /*
+   * Increase the size of this TinyVector by 1 and return a reference to the
+   * new object, which will be uninitialized.
+   */
+  T& alloc_back() {
     size_t current = size();
     reserve(current + 1);
-    *location(current) = t;
     m_data.set(current + 1, m_data.ptr());
+    return back();
   }
 
   void pop_back() {

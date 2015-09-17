@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,7 +18,9 @@
 
 #include <algorithm>
 
+#include "hphp/runtime/debugger/debugger_client.h"
 #include "hphp/runtime/vm/debugger-hook.h"
+#include "hphp/runtime/vm/hhbc-codec.h"
 #include "hphp/runtime/vm/vm-regs.h"
 
 namespace HPHP { namespace Eval {
@@ -86,11 +88,8 @@ bool CmdFlowControl::onServer(DebuggerProxy &proxy) {
 void CmdFlowControl::installLocationFilterForLine(InterruptSite *site) {
   // We may be stopped at a place with no source info.
   if (!site || !site->valid()) return;
-  if (g_context->m_flowFilter) {
-    g_context->m_flowFilter->clear();
-  } else {
-    g_context->m_flowFilter = new PCFilter();
-  }
+  RequestInjectionData &rid = ThreadInfo::s_threadInfo->m_reqInjectionData;
+  rid.m_flowFilter.clear();
   TRACE(3, "Prepare location filter for %s:%d, unit %p:\n",
         site->getFile(), site->getLine0(), site->getUnit());
   OffsetRangeVec ranges;
@@ -117,18 +116,15 @@ void CmdFlowControl::installLocationFilterForLine(InterruptSite *site) {
              (op != OpAwait) &&
              (op != OpRetC);
     };
-    g_context->m_flowFilter->addRanges(unit, ranges,
-                                          excludeResumableReturns);
+    rid.m_flowFilter.addRanges(unit, ranges,
+                                      excludeResumableReturns);
   } else {
-    g_context->m_flowFilter->addRanges(unit, ranges);
+    rid.m_flowFilter.addRanges(unit, ranges);
   }
 }
 
 void CmdFlowControl::removeLocationFilter() {
-  if (g_context->m_flowFilter) {
-    delete g_context->m_flowFilter;
-    g_context->m_flowFilter = nullptr;
-  }
+  ThreadInfo::s_threadInfo->m_reqInjectionData.m_flowFilter.clear();
 }
 
 bool CmdFlowControl::hasStepOuts() {
@@ -163,27 +159,27 @@ void CmdFlowControl::setupStepOuts() {
     PC returnPC = returnUnit->at(returnOffset);
     TRACE(2, "CmdFlowControl::setupStepOuts: at '%s' offset %d opcode %s\n",
           fp->m_func->fullName()->data(), returnOffset,
-          opcodeToName(*reinterpret_cast<const Op*>(returnPC)));
-    // Don't step out to generated functions, keep looking.
+          opcodeToName(peek_op(returnPC)));
+    // Don't step out to generated or builtin functions, keep looking.
     if (fp->m_func->line1() == 0) continue;
+    if (fp->m_func->isBuiltin()) continue;
     if (fromVMEntry) {
       TRACE(2, "CmdFlowControl::setupStepOuts: VM entry\n");
       // We only execute this for opcodes which invoke more PHP, and that does
       // not include switches. Thus, we'll have at most two destinations.
-      assert(!isSwitch(*reinterpret_cast<const Op*>(returnPC)) &&
-        (numSuccs(reinterpret_cast<const Op*>(returnPC)) <= 2));
+      auto const retOp = peek_op(returnPC);
+      assert(!isSwitch(retOp) && numSuccs(returnPC) <= 2);
       // Set an internal breakpoint after the instruction if it can fall thru.
-      if (instrAllowsFallThru(*reinterpret_cast<const Op*>(returnPC))) {
-        Offset nextOffset = returnOffset + instrLen((Op*)returnPC);
+      if (instrAllowsFallThru(retOp)) {
+        Offset nextOffset = returnOffset + instrLen(returnPC);
         TRACE(2, "CmdFlowControl: step out to '%s' offset %d (fall-thru)\n",
               fp->m_func->fullName()->data(), nextOffset);
         m_stepOut1 = StepDestination(returnUnit, nextOffset);
       }
       // Set an internal breakpoint at the target of a control flow instruction.
       // A good example of a control flow op that invokes PHP is IterNext.
-      if (instrIsControlFlow(*reinterpret_cast<const Op*>(returnPC))) {
-        Offset target =
-          instrJumpTarget(reinterpret_cast<const Op*>(returnPC), 0);
+      if (instrIsControlFlow(retOp)) {
+        Offset target = instrJumpTarget(returnPC, 0);
         if (target != InvalidAbsoluteOffset) {
           Offset targetOffset = returnOffset + target;
           TRACE(2, "CmdFlowControl: step out to '%s' offset %d (jump target)\n",
@@ -219,7 +215,7 @@ void CmdFlowControl::cleanupStepOuts() {
 // a StepDestination is constructed then it will not remove the
 // breakpoint when it is destructed. The move assignment operator
 // handles the transfer of ownership, and we delete the copy
-// constructor/assignment operators explictly to ensure no two
+// constructor/assignment operators explicitly to ensure no two
 // StepDestinations believe they can remove the same internal
 // breakpoint.
 //

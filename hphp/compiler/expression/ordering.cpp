@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,7 +16,6 @@
 
 #include "hphp/compiler/expression/ordering.h"
 #include "hphp/compiler/analysis/code_error.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/compiler/code_model_enums.h"
 
 using namespace HPHP;
@@ -82,12 +81,6 @@ void Ordering::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-TypePtr Ordering::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                  bool coerce) {
-  m_key->inferAndCheck(ar, Type::Some, false);
-  return Type::Object;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void Ordering::outputCodeModel(CodeGenerator &cg) {
@@ -97,7 +90,7 @@ void Ordering::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("order");
   cg.printValue(m_direction);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 
@@ -117,4 +110,3 @@ void Ordering::outputPHP(CodeGenerator &cg, AnalysisResultPtr ar) {
     break;
   }
 }
-

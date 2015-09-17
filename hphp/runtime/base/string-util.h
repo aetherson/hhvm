@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -110,7 +110,8 @@ public:
    */
   static Variant Explode(const String& input, const String& delimiter,
                          int limit = 0x7FFFFFFF);
-  static String  Implode(const Variant& items, const String& delim); // == Join()
+    static String Implode(const Variant& items, const String& delim,
+                          const bool checkIsContainer = true); // == Join()
   static Variant Split(const String& str, int64_t split_length = 1);
   static Variant ChunkSplit(
     const String& body, int chunklen = 76,

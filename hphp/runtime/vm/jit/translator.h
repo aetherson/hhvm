@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,7 +17,6 @@
 #ifndef incl_HPHP_TRANSLATOR_H_
 #define incl_HPHP_TRANSLATOR_H_
 
-#include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/datatype.h"
 #include "hphp/runtime/base/repo-auth-type.h"
 #include "hphp/runtime/vm/debugger-hook.h"
@@ -31,6 +30,7 @@
 #include "hphp/runtime/vm/jit/srcdb.h"
 #include "hphp/runtime/vm/jit/trans-rec.h"
 #include "hphp/runtime/vm/jit/type.h"
+#include "hphp/runtime/vm/jit/recycle-tc.h"
 #include "hphp/runtime/vm/jit/unique-stubs.h"
 #include "hphp/runtime/vm/jit/write-lease.h"
 
@@ -61,6 +61,7 @@ struct Block;
 struct IRTranslator;
 struct NormalizedInstruction;
 struct ProfData;
+struct IRGS;
 
 static const uint32_t transCountersPerChunk = 1024 * 1024 / 8;
 
@@ -87,13 +88,6 @@ struct UnknownInputExc : std::runtime_error {
   const int m_line;
 };
 
-struct ControlFlowFailedExc : std::runtime_error {
-  ControlFlowFailedExc(const char* file, int line)
-    : std::runtime_error(folly::format("ControlFlowFailedExc @ {}:{}",
-                                       file, line).str())
-  {}
-};
-
 #define punt() do { \
   throw TranslationFailedExc(__FILE__, __LINE__); \
 } while(0)
@@ -106,8 +100,6 @@ struct ControlFlowFailedExc : std::runtime_error {
 ///////////////////////////////////////////////////////////////////////////////
 // Translator auxiliary types.
 
-using BlockIdToRegionBlockMap = hphp_hash_map<RegionDesc::BlockId,
-                                              RegionDesc::Block*>;
 using BlockIdToIRBlockMap = hphp_hash_map<RegionDesc::BlockId, Block*>;
 
 /*
@@ -117,11 +109,24 @@ using BlockIdToIRBlockMap = hphp_hash_map<RegionDesc::BlockId, Block*>;
  * need access to this.
  */
 struct TransContext {
+  TransContext(TransID id, SrcKey sk, FPInvOffset spOff);
+
+  /*
+   * The SrcKey for this translation.
+   */
+  SrcKey srcKey() const;
+
+  /*
+   * Data members.
+   *
+   * The contents of SrcKey are re-laid out to avoid func table lookups.
+   */
   TransID transID;  // May be kInvalidTransID if not for a real translation.
-  Offset initBcOffset;
-  Offset initSpOffset;
-  bool resumed;
+  FPInvOffset initSpOffset;
   const Func* func;
+  Offset initBcOffset;
+  bool prologue;
+  bool resumed;
 };
 
 /*
@@ -131,57 +136,14 @@ struct TransContext {
  * to do after we're done, so it's distinct from the TransContext above.
  */
 struct TranslArgs {
-  TranslArgs(const SrcKey& sk, bool align)
-    : m_sk(sk)
-    , m_align(align)
-    , m_interp(false)
-    , m_dryRun(false)
-    , m_setFuncBody(false)
-    , m_transId(kInvalidTransID)
-    , m_region(nullptr)
-  {}
+  TranslArgs(SrcKey sk, bool align) : sk{sk}, align{align} {}
 
-  TranslArgs& sk(const SrcKey& sk) {
-    m_sk = sk;
-    return *this;
-  }
-  TranslArgs& align(bool align) {
-    m_align = align;
-    return *this;
-  }
-  TranslArgs& interp(bool interp) {
-    m_interp = interp;
-    return *this;
-  }
-  TranslArgs& dryRun(bool dry) {
-    m_dryRun = dry;
-    return *this;
-  }
-  TranslArgs& setFuncBody() {
-    m_setFuncBody = true;
-    return *this;
-  }
-  TranslArgs& flags(TransFlags flags) {
-    m_flags = flags;
-    return *this;
-  }
-  TranslArgs& transId(TransID transId) {
-    m_transId = transId;
-    return *this;
-  }
-  TranslArgs& region(RegionDescPtr region) {
-    m_region = region;
-    return *this;
-  }
-
-  SrcKey m_sk;
-  bool m_align;
-  bool m_interp;
-  bool m_dryRun;
-  bool m_setFuncBody;
-  TransFlags m_flags;
-  TransID m_transId;
-  RegionDescPtr m_region;
+  SrcKey sk;
+  bool align;
+  bool setFuncBody{false};
+  TransFlags flags{0};
+  TransID transId{kInvalidTransID};
+  RegionDescPtr region{nullptr};
 };
 
 
@@ -195,60 +157,10 @@ struct TranslArgs {
  * whose state is reset in between translations.
  */
 struct Translator {
-
   Translator();
 
   /////////////////////////////////////////////////////////////////////////////
-  // Types.
-
-  /*
-   * Blacklisted instruction set.
-   *
-   * Used by translateRegion() to track instructions that must be interpreted.
-   */
-  typedef ProfSrcKeySet RegionBlacklist;
-
-
-  /////////////////////////////////////////////////////////////////////////////
-  // Main translation API.
-
-  enum TranslateResult {
-    Failure,
-    Retry,
-    Success
-  };
-  static const char* ResultName(TranslateResult r);
-
-  /*
-   * Start, end, or free a trace of code to be translated.
-   */
-  void traceStart(TransContext context);
-  void traceEnd();
-  void traceFree();
-
-  /*
-   * Translate `region'.
-   *
-   * The `toInterp' RegionBlacklist is a set of instructions which must be
-   * interpreted.  When an instruction fails in translation, Retry is returned,
-   * and the instruction is added to `interp' so that it will be interpreted on
-   * the next attempt.
-   */
-  TranslateResult translateRegion(const RegionDesc& region,
-                                  bool bcControlFlow,
-                                  RegionBlacklist& interp,
-                                  TransFlags trflags = TransFlags{});
-
-
-  /////////////////////////////////////////////////////////////////////////////
   // Accessors.
-
-  /*
-   * Get the IRTranslator for the current translation.
-   *
-   * This is reset whenever traceStart() is called.
-   */
-  IRTranslator* irTrans() const;
 
   /*
    * Get the Translator's ProfData.
@@ -267,13 +179,7 @@ struct Translator {
    *
    * If no SrcRec exists, insert one into the SrcDB.
    */
-  SrcRec* getSrcRec(const SrcKey& sk);
-
-
-  /*
-   * Current region being translated, if any.
-   */
-  const RegionDesc* region() const;
+  SrcRec* getSrcRec(SrcKey sk);
 
   /////////////////////////////////////////////////////////////////////////////
   // Configuration.
@@ -372,7 +278,7 @@ struct Translator {
    *
    * Lazily populates m_dbgBLSrcKey from m_dbgBLPC if we don't find the entry.
    */
-  bool isSrcKeyInBL(const SrcKey& sk);
+  bool isSrcKeyInBL(SrcKey sk);
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -381,27 +287,6 @@ struct Translator {
   static Lease& WriteLease();
 
   static const int MaxJmpsTracedThrough = 5;
-
-
-  /////////////////////////////////////////////////////////////////////////////
-  // Other methods.
-
-public:
-  static bool liveFrameIsPseudoMain();
-
-private:
-  void createBlockMaps(const RegionDesc&        region,
-                       BlockIdToIRBlockMap&     blockIdToIRBlock,
-                       BlockIdToRegionBlockMap& blockIdToRegionBlock);
-
-  void setSuccIRBlocks(const RegionDesc&              region,
-                       RegionDesc::BlockId            srcBlockId,
-                       const BlockIdToIRBlockMap&     blockIdToIRBlock,
-                       const BlockIdToRegionBlockMap& blockIdToRegionBlock);
-
-  void setIRBlock(RegionDesc::BlockId            blockId,
-                  const BlockIdToIRBlockMap&     blockIdToIRBlock,
-                  const BlockIdToRegionBlockMap& blockIdToRegionBlock);
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -414,11 +299,9 @@ private:
   int64_t m_createdTime;
 
   TransKind m_mode;
-  const RegionDesc* m_region{nullptr};
   std::unique_ptr<ProfData> m_profData;
   bool m_useAHot;
 
-  std::unique_ptr<IRTranslator> m_irTrans;
   SrcDB m_srcDB;
 
   // Translation DB.
@@ -449,11 +332,6 @@ int64_t getStackPopped(PC pc);
  * Number of stack values pushed by the opcode at `pc'.
  */
 int64_t getStackPushed(PC pc);
-
-/*
- * Change in stack depth made by `ni'.
- */
-int getStackDelta(const NormalizedInstruction& ni);
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -538,23 +416,10 @@ public:
 };
 
 /*
- * Callback used by getInputs() to get the type of a local variable with a
- * given index.
+ * Get input location info and flags for a NormalizedInstruction.  Some flags
+ * on `ni' may be updated.
  */
-using LocalTypeFn = std::function<Type(int)>;
-
-/*
- * Get input location info and flags for `ni'.
- *
- * The result is returned via `infos'.  Some flags on `ni' may be updated.
- *
- * `startSk' should be the SrcKey for the first instruction in the region
- * containing `ni'.
- */
-void getInputs(SrcKey startSk,
-               NormalizedInstruction& inst,
-               InputInfoVec& infos,
-               const LocalTypeFn& localType);
+InputInfoVec getInputs(NormalizedInstruction&);
 
 namespace InstrFlags {
 ///////////////////////////////////////////////////////////////////////////////
@@ -581,7 +446,6 @@ enum OutTypeConstraints {
   OutFDesc,             // Blows away the current function desc
 
   OutUnknown,           // Not known at tracelet compile-time
-  OutPred,              // Unknown, but give prediction a whirl.
   OutPredBool,          // Boolean value predicted to be True or False
   OutCns,               // Constant; may be known at compile-time
   OutVUnknown,          // type is V(unknown)
@@ -600,7 +464,6 @@ enum OutTypeConstraints {
   OutBitOp,             // For BitAnd, BitOr, BitXor
   OutSetOp,             // For SetOpL
   OutIncDec,            // For IncDecL
-  OutStrlen,            // OpStrLen
   OutClassRef,          // KindOfClass
   OutFPushCufSafe,      // FPushCufSafe pushes two values of different
                         // types and an ActRec
@@ -638,6 +501,8 @@ enum Operands {
   StackN          = 1 << 15, // pop N cells from stack; n = imm[0].u_IVA
   BStackN         = 1 << 16, // consume N cells from stack for builtin call;
                              // n = imm[0].u_IVA
+  StackI          = 1 << 17, // consume 1 cell at index imm[0].u_IVA
+  MBase           = 1 << 18, // member operation base
   StackTop2 = Stack1 | Stack2,
   StackTop3 = Stack1 | Stack2 | Stack3,
 };
@@ -657,7 +522,6 @@ struct InstrInfo {
   InstrFlags::Operands in;
   InstrFlags::Operands out;
   InstrFlags::OutTypeConstraints type; // How are outputs related to inputs?
-  int numPushed;
 };
 
 /*
@@ -666,52 +530,12 @@ struct InstrInfo {
 const InstrInfo& getInstrInfo(Op op);
 
 /*
- * Is the output of `instr' dependent on its input?
- */
-bool outputDependsOnInput(const Op op);
-
-/*
- * Is the output of `inst' predicted?
- *
- * Flags on `inst' may be updated.
- */
-bool outputIsPredicted(NormalizedInstruction& inst);
-
-/*
  * If this returns true, we dont generate guards for any of the inputs to this
  * instruction.
  *
  * This is used to avoid generating guards for interpreted instructions.
  */
 bool dontGuardAnyInputs(Op op);
-
-
-///////////////////////////////////////////////////////////////////////////////
-// Property information.
-
-struct PropInfo {
-  PropInfo()
-    : offset(-1)
-    , repoAuthType{}
-  {}
-
-  explicit PropInfo(int offset, RepoAuthType repoAuthType)
-    : offset(offset)
-    , repoAuthType{repoAuthType}
-  {}
-
-  int offset;
-  RepoAuthType repoAuthType;
-};
-
-PropInfo getPropertyOffset(const NormalizedInstruction& ni,
-                           Class* ctx, const Class*& baseClass,
-                           const MInstrInfo& mii,
-                           unsigned mInd, unsigned iInd);
-
-PropInfo getFinalPropertyOffset(const NormalizedInstruction& ni,
-                                Class* ctx, const MInstrInfo& mii);
-
 
 ///////////////////////////////////////////////////////////////////////////////
 // Other instruction information.
@@ -723,13 +547,6 @@ PropInfo getFinalPropertyOffset(const NormalizedInstruction& ni,
 bool isAlwaysNop(Op op);
 
 /*
- * Return true if we have absolutely no JIT support for `inst'.
- *
- * Always returns true if JitAlwaysInterpOne is set.
- */
-bool instrMustInterp(const NormalizedInstruction& inst);
-
-/*
  * Could `inst' clobber the locals in the environment of `caller'?
  *
  * This occurs, e.g., if `inst' is a call to extract().
@@ -737,6 +554,13 @@ bool instrMustInterp(const NormalizedInstruction& inst);
 bool callDestroysLocals(const NormalizedInstruction& inst,
                         const Func* caller);
 
+/*
+ * Could the CPP builtin function `callee` destroy the locals
+ * in the environment of its caller?
+ *
+ * This occurs, e.g., if `func' is extract().
+ */
+bool builtinFuncDestroysLocals(const Func* callee);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Completely unrelated functionality.
@@ -757,23 +581,21 @@ bool callDestroysLocals(const NormalizedInstruction& inst,
  */
 const Func* lookupImmutableMethod(const Class* cls, const StringData* name,
                                   bool& magicCall, bool staticLookup,
-                                  Class* ctx);
+                                  const Class* ctx);
 
 /*
- * Check whether return types of builtins are not simple types.
- *
- * This is different from IS_REFCOUNTED_TYPE because builtins can return
- * Variants, and we use KindOfUnknown to denote these return types.
+ * If possible find the constructor for cls that would be run from the context
+ * ctx if a new instance of cls were created there. If the class fails to be
+ * unique, or in non-repo-authoritative mode this function will always return
+ * nullptr. Additionally if the constructor is inaccessible from the given
+ * context this function will return nullptr.
  */
-inline bool isCppByRef(DataType t) {
-  return t != KindOfBoolean && t != KindOfInt64 &&
-         t != KindOfNull && t != KindOfDouble;
-}
+const Func* lookupImmutableCtor(const Class* cls, const Class* ctx);
 
 /*
  * Return true if type is passed in/out of C++ as String&/Array&/Object&.
  */
-inline bool isSmartPtrRef(DataType t) {
+inline bool isReqPtrRef(MaybeDataType t) {
   return t == KindOfString || t == KindOfStaticString ||
          t == KindOfArray || t == KindOfObject ||
          t == KindOfResource;
@@ -787,13 +609,20 @@ inline bool isNativeImplCall(const Func* funcd, int numArgs) {
 }
 
 /*
- * The offset, in cells, of this location from its base pointer.
- *
- * The Func* is needed to see how many locals to skip for iterators.  If the
- * current frame pointer is not the context you're looking for, be sure to pass
- * in a non-default `f'.
+ * The offset, in cells, of this location from the frame pointer.
  */
-int locPhysicalOffset(Location l, const Func* f = nullptr);
+int locPhysicalOffset(int32_t localIndex);
+
+/*
+ * Take a NormalizedInstruction and turn it into a call to the appropriate ht
+ * functions.  Updates the bytecode marker, handles interp one flags, etc.
+ */
+void translateInstr(
+  IRGS&,
+  const NormalizedInstruction&,
+  bool checkOuterTypeOnly,
+  bool firstInst
+);
 
 extern bool tc_dump();
 

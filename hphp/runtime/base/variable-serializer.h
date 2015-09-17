@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,9 +17,8 @@
 #ifndef incl_HPHP_VARIABLE_SERIALIZER_H_
 #define incl_HPHP_VARIABLE_SERIALIZER_H_
 
-#include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/string-buffer.h"
-#include "hphp/runtime/base/smart-containers.h"
+#include "hphp/runtime/base/req-containers.h"
 #include "hphp/runtime/vm/class.h"
 
 namespace HPHP {
@@ -31,8 +30,7 @@ class ClassInfo;
  * Maintaining states during serialization of a variable. We use this single
  * class to uniformly serialize variables according to different formats.
  */
-class VariableSerializer {
-public:
+struct VariableSerializer {
   /**
    * Supported formats.
    */
@@ -56,6 +54,8 @@ public:
   ~VariableSerializer() {
     if (m_arrayIds) delete m_arrayIds;
   }
+
+  static __thread int64_t serializationSizeLimit;
 
   /**
    * Top level entry function called by f_ functions.
@@ -90,7 +90,7 @@ public:
   void writeRefCount(); // for DebugDump only
 
   void writeArrayHeader(int size, bool isVectorData);
-  void writeArrayKey(Variant key);
+  void writeArrayKey(const Variant& key);
   void writeArrayValue(const Variant& value);
   void writeCollectionKey(const Variant& key);
   void writeCollectionKeylessPrefix();
@@ -107,19 +107,20 @@ public:
   void incMaxCount() { m_maxCount++; }
   bool incNestedLevel(void *ptr, bool isObject = false);
   void decNestedLevel(void *ptr);
-  void setObjectInfo(const String& objClass, int objId, char objCode);
-  void setResourceInfo(const String& rsrcName, int rsrcId);
-  void getResourceInfo(String &rsrcName, int &rsrcId);
+  void pushObjectInfo(const String& objClass, int objId, char objCode);
+  void popObjectInfo();
+  void pushResourceInfo(const String& rsrcName, int rsrcId);
+  void popResourceInfo();
   Type getType() const { return m_type; }
 
 private:
-  typedef smart::hash_map<void*, int, pointer_hash<void> > SmartPtrCtrMap;
+  using ReqPtrCtrMap = req::hash_map<void*, int, pointer_hash<void>>;
   Type m_type;
   int m_option;                  // type specific extra options
   StringBuffer *m_buf;
   int m_indent;
-  SmartPtrCtrMap m_counts;       // counting seen arrays for recursive levels
-  SmartPtrCtrMap *m_arrayIds;    // reference ids for objs/arrays
+  ReqPtrCtrMap m_counts;         // counting seen arrays for recursive levels
+  ReqPtrCtrMap *m_arrayIds;      // reference ids for objs/arrays
   int m_valueCount;              // Current ref index
   bool m_referenced;             // mark current array element as reference
   int m_refCount;                // current variable's reference count
@@ -141,10 +142,24 @@ private:
     int  indent_delta;  // the extra indent to serialize this object
     int  size;          // the number of elements in the array
   };
-  smart::vector<ArrayInfo> m_arrayInfos;
+  req::vector<ArrayInfo> m_arrayInfos;
 
+  struct ObjectInfo {
+    String objClass;
+    int    objId;
+    char   objCode;
+    String rsrcName;
+    int    rsrcId;
+  };
+  req::vector<ObjectInfo> m_objectInfos;
+
+  // The func parameter will be invoked only if there is no overflow.
+  // Otherwise, writeOverflow will be invoked instead.
+  void preventOverflow(const Object& v, const std::function<void()>& func);
   void writePropertyKey(const String& prop);
 };
+
+extern const StaticString s_serializedNativeDataKey;
 
 ///////////////////////////////////////////////////////////////////////////////
 }

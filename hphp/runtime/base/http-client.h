@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,8 +17,10 @@
 #ifndef incl_HPHP_HTTP_CLIENT_H_
 #define incl_HPHP_HTTP_CLIENT_H_
 
-#include "hphp/runtime/base/string-buffer.h"
 #include <vector>
+
+#include "hphp/runtime/base/string-buffer.h"
+#include "hphp/runtime/base/type-array.h"
 #include "hphp/runtime/server/transport.h"
 
 namespace HPHP {
@@ -67,7 +69,9 @@ public:
               StringBuffer &response, const HeaderMap *requestHeaders,
               std::vector<String> *responseHeaders);
 
-  std::string getLastError() const { return m_error;}
+  const std::string& getLastError() const {
+    return m_error;
+  }
 
   static const int defaultMaxRedirect = 20;
 

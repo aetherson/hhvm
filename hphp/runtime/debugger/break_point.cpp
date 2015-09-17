@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -13,10 +13,12 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/debugger/break_point.h"
 
-#include <boost/lexical_cast.hpp>
 #include <vector>
+
+#include <folly/Conv.h>
 
 #include "hphp/runtime/debugger/debugger.h"
 #include "hphp/runtime/debugger/debugger_proxy.h"
@@ -27,13 +29,9 @@
 #include "hphp/runtime/base/stat-cache.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/base/comparisons.h"
-#include "hphp/runtime/ext/ext_generator.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
 
 namespace HPHP { namespace Eval {
-
-using std::string;
-using boost::lexical_cast;
-
 ///////////////////////////////////////////////////////////////////////////////
 
 TRACE_SET_MOD(debugger);
@@ -69,10 +67,10 @@ std::string InterruptSite::desc() const {
     ret += "()";
   }
 
-  string file = getFile();
+  std::string file = getFile();
   int line0 = getLine0();
   if (line0) {
-    ret += " on line " + boost::lexical_cast<std::string>(line0);
+    ret += " on line " + folly::to<std::string>(line0);
     if (!file.empty()) {
       ret += " of " + file;
     }
@@ -125,7 +123,7 @@ InterruptSite::InterruptSite(ActRec *fp, Offset offset, const Variant& error)
     m_file((StringData*)nullptr),
     m_line0(0), m_char0(0), m_line1(0), m_char1(0),
     m_offset(offset), m_unit(nullptr), m_valid(false),
-    m_funcEntry(false) {
+    m_funcEntry(false), m_builtin(false) {
   TRACE(2, "InterruptSite::InterruptSite(fp)\n");
   this->Initialize(fp);
 }
@@ -152,6 +150,7 @@ void InterruptSite::Initialize(ActRec *fp) {
   } else {
     m_class = "";
   }
+  m_builtin = fp->m_func->isBuiltin();
 #undef bail_on
   m_valid = true;
 }
@@ -483,14 +482,14 @@ std::string BreakPointInfo::getFuncName() const {
 
 std::string BreakPointInfo::site() const {
   TRACE(7, "BreakPointInfo::site\n");
-  string ret;
+  std::string ret;
 
-  string preposition = "at ";
+  std::string preposition = "at ";
   if (!m_funcs.empty()) {
     ret = m_funcs[0]->site(preposition);
-    for (unsigned int i = 1; i < m_funcs.size(); i++) {
+    for (unsigned i = 1; i < m_funcs.size(); i++) {
       ret += " called by ";
-      string tmp;
+      std::string tmp;
       ret += m_funcs[i]->site(tmp);
     }
   }
@@ -502,7 +501,7 @@ std::string BreakPointInfo::site() const {
       preposition = "";
     }
     if (m_line1) {
-      ret += "on line " + lexical_cast<string>(m_line1);
+      ret += "on line " + folly::to<std::string>(m_line1);
       if (!m_file.empty()) {
         ret += " of " + m_file;
       }
@@ -516,8 +515,8 @@ std::string BreakPointInfo::site() const {
 
 std::string BreakPointInfo::descBreakPointReached() const {
   TRACE(2, "BreakPointInfo::descBreakPointReached\n");
-  string ret;
-  for (unsigned int i = 0; i < m_funcs.size(); i++) {
+  std::string ret;
+  for (unsigned i = 0; i < m_funcs.size(); i++) {
     ret += (i == 0 ? "upon entering " : " called by ");
     ret += m_funcs[i]->desc(this);
   }
@@ -528,12 +527,12 @@ std::string BreakPointInfo::descBreakPointReached() const {
     }
     if (m_line1 || m_line2) {
       if (m_line1 == m_line2) {
-        ret += "on line " + lexical_cast<string>(m_line1);
+        ret += "on line " + folly::to<std::string>(m_line1);
       } else if (m_line2 == -1) {
-        ret += "between line " + lexical_cast<string>(m_line1) + " and end";
+        ret += "between line " + folly::to<std::string>(m_line1) + " and end";
       } else {
-        ret += "between line " + lexical_cast<string>(m_line1) +
-          " and line " + lexical_cast<string>(m_line2);
+        ret += "between line " + folly::to<std::string>(m_line1) +
+          " and line " + folly::to<std::string>(m_line2);
       }
       if (!m_file.empty()) {
         ret += " of " + regex(m_file);
@@ -549,7 +548,7 @@ std::string BreakPointInfo::descBreakPointReached() const {
 
 std::string BreakPointInfo::descExceptionThrown() const {
   TRACE(2, "BreakPointInfo::descExceptionThrown\n");
-  string ret;
+  std::string ret;
   if (!m_namespace.empty() || !m_class.empty()) {
     if (m_class == ErrorClassName) {
       ret = "right after an error";
@@ -570,7 +569,7 @@ std::string BreakPointInfo::descExceptionThrown() const {
 
 std::string BreakPointInfo::desc() const {
   TRACE(2, "BreakPointInfo::desc\n");
-  string ret;
+  std::string ret;
   switch (m_interruptType) {
     case BreakPointReached:
       ret = descBreakPointReached();
@@ -723,7 +722,7 @@ void BreakPointInfo::parseBreakPointReached(const std::string &exp,
                                             const std::string &file) {
   TRACE(2, "BreakPointInfo::parseBreakPointReached\n");
 
-  string name;
+  std::string name;
   auto len = exp.length();
   auto offset0 = 0;
   //Look for leading number by itself
@@ -868,7 +867,7 @@ returnInvalid:
 void BreakPointInfo::parseExceptionThrown(const std::string &exp) {
   TRACE(2, "BreakPointInfo::parseExceptionThrown\n");
 
-  string name;
+  std::string name;
   auto len = exp.length();
   auto offset0 = 0;
   // Skip over a leading backslash
@@ -998,7 +997,7 @@ bool BreakPointInfo::Match(const char *haystack, int haystack_len,
   Variant r = preg_match(String(needle.c_str(), needle.size(),
                                 CopyString),
                          String(haystack, haystack_len, CopyString),
-                         matches);
+                         &matches);
   return HPHP::same(r, 1);
 }
 
@@ -1008,9 +1007,9 @@ bool BreakPointInfo::checkExceptionOrError(const Variant& e) {
   if (e.isObject()) {
     if (m_regex) {
       return Match(m_class.c_str(), m_class.size(),
-                   e.toObject()->o_getClassName().data(), true, false);
+                   e.toObject()->getClassName().data(), true, false);
     }
-    return e.getObjectData()->o_instanceof(m_class.c_str());
+    return e.getObjectData()->instanceof(m_class);
   }
   return Match(m_class.c_str(), m_class.size(), ErrorClassName, m_regex,
                false);

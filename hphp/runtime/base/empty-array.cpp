@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -13,6 +13,7 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
+
 #include "hphp/runtime/base/empty-array.h"
 
 #include <utility>
@@ -27,6 +28,8 @@
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/mixed-array-defs.h"
 #include "hphp/runtime/base/packed-array-defs.h"
+#include "hphp/runtime/base/shape.h"
+#include "hphp/runtime/base/struct-array.h"
 
 namespace HPHP {
 
@@ -39,14 +42,9 @@ std::aligned_storage<
 
 struct EmptyArray::Initializer {
   Initializer() {
-    void* vpEmpty = &s_theEmptyArray;
-
-    auto const ad   = static_cast<ArrayData*>(vpEmpty);
-    ad->m_kind      = ArrayData::kEmptyKind;
-    ad->m_size      = 0;
-    ad->m_pos       = 0;
-    ad->m_count     = 0;
-    ad->setStatic();
+    auto const ad   = reinterpret_cast<ArrayData*>(&s_theEmptyArray);
+    ad->m_sizeAndPos = 0;
+    ad->m_hdr.init(HeaderKind::Empty, StaticValue);
   }
 };
 EmptyArray::Initializer EmptyArray::s_initializer;
@@ -88,7 +86,7 @@ bool EmptyArray::AdvanceMArrayIter(ArrayData*, MArrayIter& fp) {
 
 // We're always already a static array.
 void EmptyArray::OnSetEvalScalar(ArrayData*) { not_reached(); }
-ArrayData* EmptyArray::NonSmartCopy(const ArrayData* ad) { not_reached(); }
+ArrayData* EmptyArray::CopyStatic(const ArrayData* ad) { not_reached(); }
 
 //////////////////////////////////////////////////////////////////////
 
@@ -121,28 +119,27 @@ ArrayData* EmptyArray::CopyWithStrongIterators(const ArrayData* ad) {
 
 /*
  * Helper for empty array -> packed transitions.  Creates an array
- * with one element.  The element is transfered into the array (should
+ * with one element.  The element is transferred into the array (should
  * already be incref'd).
  */
 ALWAYS_INLINE
 std::pair<ArrayData*,TypedValue*> EmptyArray::MakePackedInl(TypedValue tv) {
   auto const cap = kPackedSmallSize;
   auto const ad = static_cast<ArrayData*>(
-    MM().objMallocLogged(sizeof(ArrayData) + cap * sizeof(TypedValue))
+    MM().objMalloc(sizeof(ArrayData) + cap * sizeof(TypedValue))
   );
-  assert(cap == packedCodeToCap(cap));
-  ad->m_kindAndSize = uint64_t{1} << 32 | cap; // also set kind
-  ad->m_posAndCount = 0;
+  assert(cap == CapCode::ceil(cap).code);
+  ad->m_sizeAndPos = 1; // size=1, pos=0
+  ad->m_hdr.init(CapCode::exact(cap), HeaderKind::Packed, 1);
 
   auto& lval = *reinterpret_cast<TypedValue*>(ad + 1);
   lval.m_data = tv.m_data;
   lval.m_type = tv.m_type;
 
-  assert(ad->m_kind == ArrayData::kPackedKind);
+  assert(ad->kind() == ArrayData::kPackedKind);
   assert(ad->m_size == 1);
   assert(ad->m_pos == 0);
-  assert(ad->m_count == 0);
-  assert((ad->m_packedCapCode & 0xFFFFFFUL) == cap);
+  assert(ad->hasExactlyOneRef());
   assert(PackedArray::checkInvariants(ad));
   return { ad, &lval };
 }
@@ -160,25 +157,12 @@ std::pair<ArrayData*,TypedValue*> EmptyArray::MakePacked(TypedValue tv) {
 NEVER_INLINE
 std::pair<ArrayData*,TypedValue*>
 EmptyArray::MakeMixed(StringData* key, TypedValue val) {
-  auto const mask = MixedArray::SmallMask;            // 3
-  auto const cap  = MixedArray::computeMaxElms(mask); // 3
-  auto const ad   = smartAllocArray(cap, mask);
-
-  ad->m_kindAndSize = uint64_t{1} << 32 | ArrayData::kMixedKind << 24;
-  ad->m_posAndCount = 0;
-  ad->m_capAndUsed  = uint64_t{1} << 32 | cap;
-  ad->m_tableMask   = mask;
-  ad->m_nextKI      = 0;
-
-  auto const data = reinterpret_cast<MixedArray::Elm*>(ad + 1);
-  auto const hash = reinterpret_cast<int32_t*>(data + cap);
-
-  assert(mask + 1 == 4);
-  auto const emptyVal = int64_t{MixedArray::Empty};
-  reinterpret_cast<int64_t*>(hash)[0] = emptyVal;
-  reinterpret_cast<int64_t*>(hash)[1] = emptyVal;
-
+  auto const ad = reqAllocArray(MixedArray::SmallScale);
+  MixedArray::InitSmall(ad, 1/*count*/, 1/*size*/, 0/*nextIntKey*/);
+  auto const data = ad->data();
+  auto const hash = reinterpret_cast<int32_t*>(data + MixedArray::SmallSize);
   auto const khash = key->hash();
+  auto const mask = MixedArray::SmallMask;
   hash[khash & mask] = 0;
   data[0].setStrKey(key, khash);
 
@@ -186,11 +170,11 @@ EmptyArray::MakeMixed(StringData* key, TypedValue val) {
   lval.m_data = val.m_data;
   lval.m_type = val.m_type;
 
-  assert(ad->m_kind == ArrayData::kMixedKind);
   assert(ad->m_size == 1);
   assert(ad->m_pos == 0);
-  assert(ad->m_count == 0);
-  assert(ad->m_cap == cap);
+  assert(ad->m_scale == MixedArray::SmallScale);
+  assert(ad->kind() == ArrayData::kMixedKind);
+  assert(ad->hasExactlyOneRef());
   assert(ad->m_used == 1);
   assert(ad->checkInvariants());
   return { ad, &lval };
@@ -202,24 +186,12 @@ EmptyArray::MakeMixed(StringData* key, TypedValue val) {
  */
 std::pair<ArrayData*,TypedValue*>
 EmptyArray::MakeMixed(int64_t key, TypedValue val) {
-  auto const mask = MixedArray::SmallMask;            // 3
-  auto const cap  = MixedArray::computeMaxElms(mask); // 3
-  auto const ad   = smartAllocArray(cap, mask);
+  auto const ad = reqAllocArray(MixedArray::SmallScale);
+  MixedArray::InitSmall(ad, 1/*count*/, 1/*size*/, (key >= 0) ? key + 1 : 0);
+  auto const data = ad->data();
+  auto const hash = reinterpret_cast<int32_t*>(data + MixedArray::SmallSize);
 
-  ad->m_kindAndSize = uint64_t{1} << 32 | ArrayData::kMixedKind << 24;
-  ad->m_posAndCount = 0;
-  ad->m_capAndUsed  = uint64_t{1} << 32 | cap;
-  ad->m_tableMask   = mask;
-  ad->m_nextKI      = key + 1;
-
-  auto const data = reinterpret_cast<MixedArray::Elm*>(ad + 1);
-  auto const hash = reinterpret_cast<int32_t*>(data + cap);
-
-  assert(mask + 1 == 4);
-  auto const emptyVal = int64_t{MixedArray::Empty};
-  reinterpret_cast<int64_t*>(hash)[0] = emptyVal;
-  reinterpret_cast<int64_t*>(hash)[1] = emptyVal;
-
+  auto const mask = MixedArray::SmallMask;
   hash[key & mask] = 0;
   data[0].setIntKey(key);
 
@@ -227,11 +199,11 @@ EmptyArray::MakeMixed(int64_t key, TypedValue val) {
   lval.m_data = val.m_data;
   lval.m_type = val.m_type;
 
-  assert(ad->m_kind == ArrayData::kMixedKind);
+  assert(ad->kind() == ArrayData::kMixedKind);
   assert(ad->m_size == 1);
   assert(ad->m_pos == 0);
-  assert(ad->m_count == 0);
-  assert(ad->m_cap == cap);
+  assert(ad->hasExactlyOneRef());
+  assert(ad->m_scale == MixedArray::SmallScale);
   assert(ad->m_used == 1);
   assert(ad->checkInvariants());
   return { ad, &lval };
@@ -329,19 +301,19 @@ ArrayData* EmptyArray::PlusEq(ArrayData*, const ArrayData* elems) {
 
 ArrayData* EmptyArray::Merge(ArrayData*, const ArrayData* elems) {
   // Packed arrays don't need renumbering, so don't make a copy.
-  if (elems->isPacked()) {
+  if (elems->isPacked() || elems->isStruct()) {
     elems->incRefCount();
     return const_cast<ArrayData*>(elems);
   }
   // Fast path the common case that elems is mixed.
   if (elems->isMixed()) {
     auto const copy = MixedArray::Copy(elems);
-    copy->incRefCount();
+    assert(copy != elems);
     MixedArray::Renumber(copy);
     return copy;
   }
   auto copy = elems->copy();
-  copy->incRefCount();
+  assert(copy != elems);
   copy->renumber();
   return copy;
 }
@@ -363,7 +335,6 @@ ArrayData* EmptyArray::Prepend(ArrayData*, const Variant& vin, bool) {
 
 ArrayData* EmptyArray::ZSetInt(ArrayData* ad, int64_t k, RefData* v) {
   auto const arr = MixedArray::MakeReserveMixed(MixedArray::SmallSize);
-  arr->m_count = 0;
   DEBUG_ONLY auto const tmp = arr->zSet(k, v);
   assert(tmp == arr);
   return arr;
@@ -371,7 +342,6 @@ ArrayData* EmptyArray::ZSetInt(ArrayData* ad, int64_t k, RefData* v) {
 
 ArrayData* EmptyArray::ZSetStr(ArrayData* ad, StringData* k, RefData* v) {
   auto const arr = MixedArray::MakeReserveMixed(MixedArray::SmallSize);
-  arr->m_count = 0;
   DEBUG_ONLY auto const tmp = arr->zSet(k, v);
   assert(tmp == arr);
   return arr;
@@ -379,7 +349,6 @@ ArrayData* EmptyArray::ZSetStr(ArrayData* ad, StringData* k, RefData* v) {
 
 ArrayData* EmptyArray::ZAppend(ArrayData* ad, RefData* v, int64_t* key_ptr) {
   auto const arr = MixedArray::MakeReserveMixed(MixedArray::SmallSize);
-  arr->m_count = 0;
   DEBUG_ONLY auto const tmp = arr->zAppend(v, key_ptr);
   assert(tmp == arr);
   return arr;

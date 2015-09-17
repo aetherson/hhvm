@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -22,8 +22,9 @@ type env = Typing_env.env
 type inherited = {
   ih_cstr     : class_elt option * bool;
   ih_consts   : class_elt SMap.t ;
-  ih_cvars    : class_elt SMap.t ;
-  ih_scvars   : class_elt SMap.t ;
+  ih_typeconsts : typeconst_type SMap.t ;
+  ih_props    : class_elt SMap.t ;
+  ih_sprops   : class_elt SMap.t ;
   ih_methods  : class_elt SMap.t ;
   ih_smethods : class_elt SMap.t ;
 }

@@ -18,24 +18,26 @@
 #ifndef incl_HPHP_XDEBUG_UTILS_H_
 #define incl_HPHP_XDEBUG_UTILS_H_
 
-#include "hphp/runtime/ext/xdebug/ext_xdebug.h"
+#include "hphp/runtime/base/resource-data.h"
 
-#include "hphp/runtime/ext/ext_datetime.h"
+#include "hphp/runtime/ext/xdebug/ext_xdebug.h"
+#include "hphp/runtime/ext/xdebug/php5_xdebug/xdebug_mm.h"
+
+#include "hphp/runtime/ext/datetime/ext_datetime.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
 // Class containing generic utility routines used by xdebug. Similar to
 // xdebug's "usefulstuff.c"
-class XDebugUtils {
-public:
+struct XDebugUtils {
   // Helper that writes a timestamp in the given file in the format used by
   // xdebug
   static void fprintTimestamp(FILE* f) {
-    DateTime now(time(nullptr));
+    auto now = req::make<DateTime>(time(nullptr));
     fprintf(f, "[%d-%02d-%02d %02d:%02d:%02d]",
-            now.year(), now.month(), now.day(),
-            now.hour(), now.minute(), now.second());
+            now->year(), now->month(), now->day(),
+            now->hour(), now->minute(), now->second());
   }
 
   // Returns true iff the passed trigger is set as a cookie or as a GET/POST
@@ -44,7 +46,15 @@ public:
 
   // Translated from xdebug.
   // xdebug desc: fake URI's per IETF RFC 1738 and 2396 format
-  static char* pathToUrl(char* fileurl);
+  static char* pathToUrl(const char* fileurl);
+
+  // HHVM interface for pathToUrl
+  static String pathToUrl(const String& fileurl) {
+    auto url = pathToUrl(const_cast<char*>(fileurl.data()));
+    String url_str = String(url, CopyString);
+    xdfree(url); // xdfree needed since allocated with xdmalloc
+    return url_str;
+  }
 
   // Decodes the given url into a file path. Translated from php5 xdebug
   static String pathFromUrl(const String& fileurl);

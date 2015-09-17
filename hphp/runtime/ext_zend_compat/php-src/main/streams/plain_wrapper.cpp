@@ -20,13 +20,13 @@
 
 #include "php.h"
 #include "hphp/runtime/base/plain-file.h"
+#include "hphp/runtime/base/resource-data.h"
 
 PHPAPI php_stream *_php_stream_fopen_tmpfile(int dummy STREAMS_DC TSRMLS_DC) {
   FILE *f = tmpfile();
   if (f) {
-    auto* file = NEWOBJ(HPHP::PlainFile)(f);
-    auto* stream = HPHP::smart_new<php_stream>(file);
-    stream->hphp_file->incRefCount();
+    auto file = HPHP::req::make<HPHP::PlainFile>(f).detach();
+    auto stream = HPHP::req::make_raw<php_stream>(file);
     return stream;
   }
   return nullptr;

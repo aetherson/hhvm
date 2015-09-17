@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1998-2010 Zend Technologies Ltd. (http://www.zend.com) |
    +----------------------------------------------------------------------+
    | This source file is subject to version 2.00 of the Zend license,     |
@@ -16,6 +16,8 @@
 */
 
 #include "hphp/runtime/base/zend-functions.h"
+
+#include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/zend-strtod.h"
 
 namespace HPHP {
@@ -30,7 +32,7 @@ static const char long_min_digits[] = "9223372036854775808";
 
 ///////////////////////////////////////////////////////////////////////////////
 
-StringSlice conv_10(int64_t num, char* buf_end) {
+folly::StringPiece conv_10(int64_t num, char* buf_end) {
   auto p = buf_end;
   uint64_t magnitude;
 
@@ -60,19 +62,23 @@ StringSlice conv_10(int64_t num, char* buf_end) {
   } while (magnitude);
 
   if (num < 0) *--p = '-';
-  return StringSlice{p, static_cast<uint32_t>(buf_end - p)};
+  return folly::StringPiece{p, static_cast<size_t>(buf_end - p)};
 }
 
 DataType is_numeric_string(const char *str, int length, int64_t *lval,
-                           double *dval, int allow_errors /* = 0 */) {
+                           double *dval, int allow_errors /* = 0 */,
+                           int* overflow_info /* = nullptr */) {
   DataType type;
   const char *ptr;
-  int base = 10, digits = 0, dp_or_e = 0;
+  int base = 10, digits = 0, dp_or_e = 0, info_unused;
   double local_dval = 0.0;
+  int& overflow = overflow_info ? *overflow_info : info_unused;
 
   if (!length || ((unsigned char)(*str)) > '9') {
     return KindOfNull;
   }
+
+  overflow = 0;
 
   /* Skip any whitespace
    * This is much faster than the isspace() function */
@@ -95,8 +101,10 @@ DataType is_numeric_string(const char *str, int length, int64_t *lval,
     /* Handle hex numbers
      * str is used instead of ptr to disallow signs and keep old behavior */
     if (length > 2 && *str == '0' && (str[1] == 'x' || str[1] == 'X')) {
-      base = 16;
-      ptr += 2;
+      if (!RuntimeOption::PHP7_NoHexNumerics) {
+        base = 16;
+        ptr += 2;
+      }
     }
 
     /* Skip any leading 0s */
@@ -133,6 +141,7 @@ DataType is_numeric_string(const char *str, int length, int64_t *lval,
 
     if (base == 10) {
       if (digits >= MAX_LENGTH_OF_LONG) {
+        overflow = *str == '-' ? -1 : 1;
         dp_or_e = -1;
         goto process_double;
       }
@@ -141,6 +150,7 @@ DataType is_numeric_string(const char *str, int length, int64_t *lval,
       if (dval) {
         local_dval = zend_hex_strtod(str, (const char **)&ptr);
       }
+      overflow = 1;
       type = KindOfDouble;
     }
   } else if (*ptr == '.' && IS_DIGIT(ptr[1])) {
@@ -175,6 +185,7 @@ DataType is_numeric_string(const char *str, int length, int64_t *lval,
         if (dval) {
           *dval = strtod(str, nullptr);
         }
+        overflow = *str == '-' ? -1 : 1;
         return KindOfDouble;
       }
     }

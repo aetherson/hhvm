@@ -24,78 +24,158 @@
  *    of data to the workers. This is used to share an environment in
  *    read-only mode with all the workers.
  *    The master stores, the workers read.
+ *    Only concurrent reads allowed. No concurrent write/read and write/write.
+ *    There are a few different OCaml modules that act as interfaces to this
+ *    global storage. They all use the same area of memory, so only one can be
+ *    active at any one time. The first word indicates the size of the global
+ *    storage currently in use; callers are responsible for setting it to zero
+ *    once they are done.
  *
  * II) The dependency table. It's a hashtable that contains all the
  *    dependencies between Hack objects. It is filled concurrently by
  *    the workers. The dependency table is made of 2 hashtables, one that
  *    can is used to quickly answer if a dependency exists. The other one
  *    to retrieve the list of dependencies associated with an object.
+ *    Only the hashes of the objects are stored, so this uses relatively
+ *    little memory. No dynamic allocation is required.
  *
- * III) The Hashtable.
- *     The operations implemented, and their limitations:
+ * III) The hashtable that maps string keys to string values. (The strings
+ *    are really serialized / marshalled representations of OCaml structures.)
+ *    Key observation of the table is that data with the same key are
+ *    considered equivalent, and so you can arbitrarily get any copy of it;
+ *    furthermore if data is missing it can be recomputed, so incorrectly
+ *    saying data is missing when it is being written is only a potential perf
+ *    loss. Note that "equivalent" doesn't necessarily mean "identical", e.g.,
+ *    two alpha-converted types are "equivalent" though not literally byte-
+ *    identical. (That said, I'm pretty sure the Hack typechecker actually does
+ *    always write identical data, but the hashtable doesn't need quite that
+ *    strong of an invariant.)
+ *
+ *    The operations implemented, and their limitations:
  *
  *    -) Concurrent writes: SUPPORTED
- *       As long as its not interleaved with any other operation
- *       (other than mem)!
+ *       One will win and the other will get dropped on the floor. There is no
+ *       way to tell which happened. Only promise is that after a write, the
+ *       one thread which did the write will see data in the table (though it
+ *       may be slightly different data than what was written, see above about
+ *       equivalent data).
  *
  *    -) Concurrent reads: SUPPORTED
- *       As long as they are no concurrent writers.
+ *       If interleaved with a concurrent write, the read will arbitrarily
+ *       say that there is no data at that slot or return the entire new data
+ *       written by the concurrent writer.
  *
  *    -) Concurrent removes: NOT SUPPORTED
- *       Only the master can remove.
+ *       Only the master can remove, and can only do so if there are no other
+ *       concurrent operations (reads or writes).
+ *
+ *    Since the values are variably sized and can get quite large, they are
+ *    stored separately from the hashes in a garbage-collected heap.
+ *
+ * Both II and III resolve hash collisions via linear probing.
  */
 /*****************************************************************************/
 
+/* define CAML_NAME_SPACE to ensure all the caml imports are prefixed with
+ * 'caml_' */
+#define CAML_NAME_SPACE
+#include <caml/mlvalues.h>
+#include <caml/unixsupport.h>
 #include <caml/memory.h>
 #include <caml/alloc.h>
-#include <string.h>
-#include <stdio.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <sys/mman.h>
+#include <caml/fail.h>
+
 #include <assert.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/errno.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <sys/mman.h>
-#include <sys/errno.h>
-#include <stdint.h>
-#include <sys/resource.h>
-#include <signal.h>
-#include <sys/syscall.h>
+#endif
 
-#define GIG (1024l * 1024l * 1024l)
+// The following 'typedef' won't be required anymore
+// when dropping support for OCaml < 4.03
+#ifdef __MINGW64__
+typedef unsigned __int64 uint64_t;
+#endif
+
+#ifndef NO_LZ4
+#include <lz4.h>
+#include <lz4hc.h>
+#endif
+
+#ifdef _WIN32
+static int win32_getpagesize(void)
+{
+  SYSTEM_INFO siSysInfo;
+  GetSystemInfo(&siSysInfo);
+  return siSysInfo.dwPageSize;
+}
+#define getpagesize win32_getpagesize
+#endif
+
+/*****************************************************************************/
+/* Config settings (essentially constants, so they don't need to live in shared
+ * memory), initialized in hh_shared_init */
+/*****************************************************************************/
+
+static size_t global_size_b;
+static size_t heap_size;
+
+// XXX: DEP_POW and HASHTBL_POW are not configurable because we take a ~2% perf
+// hit by doing so, likely because the compiler does some constant folding.
+// Should revisit this if / when we switch to compiling with an optimization
+// level higher than -O0. In lieu of that, let's use a define so we don't use
+// absurd amounts of RAM for OSS users.
+#ifdef OSS_SMALL_HH_TABLE_POWS
+#define DEP_POW         17
+#define HASHTBL_POW     18
+#else
+#define DEP_POW         26
+#define HASHTBL_POW     24
+#endif
 
 /* Convention: .*_B = Size in bytes. */
 
-/* Size of the "global storage". */
-#define GLOBAL_SIZE_B   GIG
-
 /* Used for the dependency hashtable */
-#define DEP_POW         24
-#define DEP_SIZE        (1 << DEP_POW)
+#define DEP_SIZE        (1ul << DEP_POW)
 #define DEP_SIZE_B      (DEP_SIZE * sizeof(value))
 
 /* Used for the shared hashtable */
-#define HASHTBL_POW     23
-#define HASHTBL_SIZE    (1 << HASHTBL_POW)
+#define HASHTBL_SIZE    (1ul << HASHTBL_POW)
 #define HASHTBL_SIZE_B  (HASHTBL_SIZE * sizeof(helt_t))
 
 /* Size of where we allocate shared objects. */
-#define HEAP_SIZE       (16 * GIG)
 #define Get_size(x)     (((size_t*)(x))[-1])
 #define Get_buf_size(x) (((size_t*)(x))[-1] + sizeof(size_t))
 #define Get_buf(x)      (x - sizeof(size_t))
-
-/* The total size of the shared memory.
- * Most of it is going to remain virtual.
- */
-#define SHARED_MEM_SIZE (GLOBAL_SIZE_B + 2 * DEP_SIZE_B + \
-                         HASHTBL_SIZE_B + HEAP_SIZE)
 
 /* Too lazy to use getconf */
 #define CACHE_LINE_SIZE (1 << 6)
 #define CACHE_MASK      (~(CACHE_LINE_SIZE - 1))
 #define ALIGNED(x)      ((x + CACHE_LINE_SIZE - 1) & CACHE_MASK)
+
+/* Fix the location of our shared memory so we can save and restore the
+ * hashtable easily */
+#define SHARED_MEM_INIT 0x500000000000ll
+
+/* As a sanity check when loading from a file */
+static uint64_t MAGIC_CONSTANT = 0xfacefacefaceb000ll;
+
+/* The VCS identifier (typically a git hash) of the build */
+extern const char* const BuildInfo_kRevision;
 
 /*****************************************************************************/
 /* Types */
@@ -103,16 +183,13 @@
 
 /* Cells of the Hashtable */
 typedef struct {
-  unsigned long hash;
+  uint64_t hash;
   char* addr;
 } helt_t;
 
 /*****************************************************************************/
 /* Globals */
 /*****************************************************************************/
-
-/* The location of the shared memory */
-static char* shared_mem;
 
 /* ENCODING: The first element is the size stored in bytes, the rest is
  * the data. The size is set to zero when the storage is empty.
@@ -132,6 +209,7 @@ static int* hcounter;   // the number of slots taken in the table
 
 /* A counter increasing globally across all forks. */
 static uintptr_t* counter;
+/* This should only be used before forking */
 static uintptr_t early_counter = 1;
 
 /* The top of the heap */
@@ -145,25 +223,68 @@ static pid_t my_pid;
 static char* heap_init;
 
 /* The size of the heap after initialization of the server */
+/* This should only be used by the master */
 static size_t heap_init_size = 0;
 
-/* The size of a page (memory page) */
-static int page_size;
+static size_t used_heap_size() {
+  return *heap - heap_init;
+}
+
+/* Expose so we can display diagnostics */
+value hh_heap_size() {
+  CAMLparam0();
+  CAMLreturn(Val_long(used_heap_size()));
+}
+
+value hh_hash_used_slots() {
+  CAMLparam0();
+  uint64_t count = 0;
+  uintptr_t i = 0;
+  for (i = 0; i < HASHTBL_SIZE; ++i) {
+    if (hashtbl[i].addr != NULL) {
+      count++;
+    }
+  }
+  CAMLreturn(Val_long(count));
+}
+
+value hh_hash_slots() {
+  CAMLparam0();
+  CAMLreturn(Val_long(HASHTBL_SIZE));
+}
 
 /*****************************************************************************/
 /* Given a pointer to the shared memory address space, initializes all
  * the globals that live in shared memory.
  */
 /*****************************************************************************/
-static void init_shared_globals(char* mem) {
-  int page_size = getpagesize();
-  char* bottom  = mem;
 
-  /* We keep all the small objects in the first page.
-   * There are on different cache lines because we modify them atomically.
+static void init_shared_globals(char* mem) {
+  size_t page_size = getpagesize();
+
+#ifdef _WIN32
+  if (!VirtualAlloc(mem,
+                    global_size_b + page_size +
+                      2 * DEP_SIZE_B + HASHTBL_SIZE_B,
+                    MEM_COMMIT, PAGE_READWRITE)) {
+    win32_maperr(GetLastError());
+    uerror("VirtualAlloc2", Nothing);
+  }
+#endif
+
+  /* Global storage initialization:
+   * We store this at the start of the shared memory section as it never
+   * needs to get saved (always reset after each typechecking run) */
+  global_storage = (value*)mem;
+  // Initial size is zero
+  global_storage[0] = 0;
+  mem += global_size_b;
+
+  /* BEGINNING OF THE SMALL OBJECTS PAGE
+   * We keep all the small objects in this page.
+   * They are on different cache lines because we modify them atomically.
    */
 
-  /* BEGINING OF THE FIRST PAGE */
   /* The pointer to the top of the heap.
    * We will atomically increment *heap every time we want to allocate.
    */
@@ -180,13 +301,7 @@ static void init_shared_globals(char* mem) {
   mem += page_size;
   // Just checking that the page is large enough.
   assert(page_size > CACHE_LINE_SIZE + (int)sizeof(int));
-  /* END OF THE FIRST PAGE */
-
-  /* Global storage initialization */
-  global_storage = (value*)mem;
-  // Initial size is zero
-  global_storage[0] = 0;
-  mem += GLOBAL_SIZE_B;
+  /* END OF THE SMALL OBJECTS PAGE */
 
   /* Dependencies */
   deptbl = (uint64_t*)mem;
@@ -202,9 +317,6 @@ static void init_shared_globals(char* mem) {
   /* Heap */
   heap_init = mem;
   *heap = mem;
-
-  // Checking that we did the maths correctly.
-  assert(mem + HEAP_SIZE == bottom + SHARED_MEM_SIZE + page_size);
 }
 
 /*****************************************************************************/
@@ -240,36 +352,122 @@ static void set_priorities() {
 
   // Don't slam the CPU either, though this has much less tendency to make the
   // system totally unresponsive so we don't need to lower all the way.
+  #ifdef _WIN32
+  SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+  // One might also try: PROCESS_MODE_BACKGROUND_BEGIN
+  #else
   int dummy = nice(10);
   (void)dummy; // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=25509
+  #endif
+
 }
 
 /*****************************************************************************/
 /* Must be called by the master BEFORE forking the workers! */
 /*****************************************************************************/
-void hh_shared_init() {
+
+value hh_shared_init(
+  value global_size_val,
+  value heap_size_val
+) {
+
+  CAMLparam2(global_size_val, heap_size_val);
+
+  global_size_b = Long_val(global_size_val);
+  heap_size = Long_val(heap_size_val);
+
+  char* shared_mem;
+
+  size_t page_size = getpagesize();
+
+  /* The total size of the shared memory.  Most of it is going to remain
+   * virtual. */
+  size_t shared_mem_size =
+    global_size_b + 2 * DEP_SIZE_B + HASHTBL_SIZE_B +
+    heap_size + page_size;
+
+#ifdef _WIN32
+  /*
+
+     We create an anonymous memory file, whose `handle` might be
+     inherited by slave processes.
+
+     This memory file is tagged "reserved" but not "committed". This
+     means that the memory space will be reserved in the virtual
+     memory table but the pages will not be bound to any physical
+     memory yet. Further calls to 'VirtualAlloc' will "commit" pages,
+     meaning they will be bound to physical memory.
+
+     This is behavior that should reflect the 'MAP_NORESERVE' flag of
+     'mmap' on Unix. But, on Unix, the "commit" is implicit.
+
+     Committing the whole shared heap at once would require the same
+     amount of free space in memory (or in swap file).
+
+  */
+  HANDLE handle = CreateFileMapping(
+    INVALID_HANDLE_VALUE,
+    NULL,
+    PAGE_READWRITE | SEC_RESERVE,
+    shared_mem_size >> 32, shared_mem_size & ((1ll << 32) - 1),
+    NULL);
+  if (handle == NULL) {
+    win32_maperr(GetLastError());
+    uerror("CreateFileMapping", Nothing);
+  }
+  if (!SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+    win32_maperr(GetLastError());
+    uerror("SetHandleInformation", Nothing);
+  }
+  shared_mem = MapViewOfFileEx(
+    handle,
+    FILE_MAP_ALL_ACCESS,
+    0, 0,
+    0,
+    (char *)SHARED_MEM_INIT);
+  if (shared_mem != (char *)SHARED_MEM_INIT) {
+    shared_mem = NULL;
+    win32_maperr(GetLastError());
+    uerror("MapViewOfFileEx", Nothing);
+  }
+
+#else /* _WIN32 */
+
   /* MAP_NORESERVE is because we want a lot more virtual memory than what
    * we are actually going to use.
    */
-  int flags = MAP_SHARED | MAP_ANON | MAP_NORESERVE;
+  int flags = MAP_SHARED | MAP_ANON | MAP_NORESERVE | MAP_FIXED;
   int prot  = PROT_READ  | PROT_WRITE;
 
-  page_size = getpagesize();
-
   shared_mem =
-    (char*)mmap(NULL, page_size + SHARED_MEM_SIZE, prot, flags, 0, 0);
-
+    (char*)mmap((void*)SHARED_MEM_INIT,  shared_mem_size, prot,
+                flags, 0, 0);
   if(shared_mem == MAP_FAILED) {
     printf("Error initializing: %s\n", strerror(errno));
     exit(2);
   }
 
+#ifdef MADV_DONTDUMP
+  // We are unlikely to get much useful information out of the shared heap in
+  // a core file. Moreover, it can be HUGE, and the extensive work done dumping
+  // it once for each CPU can mean that the user will reboot their machine
+  // before the much more useful stack gets dumped!
+  madvise(shared_mem, shared_mem_size, MADV_DONTDUMP);
+#endif
+
   // Keeping the pids around to make asserts.
   master_pid = getpid();
   my_pid = master_pid;
 
+#endif /* _WIN32 */
+
+  char* bottom = shared_mem;
   init_shared_globals(shared_mem);
 
+  // Checking that we did the maths correctly.
+  assert(*heap + heap_size == bottom + shared_mem_size);
+
+#ifndef _WIN32
   // Uninstall ocaml's segfault handler. It's supposed to throw an exception on
   // stack overflow, but we don't actually handle that exception, so what
   // happens in practice is we terminate at toplevel with an unhandled exception
@@ -279,13 +477,191 @@ void hh_shared_init() {
   sigemptyset(&sigact.sa_mask);
   sigact.sa_flags = 0;
   sigaction(SIGSEGV, &sigact, NULL);
+#endif
 
   set_priorities();
+
+  CAMLreturn(Val_unit);
 }
+
+#ifdef NO_LZ4
+void hh_save(value out_filename) {
+  CAMLparam1(out_filename);
+  caml_failwith("Program not linked with lz4, so saving is not supported!");
+  CAMLreturn0;
+}
+
+void hh_load(value in_filename) {
+  CAMLparam1(in_filename);
+  caml_failwith("Program not linked with lz4, so loading is not supported!");
+  CAMLreturn0;
+}
+#else
+static void fwrite_no_fail(const void* ptr, size_t size, size_t nmemb, FILE* fp) {
+  size_t nmemb_written = fwrite(ptr, size, nmemb, fp);
+  assert(nmemb_written == nmemb);
+}
+
+/* The global section is always reset after each typechecking phase, so we
+ * don't need to save it. (Resetting is done by setting the count of used bytes
+ * of the global section to zero.) */
+static char* save_start() {
+  return (char*)SHARED_MEM_INIT + global_size_b;
+}
+
+void hh_save(value out_filename) {
+  CAMLparam1(out_filename);
+  FILE* fp = fopen(String_val(out_filename), "wb");
+
+  fwrite_no_fail(&MAGIC_CONSTANT, sizeof MAGIC_CONSTANT, 1, fp);
+
+  size_t revlen = strlen(BuildInfo_kRevision);
+  fwrite_no_fail(&revlen, sizeof revlen, 1, fp);
+  fwrite_no_fail(BuildInfo_kRevision, sizeof(char), revlen, fp);
+
+  fwrite_no_fail(&heap_init_size, sizeof heap_init_size, 1, fp);
+
+  /*
+   * Format of the compressed shared memory:
+   * LZ4 can only work in chunks of 2GB, so we compress each chunk individually,
+   * and write out each one as
+   * [compressed size of chunk][uncompressed size of chunk][chunk]
+   * A compressed size of zero indicates the end of the compressed section.
+   */
+  char* chunk_start = save_start();
+  int compressed_size = 0;
+  while (chunk_start < *heap) {
+    uintptr_t remaining = *heap - chunk_start;
+    uintptr_t chunk_size = LZ4_MAX_INPUT_SIZE < remaining ?
+      LZ4_MAX_INPUT_SIZE : remaining;
+
+    char* compressed = malloc(chunk_size * sizeof(char));
+    assert(compressed != NULL);
+
+    compressed_size = LZ4_compressHC(chunk_start, compressed,
+      chunk_size);
+    assert(compressed_size > 0);
+
+    fwrite_no_fail(&compressed_size, sizeof compressed_size, 1, fp);
+    fwrite_no_fail(&chunk_size, sizeof chunk_size, 1, fp);
+    fwrite_no_fail((void*)compressed, 1, compressed_size, fp);
+
+    chunk_start += chunk_size;
+    free(compressed);
+  }
+  compressed_size = 0;
+  fwrite_no_fail(&compressed_size, sizeof compressed_size, 1, fp);
+
+  fclose(fp);
+  CAMLreturn0;
+}
+
+/* We want to use read() instead of fread() for the large shared memory block
+ * because buffering slows things down. This means we cannot use fread() for
+ * the other (smaller) values in our file either, because the buffering can
+ * move the file position indicator ahead of the values read. */
+static void read_all(int fd, void* start, size_t size) {
+  size_t total_read = 0;
+  do {
+    void* ptr = (void*)((uintptr_t)start + total_read);
+    ssize_t bytes_read = read(fd, (void*)ptr, size);
+    assert(bytes_read != -1 && bytes_read != 0);
+    total_read += bytes_read;
+  } while (total_read < size);
+}
+
+typedef struct {
+  char* compressed;
+  char* decompress_start;
+  int compressed_size;
+  int decompressed_size;
+} decompress_args;
+
+/* Return value must be an intptr_t instead of an int because pthread returns
+ * a void*-sized value */
+static intptr_t decompress(const decompress_args* args) {
+  int actual_compressed_size = LZ4_decompress_fast(
+      args->compressed,
+      args->decompress_start,
+      args->decompressed_size);
+  return args->compressed_size == actual_compressed_size;
+}
+
+void hh_load(value in_filename) {
+  CAMLparam1(in_filename);
+  FILE* fp = fopen(String_val(in_filename), "rb");
+
+  if (fp == NULL) {
+    caml_failwith("Failed to open file");
+  }
+
+  uint64_t magic = 0;
+  read_all(fileno(fp), (void*)&magic, sizeof magic);
+  assert(magic == MAGIC_CONSTANT);
+
+  size_t revlen = 0;
+  read_all(fileno(fp), (void*)&revlen, sizeof revlen);
+  char revision[revlen];
+  if (revlen > 0) {
+    read_all(fileno(fp), (void*)revision, revlen * sizeof(char));
+    assert(strncmp(revision, BuildInfo_kRevision, revlen) == 0);
+  }
+
+  read_all(fileno(fp), (void*)&heap_init_size, sizeof heap_init_size);
+
+  int compressed_size = 0;
+  read_all(fileno(fp), (void*)&compressed_size, sizeof compressed_size);
+  char* chunk_start = save_start();
+
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+  pthread_t thread;
+  decompress_args args;
+  int thread_started = 0;
+
+  // see hh_save for a description of what we are parsing here.
+  while (compressed_size > 0) {
+    char* compressed = malloc(compressed_size * sizeof(char));
+    assert(compressed != NULL);
+    uintptr_t chunk_size = 0;
+    read_all(fileno(fp), (void*)&chunk_size, sizeof chunk_size);
+    read_all(fileno(fp), compressed, compressed_size * sizeof(char));
+    if (thread_started) {
+      intptr_t success = 0;
+      int rc = pthread_join(thread, (void*)&success);
+      free(args.compressed);
+      assert(rc == 0);
+      assert(success);
+    }
+    args.compressed = compressed;
+    args.compressed_size = compressed_size;
+    args.decompress_start = chunk_start;
+    args.decompressed_size = chunk_size;
+    pthread_create(&thread, &attr, (void* (*)(void*))decompress, &args);
+    thread_started = 1;
+    chunk_start += chunk_size;
+    read_all(fileno(fp), (void*)&compressed_size, sizeof compressed_size);
+  }
+
+  if (thread_started) {
+    int success;
+    int rc = pthread_join(thread, (void*)&success);
+    free(args.compressed);
+    assert(rc == 0);
+    assert(success);
+  }
+
+  fclose(fp);
+  CAMLreturn0;
+}
+#endif /* NO_LZ4 */
 
 /* Must be called by every worker before any operation is performed */
 void hh_worker_init() {
+#ifndef _WIN32
   my_pid = getpid();
+#endif
 }
 
 /*****************************************************************************/
@@ -324,7 +700,7 @@ void hh_shared_store(value data) {
 
   assert(my_pid == master_pid);                  // only the master can store
   assert(global_storage[0] == 0);                // Is it clear?
-  assert(size < GLOBAL_SIZE_B - sizeof(value));  // Do we have enough space?
+  assert(size < global_size_b - sizeof(value));  // Do we have enough space?
 
   global_storage[0] = size;
   memcpy(&global_storage[1], &Field(data, 0), size);
@@ -401,14 +777,31 @@ static int htable_add(uint64_t* table, unsigned long hash, uint64_t value) {
 }
 
 void hh_add_dep(value ocaml_dep) {
-  unsigned long dep  = Long_val(ocaml_dep);
-  unsigned long hash = (dep >> 31) * (dep & ((1l << 31) - 1));
+  uint64_t dep  = Long_val(ocaml_dep);
+  unsigned long hash = (dep >> 31) * (dep & ((1ul << 31) - 1));
 
   if(!htable_add(deptbl_bindings, hash, hash)) {
     return;
   }
 
   htable_add(deptbl, dep >> 31, dep);
+}
+
+value hh_dep_used_slots() {
+  CAMLparam0();
+  uint64_t count = 0;
+  uintptr_t slot = 0;
+  for (slot = 0; slot < DEP_SIZE; ++slot) {
+    if (deptbl[slot]) {
+      count++;
+    }
+  }
+  CAMLreturn(Val_long(count));
+}
+
+value hh_dep_slots() {
+  CAMLparam0();
+  CAMLreturn(Val_long(DEP_SIZE));
 }
 
 /* Given a key, returns the list of values bound to it. */
@@ -427,7 +820,7 @@ value hh_get_dep(value dep) {
     }
     if(deptbl[slot] >> 31 == hash) {
       cell = caml_alloc_tuple(2);
-      Field(cell, 0) = Val_long(deptbl[slot] & ((1l << 31) - 1));
+      Field(cell, 0) = Val_long(deptbl[slot] & ((1ul << 31) - 1));
       Field(cell, 1) = result;
       result = cell;
     }
@@ -448,7 +841,13 @@ value hh_get_dep(value dep) {
  */
 /*****************************************************************************/
 void hh_call_after_init() {
-  heap_init_size = (uintptr_t)*heap - (uintptr_t)heap_init;
+  CAMLparam0();
+  heap_init_size = used_heap_size();
+  if(2 * heap_init_size >= heap_size) {
+    caml_failwith("Heap init size is too close to max heap size; "
+      "GC will never get triggered!");
+  }
+  CAMLreturn0;
 }
 
 /*****************************************************************************/
@@ -460,19 +859,25 @@ void hh_call_after_init() {
  * The collector should only be called by the master.
  */
 /*****************************************************************************/
-void hh_collect() {
+void hh_collect(value aggressive_val) {
+#ifdef _WIN32
+  // TODO GRGR
+  return;
+#else
+  int aggressive  = Bool_val(aggressive_val);
   int flags       = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
   int prot        = PROT_READ | PROT_WRITE;
   char* dest;
   size_t mem_size = 0;
   char* tmp_heap;
 
-  if(*heap < heap_init + 2 * heap_init_size) {
-    // We have not grown passed twice the size of the initial size
+  float space_overhead = aggressive ? 1.2 : 2.0;
+  if(used_heap_size() < (size_t)(space_overhead * heap_init_size)) {
+    // We have not grown past twice the size of the initial size
     return;
   }
 
-  tmp_heap = (char*)mmap(NULL, HEAP_SIZE, prot, flags, 0, 0);
+  tmp_heap = (char*)mmap(NULL, heap_size, prot, flags, 0, 0);
   dest = tmp_heap;
 
   if(tmp_heap == MAP_FAILED) {
@@ -483,7 +888,7 @@ void hh_collect() {
   assert(my_pid == master_pid); // Comes from the master
 
   // Walking the table
-  int i;
+  size_t i;
   for(i = 0; i < HASHTBL_SIZE; i++) {
     if(hashtbl[i].addr != NULL) { // Found a non empty slot
       size_t bl_size      = Get_buf_size(hashtbl[i].addr);
@@ -502,10 +907,11 @@ void hh_collect() {
   memcpy(heap_init, tmp_heap, mem_size);
   *heap = heap_init + mem_size;
 
-  if(munmap(tmp_heap, HEAP_SIZE) == -1) {
+  if(munmap(tmp_heap, heap_size) == -1) {
     printf("Error while collecting: %s\n", strerror(errno));
     exit(2);
   }
+#endif
 }
 
 /*****************************************************************************/
@@ -520,6 +926,12 @@ void hh_collect() {
 static char* hh_alloc(size_t size) {
   size_t slot_size  = ALIGNED(size + sizeof(size_t));
   char* chunk       = __sync_fetch_and_add(heap, slot_size);
+#ifdef _WIN32
+  if (!VirtualAlloc(chunk, slot_size, MEM_COMMIT, PAGE_READWRITE)) {
+    win32_maperr(GetLastError());
+    uerror("VirtualAlloc1", Nothing);
+  }
+#endif
   *((size_t*)chunk) = size;
   return (chunk + sizeof(size_t));
 }

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -25,10 +25,14 @@ namespace HPHP {
 
 TRACE_SET_MOD(mcg);
 
-// This value should be enough bytes to emit the "main" part of a
-// minimal translation, which consists of a single jump (for a
-// REQ_INTERPRET service request).
-static const int kMinTranslationBytes = 8;
+#if defined(__APPLE__) || defined(__CYGWIN__) || defined(_MSC_VER)
+const void* __hot_start = nullptr;
+const void* __hot_end = nullptr;
+#endif
+
+// This value should be enough bytes to emit the "main" part of a minimal
+// translation, which consists of a move and a jump.
+static const int kMinTranslationBytes = 16;
 
 CodeCache::Selector::Selector(const Args& args)
   : m_cache(args.m_cache)
@@ -57,9 +61,9 @@ CodeCache::CodeCache()
   static const size_t kRoundUp = 2 << 20;
 
   auto ru = [=] (size_t sz) { return sz + (-sz & (kRoundUp - 1)); };
+  auto rd = [=] (size_t sz) { return sz & ~(kRoundUp - 1); };
 
-  const size_t kAHotSize    = ru(RuntimeOption::RepoAuthoritative ?
-                                 RuntimeOption::EvalJitAHotSize : 0);
+  const size_t kAHotSize    = ru(RuntimeOption::EvalJitAHotSize);
   const size_t kASize       = ru(RuntimeOption::EvalJitASize);
   const size_t kAProfSize   = ru(RuntimeOption::EvalJitPGO ?
                                  RuntimeOption::EvalJitAProfSize : 0);
@@ -101,15 +105,36 @@ CodeCache::CodeCache()
   // Using sbrk to ensure its in the bottom 2G, so we avoid the need for
   // trampolines, and get to use shorter instructions for tc addresses.
   size_t allocationSize = m_totalSize;
+  size_t baseAdjustment = 0;
   uint8_t* base = (uint8_t*)sbrk(0);
+
+  // Adjust the start of TC relative to hot runtime code. What really matters
+  // is a number of 2MB pages in-between. We appear to benefit from odd numbers.
+  auto const shiftTC = [&]() -> size_t {
+    if (!RuntimeOption::EvalJitAutoTCShift) return 0;
+    // Make sure the offset from hot text is either odd or even number
+    // of huge pages.
+    const auto hugePagesDelta = (ru(reinterpret_cast<size_t>(base)) -
+                                 rd(reinterpret_cast<size_t>(__hot_start))) /
+                                kRoundUp;
+    return ((hugePagesDelta & 1) == (RuntimeOption::EvalJitAutoTCShift & 1))
+      ? 0
+      : kRoundUp;
+  };
+
   if (base != (uint8_t*)-1) {
     assert(!(allocationSize & (kRoundUp - 1)));
     // Make sure that we have space to round up to the start of a huge page
     allocationSize += -(uint64_t)base & (kRoundUp - 1);
+    allocationSize += shiftTC();
     base = (uint8_t*)sbrk(allocationSize);
+    baseAdjustment = allocationSize - m_totalSize;
   }
   if (base == (uint8_t*)-1) {
     allocationSize = m_totalSize + kRoundUp - 1;
+    if (RuntimeOption::EvalJitAutoTCShift) {
+      allocationSize += kRoundUp;
+    }
     base = (uint8_t*)low_malloc(allocationSize);
     if (!base) {
       base = (uint8_t*)malloc(allocationSize);
@@ -119,12 +144,14 @@ CodeCache::CodeCache()
               allocationSize);
       exit(1);
     }
+    baseAdjustment = -(uint64_t)base & (kRoundUp - 1);
+    baseAdjustment += shiftTC();
   } else {
     low_malloc_skip_huge(base, base + allocationSize - 1);
   }
   assert(base);
+  base += baseAdjustment;
   m_base = base;
-  base += -(uint64_t)base & (kRoundUp - 1);
 
   numa_interleave(base, m_totalSize);
 
@@ -139,7 +166,6 @@ CodeCache::CodeCache()
 
   m_main.init(base, kASize, "main");
   enhugen(base, RuntimeOption::EvalTCNumHugeHotMB);
-  m_mainBase = base;
   base += kASize;
 
   TRACE(1, "init aprof @%p\n", base);
@@ -165,7 +191,7 @@ CodeCache::CodeCache()
   unprotect();
 
   assert(base - m_base <= allocationSize);
-  assert(base - m_base + kRoundUp > allocationSize);
+  assert(base - m_base + 2 * kRoundUp > allocationSize);
 }
 
 CodeCache::~CodeCache() {
@@ -221,7 +247,6 @@ CodeBlock& CodeCache::cold() {
 }
 
 CodeBlock& CodeCache::frozen() {
-  always_assert(!m_lock);
   return m_frozen;
 }
 

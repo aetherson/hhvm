@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -21,22 +21,23 @@
 #include <map>
 
 #include <boost/variant.hpp>
-#include <boost/next_prior.hpp>
 #include <algorithm>
+#include <iterator>
 #include <memory>
 #include <set>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "folly/gen/Base.h"
-#include "folly/gen/String.h"
-#include "folly/ScopeGuard.h"
-#include "folly/Memory.h"
+#include <folly/gen/Base.h>
+#include <folly/gen/String.h>
+#include <folly/ScopeGuard.h>
+#include <folly/Memory.h>
 
-#include "hphp/runtime/base/repo-auth-type.h"
 #include "hphp/runtime/base/repo-auth-type-codec.h"
+#include "hphp/runtime/base/repo-auth-type.h"
 #include "hphp/runtime/vm/func-emitter.h"
+#include "hphp/runtime/vm/hhbc-codec.h"
 #include "hphp/runtime/vm/preclass-emitter.h"
 #include "hphp/runtime/vm/unit-emitter.h"
 
@@ -53,6 +54,8 @@ namespace {
 //////////////////////////////////////////////////////////////////////
 
 const StaticString s_Closure("Closure");
+const StaticString s_toString("__toString");
+const StaticString s_Stringish("Stringish");
 
 //////////////////////////////////////////////////////////////////////
 
@@ -116,23 +119,22 @@ std::set<Offset> findBasicBlocks(const FuncEmitter& fe) {
   auto offset = fe.base;
   for (;;) {
     auto const bc = fe.ue().bc();
-    auto const pc = reinterpret_cast<const Op*>(bc + offset);
+    auto const pc = bc + offset;
     auto const nextOff = offset + instrLen(pc);
     auto const atLast = nextOff == fe.past;
+    auto const op = peek_op(pc);
+    auto const breaksBB = instrIsNonCallControlFlow(op) || instrFlags(op) & TF;
 
-    if (instrIsNonCallControlFlow(*pc) && !atLast) {
+    if (breaksBB && !atLast) {
       markBlock(nextOff);
     }
 
-    if (isSwitch(*pc)) {
+    if (isSwitch(op)) {
       foreachSwitchTarget(pc, [&] (Offset delta) {
         markBlock(offset + delta);
       });
     } else {
-      auto const target = instrJumpTarget(
-        reinterpret_cast<const Op*>(bc),
-        offset
-      );
+      auto const target = instrJumpTarget(bc, offset);
       if (target != InvalidAbsoluteOffset) markBlock(target);
     }
 
@@ -173,7 +175,7 @@ struct ExnTreeInfo {
    * Map from EHEnt to the ExnNode that will represent exception
    * behavior in that region.
    */
-  std::map<const EHEnt*,borrowed_ptr<php::ExnNode>> ehMap;
+  std::map<const EHEntEmitter*,borrowed_ptr<php::ExnNode>> ehMap;
 
   /*
    * Fault funclets don't actually fall in the EHEnt region for all of
@@ -312,9 +314,9 @@ void find_fault_funclets(ExnTreeInfo& tinfo,
   auto sectionId = uint32_t{1};
 
   for (auto funcletStartIt = begin(tinfo.faultFuncletStarts);
-      boost::next(funcletStartIt) != end(tinfo.faultFuncletStarts);
+      std::next(funcletStartIt) != end(tinfo.faultFuncletStarts);
       ++funcletStartIt, ++sectionId) {
-    auto const nextFunclet = *boost::next(funcletStartIt);
+    auto const nextFunclet = *std::next(funcletStartIt);
 
     auto offIt = blockStarts.find(*funcletStartIt);
     assert(offIt != end(blockStarts));
@@ -353,6 +355,10 @@ template<class T> T decode(PC& pc) {
   auto const ret = *reinterpret_cast<const T*>(pc);
   pc += sizeof ret;
   return ret;
+}
+
+template<class T> void decode(PC& pc, T& val) {
+  val = decode<T>(pc);
 }
 
 template<class FindBlock>
@@ -485,8 +491,8 @@ void populate_block(ParseUnitState& puState,
 #define IMM_BA(n)      assert(next == past); \
                        auto target = findBlock(  \
                          opPC + decode<Offset>(pc) - ue.bc());
-#define IMM_OA_IMPL(n) decode<uint8_t>(pc);
-#define IMM_OA(type)   auto subop = (type)IMM_OA_IMPL
+#define IMM_OA_IMPL(n) subop##n; decode(pc, subop##n);
+#define IMM_OA(type)   type IMM_OA_IMPL
 #define IMM_VSA(n)     auto keys = decode_stringvec();
 
 #define IMM_NA
@@ -508,7 +514,6 @@ void populate_block(ParseUnitState& puState,
 #define O(opcode, imms, inputs, outputs, flags)       \
   case Op::opcode:                                    \
     {                                                 \
-      ++pc;                                           \
       auto b = Bytecode {};                           \
       b.op = Op::opcode;                              \
       b.srcLoc = srcLoc;                              \
@@ -525,8 +530,7 @@ void populate_block(ParseUnitState& puState,
   assert(pc != past);
   do {
     auto const opPC = pc;
-    auto const pop  = reinterpret_cast<const Op*>(pc);
-    auto const next = pc + instrLen(pop);
+    auto const next = pc + instrLen(opPC);
     assert(next <= past);
 
     auto const srcLoc = match<php::SrcLoc>(
@@ -555,10 +559,11 @@ void populate_block(ParseUnitState& puState,
       }
     );
 
-    switch (*pop) { OPCODES }
+    auto const op = decode_op(pc);
+    switch (op) { OPCODES }
 
     if (next == past) {
-      if (instrAllowsFallThru(*pop)) {
+      if (instrAllowsFallThru(op)) {
         blk.fallthrough = findBlock(next - ue.bc());
       }
     }
@@ -664,11 +669,11 @@ void build_cfg(ParseUnitState& puState,
   auto exnTreeInfo = build_exn_tree(fe, func, findBlock);
 
   for (auto it = begin(blockStarts);
-      boost::next(it) != end(blockStarts);
+      std::next(it) != end(blockStarts);
       ++it) {
     auto const block   = findBlock(*it);
     auto const bcStart = bc + *it;
-    auto const bcStop  = bc + *boost::next(it);
+    auto const bcStop  = bc + *std::next(it);
 
     if (auto const eh = findEH(fe.ehtab, *it)) {
       auto it = exnTreeInfo.ehMap.find(eh);
@@ -759,8 +764,8 @@ std::unique_ptr<php::Func> parse_func(ParseUnitState& puState,
 
   /*
    * Builtin functions get some extra information.  The returnType flag is only
-   * non-KindOfInvalid for these, but note that something may be a builtin and
-   * still have a KindOfInvalid return type.
+   * non-folly::none for these, but note that something may be a builtin and
+   * still have a folly::none return type.
    */
   if (fe.attrs & AttrBuiltin) {
     ret->nativeInfo             = folly::make_unique<php::NativeInfo>();
@@ -780,6 +785,26 @@ void parse_methods(ParseUnitState& puState,
   for (auto& me : pce.methods()) {
     auto f = parse_func(puState, unit, ret, *me);
     ret->methods.push_back(std::move(f));
+  }
+}
+
+void add_stringish(borrowed_ptr<php::Class> cls) {
+  // The runtime adds Stringish to any class providing a __toString() function,
+  // so we mirror that here to make sure analysis of interfaces is correct.
+  if (cls->attrs & AttrInterface && cls->name->isame(s_Stringish.get())) {
+    return;
+  }
+
+  for (auto& iface : cls->interfaceNames) {
+    if (iface->isame(s_Stringish.get())) return;
+  }
+
+  for (auto& func : cls->methods) {
+    if (func->name->isame(s_toString.get())) {
+      FTRACE(2, "Adding Stringish to {}\n", cls->name->data());
+      cls->interfaceNames.push_back(s_Stringish.get());
+      return;
+    }
   }
 }
 
@@ -808,8 +833,10 @@ std::unique_ptr<php::Class> parse_class(ParseUnitState& puState,
   ret->traitPrecRules    = pce.traitPrecRules();
   ret->traitAliasRules   = pce.traitAliasRules();
   ret->requirements      = pce.requirements();
+  ret->numDeclMethods    = pce.numDeclMethods();
 
   parse_methods(puState, borrow(ret), unit, pce);
+  add_stringish(borrow(ret));
 
   auto& propMap = pce.propMap();
   for (size_t idx = 0; idx < propMap.size(); ++idx) {
@@ -832,9 +859,10 @@ std::unique_ptr<php::Class> parse_class(ParseUnitState& puState,
       php::Const {
         cconst.name(),
         borrow(ret),
-        cconst.val(),
+        cconst.valOption(),
         cconst.phpCode(),
-        cconst.typeConstraint()
+        cconst.typeConstraint(),
+        cconst.isTypeconst()
       }
     );
   }

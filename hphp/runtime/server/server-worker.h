@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -20,7 +20,6 @@
 #include "hphp/runtime/server/server.h"
 #include "hphp/runtime/server/job-queue-vm-stack.h"
 #include "hphp/runtime/server/server-stats.h"
-#include "hphp/runtime/debugger/debugger.h"
 #include "hphp/util/job-queue.h"
 #include "hphp/util/service-data.h"
 
@@ -90,20 +89,27 @@ protected:
     bool error = true;
     std::string errorMsg;
 
-    if (abort) {
-      m_handler->abortRequest(transport);
-      return;
-    }
+    assertx(MM().empty());
+
+    SCOPE_EXIT { m_handler->teardownRequest(transport); };
 
     try {
+      transport->onRequestStart(job->getStartTimer());
+      m_handler->setupRequest(transport);
+
+      if (abort) {
+        m_handler->abortRequest(transport);
+        return;
+      }
       std::string cmd = transport->getCommand();
       cmd = std::string("/") + cmd;
+
       if (server->shouldHandle(cmd)) {
-        transport->onRequestStart(job->getStartTimer());
         m_handler->handleRequest(transport);
         error = false;
       } else {
         transport->sendString("Not Found", 404);
+        transport->onSendEnd();
         return;
       }
     } catch (Exception &e) {
@@ -124,6 +130,7 @@ protected:
       } else {
         transport->sendString(RuntimeOption::FatalErrorMessage, 500);
       }
+      transport->onSendEnd();
     }
   }
 

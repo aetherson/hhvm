@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -18,7 +18,7 @@
 #ifndef incl_HPHP_EXT_JSON_H_
 #define incl_HPHP_EXT_JSON_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -40,6 +40,7 @@ extern const int64_t k_JSON_UNESCAPED_SLASHES;
 extern const int64_t k_JSON_PRETTY_PRINT;
 extern const int64_t k_JSON_UNESCAPED_UNICODE;
 extern const int64_t k_JSON_PARTIAL_OUTPUT_ON_ERROR;
+extern const int64_t k_JSON_PRESERVE_ZERO_FRACTION;
 extern const int64_t k_JSON_FB_LOOSE;
 extern const int64_t k_JSON_FB_EXTRA_ESCAPES;
 extern const int64_t k_JSON_FB_UNLIMITED;

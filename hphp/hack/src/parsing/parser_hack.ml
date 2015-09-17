@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -7,10 +7,10 @@
  * of patent rights can be found in the PATENTS file in the same directory.
  *
  *)
-open Lexer_hack
 open Ast
+open Core
+open Lexer_hack
 
-module SMap = Utils.SMap
 module L = Lexer_hack
 
 (*****************************************************************************)
@@ -18,25 +18,28 @@ module L = Lexer_hack
 (*****************************************************************************)
 
 type env = {
-    mode      : Ast.mode;
-    priority  : int;
-    lb        : Lexing.lexbuf;
-    errors    : (Pos.t * string) list ref;
-  }
+  file      : Relative_path.t;
+  mode      : FileInfo.mode;
+  priority  : int;
+  lb        : Lexing.lexbuf;
+  errors    : (Pos.t * string) list ref;
+  in_generator : bool ref;
+}
 
-let init_env lb = {
-  mode     = Ast.Mpartial;
+let init_env file lb = {
+  file     = file;
+  mode     = FileInfo.Mpartial;
   priority = 0;
   lb       = lb;
   errors   = ref [];
+  in_generator = ref false;
 }
 
 type parser_return = {
-    (* True if we are dealing with a hack file *)
-    is_hh_file : bool;
-    comments   : (Pos.t * string) list;
-    ast        : Ast.program;
-  }
+  file_mode  : FileInfo.mode option; (* None if PHP *)
+  comments   : (Pos.t * string) list;
+  ast        : Ast.program;
+}
 
 (*****************************************************************************)
 (* Lexer (with backtracking) *)
@@ -109,16 +112,21 @@ let try_parse (env : env) (f : env -> 'a option) : 'a option =
 (* Return the next token without updating lexer state *)
 let peek env =
   let saved = save_lexbuf_state env.lb in
-  let ret = L.token env.lb in
+  let ret = L.token env.file env.lb in
+  restore_lexbuf_state env.lb saved;
+  ret
+
+(* Checks if the next token matches a given word without updating lexer state*)
+let peek_check_word env word =
+  let saved = save_lexbuf_state env.lb in
+  let ret = L.token env.file env.lb = Tword && Lexing.lexeme env.lb = word in
   restore_lexbuf_state env.lb saved;
   ret
 
 (* Drop the next token unconditionally *)
-let drop (env : env) : unit = match L.token env.lb with _ -> ()
+let drop (env : env) : unit = match L.token env.file env.lb with _ -> ()
 
 let btw (p1, _) (p2, _) = Pos.btw p1 p2
-
-let is_hh_file = ref false
 
 (*****************************************************************************)
 (* Errors *)
@@ -128,28 +136,31 @@ let error_at env pos msg =
   env.errors := (pos, msg) :: !(env.errors)
 
 let error env msg =
-  error_at env (Pos.make env.lb) msg
+  error_at env (Pos.make env.file env.lb) msg
 
 let error_continue env =
   error env
     "Yeah...we're not going to support continue/break N. \
     It makes static analysis tricky and it's not really essential"
 
-let error_expect env expect =
-  let pos = Pos.make env.lb in
+let error_back env msg =
+  let pos = Pos.make env.file env.lb in
   L.back env.lb;
-  env.errors := (pos, "Expected "^expect) :: !(env.errors)
+  error_at env pos msg
+
+let error_expect env expect =
+  error_back env ("Expected "^expect)
 
 let expect env x =
-  if L.token env.lb = x
+  if L.token env.file env.lb = x
   then ()
   else error_expect env (L.token_to_string x)
 
 let expect_word env name =
-  let tok = L.token env.lb in
+  let tok = L.token env.file env.lb in
   let value = Lexing.lexeme env.lb in
   if tok <> Tword || value <> name
-  then error_expect env ("Was expecting: '"^name^ "' (not '"^value^"')");
+  then error_expect env ("'"^name^ "' (not '"^value^"')");
   ()
 
 (*****************************************************************************)
@@ -167,10 +178,10 @@ let rec check_modifiers env pos abstract final = function
   | _ :: rl -> check_modifiers env pos abstract final rl
 
 let check_visibility env pos l =
-  if List.exists begin function
+  if List.exists l begin function
     | Private | Public | Protected | Static -> true
     | _ -> false
-  end l
+  end
   then ()
   else error_at env pos
       "Parse error. You are missing public, private or protected."
@@ -202,12 +213,12 @@ let check_modifiers env pos l =
   ()
 
 let check_not_final env pos modifiers =
-  if List.exists (function Final -> true | _ -> false) modifiers
+  if List.exists modifiers (function Final -> true | _ -> false)
   then error_at env pos "class variable cannot be final";
   ()
 
 let check_toplevel env pos =
-  if env.mode = Ast.Mstrict
+  if env.mode = FileInfo.Mstrict
   then error_at env pos "Remove all toplevel statements except for requires"
 
 (*****************************************************************************)
@@ -215,18 +226,28 @@ let check_toplevel env pos =
 (*****************************************************************************)
 
 let rec check_lvalue env = function
+  | pos, Obj_get (_, (_, Id (_, name)), OG_nullsafe) ->
+      error_at env pos "?-> syntax is not supported for lvalues"
+  | pos, Obj_get (_, (_, Id (_, name)), _) when name.[0] = ':' ->
+      error_at env pos "->: syntax is not supported for lvalues"
   | _, (Lvar _ | Obj_get _ | Array_get _ | Class_get _ | Unsafeexpr _) -> ()
-  | pos, Call ((_, Id (_, "tuple")), _) ->
+  | pos, Call ((_, Id (_, "tuple")), _, _) ->
       error_at env pos
         "Tuple cannot be used as an lvalue. Maybe you meant List?"
-  | _, List el -> List.iter (check_lvalue env) el
+  | _, List el -> List.iter el (check_lvalue env)
   | pos, (Array _ | Shape _ | Collection _
   | Null | True | False | Id _ | Clone _
   | Class_const _ | Call _ | Int _ | Float _
   | String _ | String2 _ | Yield _ | Yield_break
-  | Await _ | Expr_list _ | Cast _ | Unop _ |
-    Binop _ | Eif _ | InstanceOf _ | New _ | Efun _ | Lfun _ | Xml _) ->
+  | Await _ | Expr_list _ | Cast _ | Unop _
+  | Binop _ | Eif _ | InstanceOf _ | New _ | Efun _ | Lfun _ | Xml _
+  | Import _) ->
       error_at env pos "Invalid lvalue"
+
+(* The bound variable of a foreach can be a reference (but not inside
+  a list expression. *)
+let check_foreach_lvalue env = function
+  | (_, Unop (Uref, e)) | e -> check_lvalue env e
 
 (*****************************************************************************)
 (* Operator priorities.
@@ -251,7 +272,7 @@ let priorities = [
   (* Lowest priority *)
   (NonAssoc, [Tyield]);
   (NonAssoc, [Tawait]);
-  (Left, [Tinclude; Tinclude_once; Teval; Trequire; Trequire_once]);
+  (Left, [Timport; Teval;]);
   (Left, [Tcomma]);
   (Right, [Tprint]);
   (Left, [Tqm; Tcolon]);
@@ -268,6 +289,7 @@ let priorities = [
   (Right, [Tem]);
   (NonAssoc, [Tinstanceof]);
   (Right, [Ttild; Tincr; Tdecr; Tcast]);
+  (Right, [Tstarstar]);
   (Right, [Tat; Tref]);
   (Left, [Tlp]);
   (NonAssoc, [Tnew; Tclone]);
@@ -275,7 +297,7 @@ let priorities = [
   (Right, [Teq; Tpluseq; Tminuseq; Tstareq;
            Tslasheq; Tdoteq; Tpercenteq;
            Tampeq; Tbareq; Txoreq; Tlshifteq; Trshifteq]);
-  (Left, [Tarrow]);
+  (Left, [Tarrow; Tnsarrow]);
   (Left, [Telseif]);
   (Left, [Telse]);
   (Left, [Tendif]);
@@ -289,11 +311,11 @@ let get_priority =
   let ptable = Hashtbl.create 23 in
   (* Lowest priority = 0 *)
   let priority = ref 0 in
-  List.iter begin fun (assoc, tokl) ->
-    List.iter begin fun token ->
+  List.iter priorities begin fun (assoc, tokl) ->
+    List.iter tokl begin fun token ->
       (* Associates operator => (associativity, priority) *)
       Hashtbl.add ptable token (assoc, !priority)
-    end tokl;
+    end;
     (* This is a bit subtle:
      *
      * The difference in priority between 2 lines should be 2, not 1.
@@ -312,7 +334,7 @@ let get_priority =
      *                                 "+" sign.
      *)
     priority := !priority + 2
-  end priorities;
+  end;
   fun tok ->
     assert (Hashtbl.mem ptable tok);
     Hashtbl.find ptable tok
@@ -331,78 +353,88 @@ let with_base_priority env f =
 (*****************************************************************************)
 
 let ref_opt env =
-  match L.token env.lb with
-  | Tamp when env.mode = Ast.Mstrict ->
-      error env "Don't use references!"
+  match L.token env.file env.lb with
+  | Tamp when env.mode = FileInfo.Mstrict ->
+      error env "Don't use references!";
+      true
   | Tamp ->
-      ()
+      true
   | _ ->
-      L.back env.lb
+      L.back env.lb;
+      false
 
 (*****************************************************************************)
 (* Identifiers *)
 (*****************************************************************************)
 
+let xhp_identifier env =
+  (match L.xhpname env.file env.lb with
+  | Txhpname ->
+      Pos.make env.file env.lb, ":"^Lexing.lexeme env.lb
+  | _ ->
+      error_expect env "identifier";
+      Pos.make env.file env.lb, "*Unknown*"
+  )
+
 (* identifier *)
 let identifier env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       let name = Lexing.lexeme env.lb in
       pos, name
   | Tcolon ->
-      (match L.xhpname env.lb with
-      | Txhpname ->
-          Pos.make env.lb, ":"^Lexing.lexeme env.lb
-      | _ ->
-          error_expect env "identifier";
-          Pos.make env.lb, "*Unknown*"
-      )
+      let start = Pos.make env.file env.lb in
+      let end_, name = xhp_identifier env in
+      Pos.btw start end_, name
   | _ ->
       error_expect env "identifier";
-      Pos.make env.lb, "*Unknown*"
+      Pos.make env.file env.lb, "*Unknown*"
 
 (* $variable *)
 let variable env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tlvar ->
-      Pos.make env.lb, Lexing.lexeme env.lb
+      Pos.make env.file env.lb, Lexing.lexeme env.lb
   | _ ->
       error_expect env "variable";
-      Pos.make env.lb, "$_"
+      Pos.make env.file env.lb, "$_" (* SpecialIdents.placeholder *)
 
 (* &$variable *)
 let ref_variable env =
-  ref_opt env;
-  variable env
+  let is_ref = ref_opt env in
+  (variable env, is_ref)
 
 (* &...$arg *)
 let ref_param env =
-  ref_opt env;
-  let is_variadic = match L.token env.lb with
+  let is_ref = ref_opt env in
+  let is_variadic = match L.token env.file env.lb with
     | Tellipsis -> true
     | _ -> L.back env.lb; false
   in
   let var = variable env in
-  is_variadic, var
+  is_ref, is_variadic, var
 
 (*****************************************************************************)
 (* Entry point *)
 (*****************************************************************************)
 
-let rec program content =
-  is_hh_file := false;
+let rec program ?(elaborate_namespaces = true) file content =
   L.comment_list := [];
+  L.fixmes := Utils.IMap.empty;
   let lb = Lexing.from_string content in
-  let env = init_env lb in
-  let ast = header env in
+  let env = init_env file lb in
+  let ast, file_mode = header env in
   let comments = !L.comment_list in
+  let fixmes = !L.fixmes in
   L.comment_list := [];
-  if !(env.errors) <> []
-  then Errors.parsing_error (List.hd (List.rev !(env.errors)));
-  let is_hh_file = !is_hh_file in
-  let ast = Namespaces.elaborate_defs ast in
-  {is_hh_file; comments; ast}
+  L.fixmes := Utils.IMap.empty;
+  Parser_heap.HH_FIXMES.add env.file fixmes;
+  Option.iter (List.last !(env.errors)) Errors.parsing_error;
+  let ast = if elaborate_namespaces
+    then Namespaces.elaborate_defs ast
+    else ast in
+  {file_mode; comments; ast}
 
 (*****************************************************************************)
 (* Hack headers (strict, decl, partial) *)
@@ -411,39 +443,38 @@ let rec program content =
 and header env =
   let file_type, head = get_header env in
   match file_type, head with
-  | Ast.PhpFile, _
-  | _, Some Ast.Mdecl ->
-      let env = { env with mode = Ast.Mdecl } in
-      let attr = SMap.empty in
+  | FileInfo.PhpFile, _
+  | _, Some FileInfo.Mdecl ->
+      let env = { env with mode = FileInfo.Mdecl } in
+      let attr = [] in
       let result = ignore_toplevel ~attr [] env (fun x -> x = Teof) in
       expect env Teof;
-      if head = Some Ast.Mdecl then is_hh_file := true;
-      result
+      result, head
   | _, Some mode ->
       let result = toplevel [] { env with mode = mode } (fun x -> x = Teof) in
       expect env Teof;
-      is_hh_file := true;
-      result
+      result, head
   | _ ->
-      []
+      [], head
 
 and get_header env =
-  match L.header env.lb with
-  | `error -> Ast.HhFile, None
-  | `default_mode -> Ast.HhFile, Some Ast.Mpartial
-  | `php_decl_mode -> Ast.PhpFile, Some Ast.Mdecl
-  | `php_mode -> Ast.PhpFile, None
+  match L.header env.file env.lb with
+  | `error -> FileInfo.HhFile, None
+  | `default_mode -> FileInfo.HhFile, Some FileInfo.Mpartial
+  | `php_decl_mode -> FileInfo.PhpFile, Some FileInfo.Mdecl
+  | `php_mode -> FileInfo.PhpFile, None
   | `explicit_mode ->
-      let _token = L.token env.lb in
+      let _token = L.token env.file env.lb in
       (match Lexing.lexeme env.lb with
-      | "strict" when !(Ide.is_ide_mode) -> Ast.HhFile, Some Ast.Mpartial
-      | "strict" -> Ast.HhFile, Some Ast.Mstrict
-      | ("decl"|"only-headers") -> Ast.HhFile, Some Ast.Mdecl
-      | "partial" -> Ast.HhFile, Some Ast.Mpartial
+      | "strict" when !(Ide.is_ide_mode) ->
+          FileInfo.HhFile, Some FileInfo.Mpartial
+      | "strict" -> FileInfo.HhFile, Some FileInfo.Mstrict
+      | ("decl"|"only-headers") -> FileInfo.HhFile, Some FileInfo.Mdecl
+      | "partial" -> FileInfo.HhFile, Some FileInfo.Mpartial
       | _ ->
           error env
  "Incorrect comment; possible values include strict, decl, partial or empty";
-          Ast.HhFile, Some Ast.Mdecl
+          FileInfo.HhFile, Some FileInfo.Mdecl
       )
 
 (*****************************************************************************)
@@ -451,24 +482,24 @@ and get_header env =
 (*****************************************************************************)
 
 and ignore_toplevel ~attr acc env terminate =
-  match L.token env.lb with
-  | x when terminate x ->
+  match L.token env.file env.lb with
+  | x when terminate x || x = Teof ->
       L.back env.lb;
       acc
   | Tltlt ->
       (* Parsing attribute << .. >> *)
-      let attr = attribute_remain env SMap.empty in
+      let attr = attribute_remain env in
       ignore_toplevel ~attr acc env terminate
   | Tlcb ->
       let acc = ignore_toplevel ~attr acc env terminate in
       ignore_toplevel ~attr acc env terminate
   | Tquote ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       let abs_pos = env.lb.Lexing.lex_curr_pos in
       ignore (expr_string env pos abs_pos);
       ignore_toplevel ~attr acc env terminate
   | Tdquote ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       ignore (expr_encapsed env pos);
       ignore_toplevel ~attr acc env terminate
   | Theredoc ->
@@ -480,18 +511,18 @@ and ignore_toplevel ~attr acc env terminate =
   | Tword ->
       (match Lexing.lexeme env.lb with
       | "function" ->
-          (match L.token env.lb with
+          (match L.token env.file env.lb with
           | Tword ->
               L.back env.lb;
               let def = toplevel_word ~attr env "function" in
-              ignore_toplevel ~attr:SMap.empty (def @ acc) env terminate
+              ignore_toplevel ~attr:[] (def @ acc) env terminate
           (* function &foo(...), we still want them in decl mode *)
           | Tamp ->
-            (match L.token env.lb with
+            (match L.token env.file env.lb with
             | Tword ->
                 L.back env.lb;
                 let def = toplevel_word ~attr env "function" in
-                ignore_toplevel ~attr:SMap.empty (def @ acc) env terminate
+                ignore_toplevel ~attr:[] (def @ acc) env terminate
             | _ ->
               ignore_toplevel ~attr acc env terminate
             )
@@ -504,7 +535,7 @@ and ignore_toplevel ~attr acc env terminate =
       | "async" | "newtype"| "type"| "const" ->
           (* Parsing toplevel declarations (class, function etc ...) *)
           let def = toplevel_word ~attr env (Lexing.lexeme env.lb) in
-          ignore_toplevel ~attr:SMap.empty (def @ acc) env terminate
+          ignore_toplevel ~attr:[] (def @ acc) env terminate
       | _ -> ignore_toplevel ~attr acc env terminate
       )
   | Tclose_php ->
@@ -517,8 +548,8 @@ and ignore_toplevel ~attr acc env terminate =
 (*****************************************************************************)
 
 and toplevel acc env terminate =
-  match L.token env.lb with
-  | x when terminate x ->
+  match L.token env.file env.lb with
+  | x when terminate x || x = Teof ->
       L.back env.lb;
       List.rev acc
   | Tsc ->
@@ -527,34 +558,37 @@ and toplevel acc env terminate =
       toplevel acc env terminate
   | Tltlt ->
       (* Parsing attribute << .. >> *)
-      let attr = attribute_remain env SMap.empty in
-      let _ = L.token env.lb in
+      let attr = attribute_remain env in
+      let _ = L.token env.file env.lb in
       let def = toplevel_word ~attr env (Lexing.lexeme env.lb) in
       toplevel (def @ acc) env terminate
   | Tword ->
       (* Parsing toplevel declarations (class, function etc ...) *)
-      let attr = SMap.empty in
-      let def = toplevel_word ~attr env (Lexing.lexeme env.lb) in
+      let def = toplevel_word ~attr:[] env (Lexing.lexeme env.lb) in
       toplevel (def @ acc) env terminate
   | Tclose_php ->
       error env "Hack does not allow the closing ?> tag";
       List.rev acc
   | _ ->
       (* All the other statements. *)
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       L.back env.lb;
       let error_state = !(env.errors) in
       let stmt = Stmt (statement env) in
       check_toplevel env pos;
       if error_state != !(env.errors)
-      then ignore_toplevel ~attr:SMap.empty (stmt :: acc) env terminate
+      then ignore_toplevel ~attr:[] (stmt :: acc) env terminate
       else toplevel (stmt :: acc) env terminate
 
 and toplevel_word ~attr env = function
   | "abstract" ->
-      expect_word env "class";
-      let class_ = class_ ~attr ~final:false ~kind:Cabstract env in
-      [Class class_]
+    let final = (match L.token env.file env.lb with
+      | Tword when Lexing.lexeme env.lb = "final" -> true
+      | _ -> begin L.back env.lb; false end
+    ) in
+    expect_word env "class";
+    let class_ = class_ ~attr ~final ~kind:Cabstract env in
+    [Class class_]
   | "final" ->
       expect_word env "class";
       let class_ = class_ ~attr ~final:true ~kind:Cnormal env in
@@ -573,37 +607,20 @@ and toplevel_word ~attr env = function
       [Class class_]
   | "async" ->
       expect_word env "function";
-      let fun_ = fun_ ~attr ~sync:FAsync env in
+      let fun_ = fun_ ~attr ~sync:FDeclAsync env in
       [Fun fun_]
   | "function" ->
-      let fun_ = fun_ ~attr ~sync:FSync env in
+      let fun_ = fun_ ~attr ~sync:FDeclSync env in
       [Fun fun_]
   | "newtype" ->
-      let id, tparaml, tconstraint, typedef = typedef env in
-      [Typedef {
-          t_id = id;
-          t_tparams = tparaml;
-          t_constraint = tconstraint;
-          t_kind = NewType typedef;
-          t_namespace = Namespace_env.empty;
-          t_mode = env.mode;
-      }]
+      let typedef_ = typedef ~attr ~is_abstract:true env in
+      [Typedef typedef_]
   | "type" ->
-      let id, tparaml, tconstraint, typedef = typedef env in
-      [Typedef {
-          t_id = id;
-          t_tparams = tparaml;
-          t_constraint = tconstraint;
-          t_kind = Alias typedef;
-          t_namespace = Namespace_env.empty;
-          t_mode = env.mode;
-      }]
+      let typedef_ = typedef ~attr ~is_abstract:false env in
+      [Typedef typedef_]
   | "namespace" ->
       let id, body = namespace env in
-      (* Check for an empty name and omit the Namespace wrapper *)
-      (match id with
-      | (_, "") -> body
-      | _ -> [Namespace (id, body)])
+      [Namespace (id, body)]
   | "use" ->
       let usel = namespace_use_list env [] in
       [NamespaceUse usel]
@@ -611,28 +628,29 @@ and toplevel_word ~attr env = function
       let consts = class_const_def env in
       (match consts with
       | Const (h, cstl) ->
-          List.map (fun (x, y) -> Constant {
+          List.map cstl begin fun (x, y) -> Constant {
             cst_mode = env.mode;
             cst_kind = Cst_const;
             cst_name = x;
             cst_type = h;
             cst_value = y;
             cst_namespace = Namespace_env.empty;
-          }) cstl
+          } end
       | _ -> assert false)
-  | "require" | "require_once" ->
-      let _ = expr env in
+  | r when is_import r ->
+      let pos = Pos.make env.file env.lb in
+      let e = expr_import r env pos in
       expect env Tsc;
-      [Stmt Noop]
+      [Stmt (Expr e)]
   | _ ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       L.back env.lb;
       let stmt = statement env in
       check_toplevel env pos;
       [define_or_stmt env stmt]
 
 and define_or_stmt env = function
-  | Expr (_, Call ((_, Id (_, "define")), [(_, String name); value])) ->
+  | Expr (_, Call ((_, Id (_, "define")), [(_, String name); value], [])) ->
       Constant {
       cst_mode = env.mode;
       cst_kind = Cst_define;
@@ -650,63 +668,62 @@ and define_or_stmt env = function
 
 (* <<_>> *)
 and attribute env =
-  let acc = SMap.empty in
-  if look_ahead env (fun env -> L.token env.lb = Tltlt)
+  if look_ahead env (fun env -> L.token env.file env.lb = Tltlt)
   then begin
     expect env Tltlt;
-    attribute_remain env acc;
+    attribute_remain env;
   end
-  else acc
+  else []
 
 (* _>> *)
-and attribute_remain env acc =
-  match L.token env.lb with
+and attribute_remain env =
+  match L.token env.file env.lb with
   | Tword ->
-      let attr_name = Lexing.lexeme env.lb in
-      let acc = attribute_parameter attr_name acc env in
-      attribute_list_remain acc env
+      let pos = Pos.make env.file env.lb in
+      let ua_name = pos, Lexing.lexeme env.lb in
+      let ua_params = attribute_parameters env in
+      let attr = { ua_name; ua_params } in
+      attr :: attribute_list_remain env
   | _ ->
       error_expect env "attribute name";
-      acc
+      []
 
 (* empty | (parameter_list) *)
-and attribute_parameter attr_name acc env =
-  match L.token env.lb with
-  | Tlp ->
-      let el = expr_list_remain env in
-      SMap.add attr_name el acc
-  | _ ->
-      let acc = SMap.add attr_name [] acc in
-      L.back env.lb;
-      acc
+and attribute_parameters env =
+  match L.token env.file env.lb with
+  | Tlp -> expr_list_remain env
+  | _ -> L.back env.lb; []
 
 (* ,_,>> *)
-and attribute_list_remain acc env =
-  match L.token env.lb with
-  | Tgtgt -> acc
-  | Tcomma -> attribute_remain env acc
+and attribute_list_remain env =
+  match L.token env.file env.lb with
+  | Tgtgt -> []
+  | Tcomma -> attribute_remain env
   | _ ->
       error_expect env ">>";
-      acc
+      []
 
 (*****************************************************************************)
 (* Functions *)
 (*****************************************************************************)
 
-and fun_ ~attr ~sync env =
-  ref_opt env;
+and fun_ ~attr ~(sync:fun_decl_kind) env =
+  let is_ref = ref_opt env in
+  if is_ref && sync = FDeclAsync
+    then error env ("Asynchronous function cannot return reference");
   let name = identifier env in
   let tparams = class_params env in
   let params = parameter_list env in
   let ret = hint_return_opt env in
-  let body = function_body env in
+  let is_generator, body_stmts = function_body env in
   { f_name = name;
     f_tparams = tparams;
     f_params = params;
     f_ret = ret;
-    f_body = body;
+    f_ret_by_ref = is_ref;
+    f_body = body_stmts;
     f_user_attributes = attr;
-    f_fun_kind = sync;
+    f_fun_kind = fun_kind sync is_generator;
     f_mode = env.mode;
     f_mtime = 0.0;
     f_namespace = Namespace_env.empty;
@@ -720,8 +737,10 @@ and class_ ~attr ~final ~kind env =
   let cname       = identifier env in
   let is_xhp      = (snd cname).[0] = ':' in
   let tparams     = class_params env in
-  let cextends    = class_extends env in
-  let cimplements = class_implements env in
+  let cextends    =
+    if kind = Ctrait then []
+    else class_extends ~single:(kind <> Cinterface) env in
+  let cimplements = class_implements kind env in
   let cbody       = class_body env in
   let result =
     { c_mode            = env.mode;
@@ -800,13 +819,13 @@ and enum_defs env =
 (* Extends/Implements *)
 (*****************************************************************************)
 
-and class_extends env =
-  match L.token env.lb with
+and class_extends ~single env =
+  match L.token env.file env.lb with
   | Tword ->
       (match Lexing.lexeme env.lb with
-      | "extends" -> class_extends_list env
+      | "extends" -> if single then [class_hint env] else class_extends_list env
       | "implements" -> L.back env.lb; []
-      | _ -> error env "Expected: extends"; []
+      | s -> error env ("Expected: extends; Got: "^s); []
       )
   | Tlcb ->
       L.back env.lb;
@@ -815,13 +834,18 @@ and class_extends env =
       error_expect env "{";
       []
 
-and class_implements env =
-  match L.token env.lb with
+and class_implements kind env =
+  match L.token env.file env.lb with
   | Tword ->
       (match Lexing.lexeme env.lb with
-      | "implements" -> class_extends_list env
+      | "implements" ->
+         let impl = class_extends_list env in
+         if kind = Cinterface then begin
+           error env "Expected: extends; Got implements"; []
+         end else
+           impl
       | "extends" -> L.back env.lb; []
-      | _ -> error env "Expected: implements"; []
+      | s -> error env ("Expected: implements; Got: "^s); []
       )
   | Tlcb ->
       L.back env.lb;
@@ -833,7 +857,7 @@ and class_implements env =
 and class_extends_list env =
   let error_state = !(env.errors) in
   let c = class_hint env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tlcb ->
       L.back env.lb; [c]
   | Tcomma ->
@@ -852,56 +876,60 @@ and class_extends_list env =
 (*****************************************************************************)
 
 and class_params env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tlt -> class_param_list env
   | _ -> L.back env.lb; []
 
 and class_param_list env =
   let error_state = !(env.errors) in
   let cst = class_param env in
-  match L.gt_or_comma env.lb with
+  match L.gt_or_comma env.file env.lb with
   | Tgt ->
       [cst]
   | Tcomma ->
       if !(env.errors) != error_state
       then [cst]
-      else cst :: class_param_list_remain env
+      else cst :: class_param_list env
   | _ ->
       error_expect env ">";
       [cst]
 
-and class_param_list_remain env =
-  match L.gt_or_comma env.lb with
-  | Tgt -> []
-  | _ ->
-      L.back env.lb;
-      let error_state = !(env.errors) in
-      let cst = class_param env in
-      match L.gt_or_comma env.lb with
-      | Tgt ->
-          [cst]
-      | Tcomma ->
-          if !(env.errors) != error_state
-          then [cst]
-          else cst :: class_param_list_remain env
-      | _ -> error_expect env ">"; [cst]
-
 and class_param env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
+  | Tplus ->
+      if L.token env.file env.lb <> Tword
+      then class_param_error env
+      else
+        let parameter_name, parameter_constraint = class_param_name env in
+        Covariant, parameter_name, parameter_constraint
+  | Tminus ->
+      if L.token env.file env.lb <> Tword
+      then class_param_error env
+      else
+        let parameter_name, parameter_constraint = class_param_name env in
+        Contravariant, parameter_name, parameter_constraint
   | Tword ->
-      let parameter_name = Pos.make env.lb, Lexing.lexeme env.lb in
-      let parameter_constraint = class_parameter_constraint env in
-      parameter_name, parameter_constraint
+      let parameter_name, parameter_constraint = class_param_name env in
+      let variance = Invariant in
+      variance, parameter_name, parameter_constraint
   | _ ->
-      error_expect env "type parameter";
-      let parameter_name = Pos.make env.lb, "T*unknown*" in
-      parameter_name, None
+      class_param_error env
 
+and class_param_error env =
+  error_expect env "type parameter";
+  let parameter_name = Pos.make env.file env.lb, "T*unknown*" in
+  Invariant, parameter_name, None
+
+and class_param_name env =
+  let parameter_name = Pos.make env.file env.lb, Lexing.lexeme env.lb in
+  let parameter_constraint = class_parameter_constraint env in
+  parameter_name, parameter_constraint
 
 and class_parameter_constraint env =
-  match L.token env.lb with
-  | Tword when Lexing.lexeme env.lb = "as" ->
-      Some (hint env)
+  match L.token env.file env.lb with
+  | Tword when Lexing.lexeme env.lb = "as" -> Some (Constraint_as, hint env)
+  | Tword when Lexing.lexeme env.lb = "super" ->
+      Some (Constraint_super, hint env)
   | _ -> L.back env.lb; None
 
 (*****************************************************************************)
@@ -917,100 +945,117 @@ and class_hint_with_name env pname =
   (fst pname), Happly (pname, params)
 
 and class_hint_params env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tlt -> class_hint_param_list env
   | _ -> L.back env.lb; []
 
 and class_hint_param_list env =
   let error_state = !(env.errors) in
   let h = hint env in
-  match L.gt_or_comma env.lb with
+  match L.gt_or_comma env.file env.lb with
   | Tgt ->
       [h]
   | Tcomma ->
       if !(env.errors) != error_state
       then [h]
-      else h :: class_hint_param_list_remain env
+      else h :: class_hint_param_list env
   | _ ->
       error_expect env ">"; [h]
-
-and class_hint_param_list_remain env =
-  match L.gt_or_comma env.lb with
-  | Tgt -> []
-  | _ ->
-      L.back env.lb;
-      let error_state = !(env.errors) in
-      let h = hint env in
-      match L.gt_or_comma env.lb with
-      | Tgt ->
-          [h]
-      | Tcomma ->
-          if !(env.errors) != error_state
-          then [h]
-          else h :: class_hint_param_list_remain env
-      | _ -> error_expect env ">"; [h]
 
 (*****************************************************************************)
 (* Type hints: int, ?int, A<T>, array<...> etc ... *)
 (*****************************************************************************)
 
 and hint env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   (* ?_ *)
   | Tqm ->
-      let start = Pos.make env.lb in
+      let start = Pos.make env.file env.lb in
       let e = hint env in
       Pos.btw start (fst e), Hoption e
-  (* A<_> | function(_):_ *)
-  | Tword ->
-      let pos = Pos.make env.lb in
-      let word = Lexing.lexeme env.lb in
-      hint_word env pos word
-  (* :XHPNAME *)
-  | Tcolon ->
+  (* A<_> *)(* :XHPNAME *)
+  | Tword when Lexing.lexeme env.lb = "shape" ->
+      let pos = Pos.make env.file env.lb in
+      pos, Hshape (hint_shape_field_list env pos)
+  | Tword | Tcolon when Lexing.lexeme env.lb <> "function" ->
       L.back env.lb;
-      let cname = identifier env in
-      class_hint_with_name env cname
-  (* (_) *)
+      hint_apply_or_access env []
+  | Tword ->
+      let h = hint_function env in
+      error_at env (fst h) "Function hints must be parenthesized";
+      h
+  (* (_) | (function(_): _) *)
   | Tlp ->
-      let start_pos = Pos.make env.lb in
+      let start_pos = Pos.make env.file env.lb in
       hint_paren start_pos env
   (* @_ *)
   | Tat ->
-      let start = Pos.make env.lb in
+      let start = Pos.make env.file env.lb in
       let h = hint env in
       Pos.btw start (fst h), snd h
   | _ ->
       error_expect env "type";
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       pos, Happly ((pos, "*Unknown*"), [])
 
-and hint_word env pos word =
- (* function(_): _ *)
-  match word with
-  | "function" ->
-      hint_function pos env
-  (* A<_> *)
-  | name ->
-      class_hint_with_name env (pos, name)
+and hint_apply_or_access env id_list =
+  match L.token env.file env.lb with
+    (* A | :XHPNAME *)
+    | Tword | Tcolon ->
+        L.back env.lb;
+        hint_apply_or_access_remainder env (identifier env :: id_list)
+    | _ ->
+        error_expect env "identifier";
+        let pos = Pos.make env.file env.lb in
+        pos, Happly ((pos, "*Unknown*"), [])
 
-(* (_) *)
+and hint_apply_or_access_remainder env id_list =
+  match L.token env.file env.lb with
+    (* ...::... *)
+    | Tcolcol -> hint_apply_or_access env id_list
+    (* ...<_> | ... *)
+    | _ ->
+        L.back env.lb;
+        begin match List.rev id_list with
+          | [id] ->
+              let params = class_hint_params env in
+              fst id, Happly (id, params)
+          | id1 :: id2 :: ids ->
+              let pos1 = fst id1 in
+              let pos2 = List.fold_left ids
+                ~init:(fst id2)
+                ~f:(fun _acc (p, _) -> p) in
+              Pos.btw pos1 pos2, Haccess (id1, id2, ids)
+          | [] ->
+              error_expect env "identifier";
+              let pos = Pos.make env.file env.lb in
+              pos, Happly ((pos, "*Unknown*"), [])
+        end
+
+(* (_) | (function(_): _) *)
 and hint_paren start env =
-  let hintl = hint_list env in
-  let end_ = Pos.make env.lb in
-  let pos = Pos.btw start end_ in
-  match hintl with
-  | []  -> assert false
-  | [_, Hfun _ as h] -> pos, snd h
-  | [_] ->
-      error_at env pos "Tuples of one element are not allowed";
-      pos, Happly ((pos, "*Unknown*"), [])
-  | hl  -> pos, Htuple hl
+  match L.token env.file env.lb with
+  | Tword when Lexing.lexeme env.lb = "function" ->
+      let h = hint_function env in
+      if L.token env.file env.lb <> Trp
+      then error_at env (fst h) "Function hints must be parenthesized";
+      Pos.btw start (Pos.make env.file env.lb), (snd h)
+  | _ ->
+      L.back env.lb;
+      let hintl = hint_list env in
+      let end_ = Pos.make env.file env.lb in
+      let pos = Pos.btw start end_ in
+      match hintl with
+      | []  -> assert false
+      | [_] ->
+          error_at env pos "Tuples of one element are not allowed";
+          pos, Happly ((pos, "*Unknown*"), [])
+      | hl  -> pos, Htuple hl
 
 and hint_list env =
   let error_state = !(env.errors) in
   let h = hint env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp ->
       [h]
   | Tcomma ->
@@ -1021,13 +1066,13 @@ and hint_list env =
       error_expect env ">"; [h]
 
 and hint_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let h = hint env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Trp ->
           [h]
       | Tcomma ->
@@ -1042,7 +1087,8 @@ and hint_list_remain env =
 (*****************************************************************************)
 
 (* function(_): _ *)
-and hint_function start env =
+and hint_function env =
+  let start = Pos.make env.file env.lb in
   expect env Tlp;
   let params, has_dots = hint_function_params env in
   let ret = hint_return env in
@@ -1050,7 +1096,7 @@ and hint_function start env =
 
 (* (parameter_1, .., parameter_n) *)
 and hint_function_params env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp ->
       ([], false)
   | Tellipsis ->
@@ -1062,7 +1108,7 @@ and hint_function_params env =
 
 (* ) | ,) *)
 and hint_function_params_close env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp ->
       ()
   | Tcomma ->
@@ -1075,7 +1121,7 @@ and hint_function_params_close env =
 and hint_function_params_remain env =
   let error_state = !(env.errors) in
   let h = hint env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tcomma ->
       if !(env.errors) != error_state
       then ([h], false)
@@ -1091,13 +1137,47 @@ and hint_function_params_remain env =
       error_expect env ")";
       ([h], false)
 
+and xhp_enum_decl_list env =
+  match L.token env.file env.lb with
+  | Trcb -> []
+  | _ -> L.back env.lb; xhp_enum_decl_list_remain env
+
+and xhp_enum_decl_list_remain env =
+  let error_state = !(env.errors) in
+  let v = xhp_enum_decl_value env in
+  match L.token env.file env.lb with
+  | Trcb ->
+      [v]
+  | Tcomma ->
+      if !(env.errors) != error_state
+        then [v]
+        else v :: xhp_enum_decl_list env
+  | _ ->
+      error_expect env "}"; [v]
+
+and xhp_enum_decl_value env =
+  let tok = L.token env.file env.lb in
+  let pos = Pos.make env.file env.lb in
+  match tok with
+  | Tint ->
+      let tok_value = Lexing.lexeme env.lb in
+      pos, Int (pos, tok_value)
+  | Tquote ->
+      let absolute_pos = env.lb.Lexing.lex_curr_pos in
+      expr_string env pos absolute_pos
+  | Tdquote ->
+      expr_encapsed env pos
+  | _ ->
+      error_expect env "integer literal or string literal";
+      pos, Null
+
 (* : _ *)
 and hint_return env =
   expect env Tcolon;
   hint env
 
 and hint_return_opt env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tcolon -> Some (hint env)
   | _ -> L.back env.lb; None
 
@@ -1114,7 +1194,7 @@ and class_body env =
   class_defs env
 
 and class_defs env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   (* ... } *)
   | Trcb ->
       []
@@ -1123,7 +1203,7 @@ and class_defs env =
       let word = Lexing.lexeme env.lb in
       class_toplevel_word env word
   | Tltlt ->
-  (* variable | method *)
+  (* variable | method | type const*)
       L.back env.lb;
       let error_state = !(env.errors) in
       let m = class_member_def env in
@@ -1132,20 +1212,27 @@ and class_defs env =
       else m :: class_defs env
   | _ ->
       error_expect env "class member";
-      let start = Pos.make env.lb in
+      let start = Pos.make env.file env.lb in
       look_for_next_method start env;
-      let _ = L.token env.lb in
+      let _ = L.token env.file env.lb in
       let word = Lexing.lexeme env.lb in
       class_toplevel_word env word
 
 and class_toplevel_word env word =
   match word with
-  | "category" | "children" | "attribute" ->
+  | "children" ->
       xhp_format env;
       class_defs env
+  | "category" ->
+      let cat = XhpCategory (xhp_category_list env) in
+      cat :: class_defs env
   | "const" ->
       let error_state = !(env.errors) in
-      let def = class_const_def env in
+      let def =
+        match try_typeconst_def env ~is_abstract:false with
+        | Some tconst -> tconst
+        | None -> class_const_def env
+      in
       if !(env.errors) != error_state
       then [def]
       else def :: class_defs env
@@ -1155,28 +1242,42 @@ and class_toplevel_word env word =
   | "require" ->
       let traitl = trait_require env in
       traitl @ class_defs env
-  | "abstract" | "public" | "protected" | "private" | "final" | "static"  ->
-      (* variable | method *)
-      L.back env.lb;
-      let start = Pos.make env.lb in
+  | "attribute" ->
+      let start = Pos.make env.file env.lb in
       let error_state = !(env.errors) in
-      let m = class_member_def env in
+      let m = xhp_attr_list env in
       if !(env.errors) != error_state
       then look_for_next_method start env;
-      m :: class_defs env
+      m @ class_defs env
+  | "abstract" ->
+    (match try_abstract_const env with
+      | Some ac -> ac :: class_defs env
+      | None -> on_class_member_word env)
+  | "public" | "protected" | "private" | "final" | "static"  ->
+    on_class_member_word env
   | _ ->
       error_expect env "modifier";
       []
 
+and on_class_member_word env =
+  (* variable | method | type const*)
+  L.back env.lb;
+  let start = Pos.make env.file env.lb in
+  let error_state = !(env.errors) in
+  let m = class_member_def env in
+  if !(env.errors) != error_state
+  then look_for_next_method start env;
+  m :: class_defs env
+
 and look_for_next_method previous_pos env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Teof -> ()
   | Trcb -> ()
   | Tword ->
       (match Lexing.lexeme env.lb with
-      | "abstract" | "public" | "protected"
-      | "private" | "final" | "static" ->
-          let pos = Pos.make env.lb in
+      | "abstract"| "public" | "protected"
+      | "private" | "final" | "static" when not (peek_check_word env "const") ->
+          let pos = Pos.make env.file env.lb in
           if Pos.compare pos previous_pos = 0
           then (* we are stuck in a circle *)
             look_for_next_method pos env
@@ -1193,34 +1294,19 @@ and look_for_next_method previous_pos env =
 and class_use_list env =
   let error_state = !(env.errors) in
   let cst = ClassUse (class_hint env) in
-  match L.token env.lb with
+
+  match L.token env.file env.lb with
   | Tsc ->
       [cst]
   | Tcomma ->
       if !(env.errors) != error_state
       then [cst]
-      else cst :: class_use_list_remain env
+      else cst :: class_use_list env
   | _ ->
       error_expect env ";"; [cst]
 
-and class_use_list_remain env =
-  match L.token env.lb with
-  | Tsc -> []
-  | _ ->
-      L.back env.lb;
-      let error_state = !(env.errors) in
-      let cst = ClassUse (class_hint env) in
-      match L.token env.lb with
-      | Tsc ->
-          [cst]
-      | Tcomma ->
-          if !(env.errors) != error_state
-          then [cst]
-          else cst :: class_use_list_remain env
-      | _ -> error_expect env ";"; [cst]
-
 and trait_require env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
     let req_type = Lexing.lexeme env.lb in
     let ret = (match req_type with
@@ -1228,34 +1314,32 @@ and trait_require env =
       | "extends" -> [ClassTraitRequire (MustExtend, class_hint env)]
       | _ -> error env "Expected: implements or extends"; []
     ) in
-    (match L.token env.lb with
+    (match L.token env.file env.lb with
       | Tsc -> ret
       | _ -> error_expect env ";"; [])
   | _ -> error env "Expected: implements or extends"; []
 
 (*****************************************************************************)
-(* Class xhp_fromat *)
+(* Class xhp_format *)
 (*
  * within a class body -->
  *    children ...;
- *    attribute ...;
- *    category ...;
  *)
 (*****************************************************************************)
 
 and xhp_format env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc -> ()
   | Teof ->
-      error_expect env "end of XHP category/attribute/children declaration";
+      error_expect env "end of XHP children declaration";
       ()
   | Tquote ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       let abs_pos = env.lb.Lexing.lex_curr_pos in
       ignore (expr_string env pos abs_pos);
       xhp_format env
   | Tdquote ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       ignore (expr_encapsed env pos);
       xhp_format env
   | x ->
@@ -1268,6 +1352,31 @@ and xhp_format env =
  *    const ...;
  *)
 (*****************************************************************************)
+
+(* Is "abstract" followed by "const"?
+   abstract const _ X; *)
+and try_abstract_const env =
+    try_parse env begin fun env ->
+      match L.token env.file env.lb with
+        | Tword when Lexing.lexeme env.lb = "const" ->
+            (match try_typeconst_def env ~is_abstract:true with
+            | Some tconst -> Some tconst
+            | None ->
+                let h = class_const_hint env in
+                let id = identifier env in
+                expect env Tsc;
+                Some (AbsConst (h, id))
+            )
+        | _ -> None
+    end
+
+and try_typeconst_def env ~is_abstract =
+  try_parse env begin fun env ->
+    match L.token env.file env.lb with
+    | Tword when Lexing.lexeme env.lb = "type" && (peek env) = Tword ->
+        Some (TypeConst (typeconst_def env ~is_abstract))
+    | _ -> None
+  end
 
 (* const_hint const_name1 = value1, ..., const_name_n = value_n; *)
 and class_const_def env =
@@ -1284,18 +1393,19 @@ and class_const_hint env =
 (* Determines if there is a type-hint by looking ahead. *)
 and class_const_has_hint env =
   look_ahead env begin fun env ->
-    match L.token env.lb with
+    match L.token env.file env.lb with
     (* const_name = ... | hint_name const_name = ... *)
     | Tword ->
-        (* If we see 'name =', there is no type hint *)
-        L.token env.lb <> Teq
+      (* If we see 'name =' or 'name;', there is no type hint *)
+      let tok = L.token env.file env.lb in
+      (tok <> Teq && tok <> Tsc)
     | _ -> true
   end
 
 and class_const_list env =
   let error_state = !(env.errors) in
   let cst = class_const env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc ->
       [cst]
   | Tcomma ->
@@ -1306,13 +1416,13 @@ and class_const_list env =
       error_expect env ";"; [cst]
 
 and class_const_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let cst = class_const env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Tsc ->
           [cst]
       | Tcomma ->
@@ -1334,7 +1444,7 @@ and class_const env =
 (*****************************************************************************)
 
 and mandatory_modifier_list env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
       let word = Lexing.lexeme env.lb in
       (match modifier_word env word with
@@ -1345,7 +1455,7 @@ and mandatory_modifier_list env =
       error_expect env "modifier"; []
 
 and optional_modifier_list env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
       let word = Lexing.lexeme env.lb in
       (match modifier_word env word with
@@ -1357,7 +1467,17 @@ and optional_modifier_list env =
 
 and modifier_word env = function
   | "final"     -> Some Final
-  | "static"    -> Some Static
+  | "static"    ->
+      (* We need to look ahead to make sure we are not looking at a type access
+       *
+       * class C {
+       *   public static $x; // a static var
+       *   public static::T $y; // an instance var with type static::T
+       * }
+       *)
+      if peek env = Tcolcol
+      then None
+      else Some Static
   | "abstract"  -> Some Abstract
   | "private"   -> Some Private
   | "public"    -> Some Public
@@ -1374,12 +1494,12 @@ and modifier_word env = function
 
 and class_member_def env =
   let attrs = attribute env in
-  let modifier_start = Pos.make env.lb in
+  let modifier_start = Pos.make env.file env.lb in
   let modifiers = mandatory_modifier_list env in
-  let modifier_end = Pos.make env.lb in
+  let modifier_end = Pos.make env.file env.lb in
   let modifier_pos = Pos.btw modifier_start modifier_end in
   check_modifiers env modifier_pos modifiers;
-  match L.token env.lb with
+  match L.token env.file env.lb with
   (* modifier_list $_ *)
   | Tlvar ->
       L.back env.lb;
@@ -1391,6 +1511,7 @@ and class_member_def env =
       class_member_word env ~modifiers ~attrs word
   | _ ->
       L.back env.lb;
+      check_visibility env modifier_pos modifiers;
       check_not_final env modifier_pos modifiers;
       let h = hint env in
       let cvars = class_var_list env in
@@ -1413,11 +1534,11 @@ and class_var_list env =
   else cvar :: class_var_list_remain env
 
 and class_var_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc ->
       []
   | Tcomma ->
-      (match L.token env.lb with
+      (match L.token env.file env.lb with
       | Tsc ->
           []
       | _ ->
@@ -1439,6 +1560,78 @@ and class_var env =
 and class_var_name name =
     String.sub name 1 (String.length name - 1)
 
+and xhp_attr env =
+  let maybe_use, maybe_enum = (match L.token env.file env.lb with
+    | Tcolon ->
+        L.back env.lb; (try_xhp_attr_use env, None)
+    | Tword when Lexing.lexeme env.lb = "enum" ->
+        L.back env.lb; (None, try_xhp_enum_hint env)
+    | _ ->
+        L.back env.lb; (None, None)) in
+  match maybe_use with
+    | Some x -> x
+    | None ->
+        begin
+          let h = (match maybe_enum with
+            | Some x -> None
+            | None -> Some (hint env)) in
+          let ident = xhp_identifier env in
+          let default = parameter_default env in
+          let is_required = (match L.token env.file env.lb with
+            | Trequired -> true
+            | _ -> L.back env.lb; false) in
+          XhpAttr ([], h, [ident, default], is_required, maybe_enum)
+        end
+
+and xhp_attr_list env =
+  let error_state = !(env.errors) in
+  let a = xhp_attr env in
+  if !(env.errors) != error_state
+    then [a]
+    else [a] @ xhp_attr_list_remain env
+
+and xhp_attr_list_remain env =
+  match L.token env.file env.lb with
+  | Tsc ->
+      []
+  | Tcomma ->
+      (match L.token env.file env.lb with
+      | Tsc ->
+          []
+      | _ ->
+          L.back env.lb;
+          xhp_attr_list env)
+  | _ -> error_expect env ";"; []
+
+and xhp_category env =
+  expect env Tpercent;
+  let token = L.xhpname env.file env.lb in
+  let ret =  Pos.make env.file env.lb, Lexing.lexeme env.lb in
+  (match token with | Txhpname -> ()
+                    | _ -> error_expect env "xhp name");
+  ret
+
+and xhp_category_list_remain env =
+  match L.token env.file env.lb with
+  | Tsc ->
+      []
+  | Tcomma ->
+      (match L.token env.file env.lb with
+      | Tsc ->
+          []
+      | _ ->
+          L.back env.lb;
+          xhp_category_list env)
+  | _ -> error_expect env ";"; []
+
+and xhp_category_list env =
+  let error_state = !(env.errors) in
+  let a = xhp_category env in
+  if !(env.errors) != error_state
+    then [a]
+    else [a] @ xhp_category_list_remain env
+
+
 (*****************************************************************************)
 (* Methods *)
 (*
@@ -1451,27 +1644,51 @@ and class_var_name name =
 and class_member_word env ~attrs ~modifiers = function
   | "async" ->
       expect_word env "function";
-      ref_opt env;
+      let is_ref = ref_opt env in
+      if is_ref
+        then error env ("Asynchronous function cannot return reference");
       let fun_name = identifier env in
-      let method_ = method_ env ~modifiers ~attrs ~sync:FAsync fun_name in
+      let method_ =
+        method_ env ~modifiers ~attrs ~sync:FDeclAsync is_ref fun_name in
       Method method_
   | "function" ->
-      ref_opt env;
+      let is_ref = ref_opt env in
       let fun_name = identifier env in
-      let method_ = method_ env ~modifiers ~attrs ~sync:FSync fun_name in
+      let method_ =
+        method_ env ~modifiers ~attrs ~sync:FDeclSync is_ref fun_name in
       Method method_
   | _ ->
       L.back env.lb;
       let h = hint env in
-      let cvars = class_var_list env in
-      ClassVars (modifiers, Some h, cvars)
+      let cvars =
+        match L.token env.file env.lb with
+        | Tword when Lexing.lexeme env.lb = "function" ->
+            error env ("Expected variable. "^
+              "Perhaps you meant 'function (...): return-type'?");
+            []
+        | _ -> L.back env.lb; class_var_list env
+      in ClassVars (modifiers, Some h, cvars)
 
-and method_ env ~modifiers ~attrs ~sync pname =
+and typeconst_def env ~is_abstract =
+  let pname = identifier env in
+  let constr = typedef_constraint env in
+  let type_ = match L.token env.file env.lb with
+    | Teq -> Some (hint env)
+    | _ -> L.back env.lb; None
+  in
+  expect env Tsc;
+  { tconst_abstract = is_abstract;
+    tconst_name = pname;
+    tconst_constraint = constr;
+    tconst_type = type_;
+  }
+
+and method_ env ~modifiers ~attrs ~(sync:fun_decl_kind) is_ref pname =
   let pos, name = pname in
   let tparams = class_params env in
   let params = parameter_list env in
   let ret = hint_return_opt env in
-  let body = function_body env in
+  let is_generator, body_stmts = function_body env in
   let ret = method_implicit_return env pname ret in
   if name = "__destruct" && params <> []
   then error_at env pos "Destructor must not have any parameters.";
@@ -1479,10 +1696,11 @@ and method_ env ~modifiers ~attrs ~sync pname =
     m_tparams = tparams;
     m_params = params;
     m_ret = ret;
-    m_body = body;
+    m_ret_by_ref = is_ref;
+    m_body = body_stmts;
     m_kind = modifiers;
     m_user_attributes = attrs;
-    m_fun_kind = sync;
+    m_fun_kind = fun_kind sync is_generator;
   }
 
 (*****************************************************************************)
@@ -1538,7 +1756,8 @@ and param_implicit_field vis p =
   let this = pos, "$this" in
   let stmt =
     Expr (pos, Binop (Eq None, (pos, Obj_get((pos, Lvar this),
-                                             (pos, Id cvname))),
+                                             (pos, Id cvname),
+                                             OG_nullthrows)),
                       (pos, Lvar p.param_id)))
   in
   member, stmt
@@ -1548,59 +1767,84 @@ and param_implicit_field vis p =
 (*****************************************************************************)
 
 and function_body env =
-  match L.token env.lb with
-  | Tsc -> []
+  match L.token env.file env.lb with
+  | Tsc ->
+    false, []
   | Tlcb ->
-      (match env.mode with
-      | Mdecl ->
-          ignore_body env;
-          (* This is a hack for the type-checker to make a distinction
-           * Between function foo(); and function foo() {}
-           *)
-          [Noop]
+    let previous_in_generator = !(env.in_generator) in
+    env.in_generator := false;
+    let statements = (match env.mode with
+      | FileInfo.Mdecl ->
+        ignore_body env;
+        (* This is a hack for the type-checker to make a distinction
+         * Between function foo(); and function foo() {}
+         *)
+        [Noop]
       | _ ->
-          (match statement_list env with
+        (match statement_list env with
           | [] -> [Noop]
           | x -> x)
-      )
-  | _ -> error_expect env "{"; []
+    ) in
+    let in_generator = !(env.in_generator) in
+    env.in_generator := previous_in_generator ;
+    in_generator, statements
+  | _ ->
+    error_expect env "{";
+    false, []
+
+and fun_kind sync (has_yield:bool) =
+  match sync, has_yield with
+    | FDeclAsync, true -> FAsyncGenerator
+    | FDeclSync, true -> FGenerator
+    | FDeclAsync, false -> FAsync
+    | FDeclSync, false -> FSync
 
 and ignore_body env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tlcb -> ignore_body env; ignore_body env
   | Trcb -> ()
   | Tquote ->
-      let pos = Pos.make env.lb in
-      let abs_pos = env.lb.Lexing.lex_curr_pos in
-      ignore (expr_string env pos abs_pos);
-      ignore_body env
+    let pos = Pos.make env.file env.lb in
+    let abs_pos = env.lb.Lexing.lex_curr_pos in
+    ignore (expr_string env pos abs_pos);
+    ignore_body env
   | Tdquote ->
-      let pos = Pos.make env.lb in
-      ignore (expr_encapsed env pos);
-      ignore_body env
+    let pos = Pos.make env.file env.lb in
+    ignore (expr_encapsed env pos);
+    ignore_body env
   | Theredoc ->
-      ignore (expr_heredoc env);
-      ignore_body env
+    ignore (expr_heredoc env);
+    ignore_body env
+  | Tword when (Lexing.lexeme env.lb) = "yield" ->
+    env.in_generator := true;
+    ignore_body env
   | Tword when (Lexing.lexeme env.lb) = "function" && peek env = Tlp ->
-  (* this covers the async case as well *)
-      let pos = Pos.make env.lb in
-      ignore (expr_anon_fun env pos ~sync:FSync);
-      ignore_body env
+    (* this covers the async case as well *)
+    let pos = Pos.make env.file env.lb in
+    with_ignored_yield env
+      (fun () -> ignore (expr_anon_fun env pos ~sync:FDeclSync));
+    ignore_body env
   | Tlp ->
-      ignore (try_short_lambda env);
-      ignore_body env
+    with_ignored_yield env
+      (fun () -> ignore (try_short_lambda env));
+    ignore_body env
   | Tlt when is_xhp env ->
-      ignore (xhp env);
-      ignore_body env
+    ignore (xhp env);
+    ignore_body env
   | Teof -> error_expect env "}"; ()
   | _ -> ignore_body env
+
+and with_ignored_yield env fn =
+  let previous_in_generator = !(env.in_generator) in
+  let () = fn () in
+  env.in_generator := previous_in_generator; ()
 
 (*****************************************************************************)
 (* Statements *)
 (*****************************************************************************)
 
 and statement_list env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trcb -> []
   | Tlcb ->
       let block = statement_list env in
@@ -1619,7 +1863,7 @@ and statement_list env =
       stmt :: statement_list env
 
 and statement env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
       let word = Lexing.lexeme env.lb in
       let stmt = statement_word env word in
@@ -1657,7 +1901,7 @@ and statement_word env = function
   | "async" | "abstract" | "final" ->
       error env
           "Parse error: declarations are not supported outside global scope";
-      ignore (ignore_toplevel SMap.empty [] env (fun _ -> true));
+      ignore (ignore_toplevel ~attr:[] [] env (fun _ -> true));
       Noop
   | x ->
       L.back env.lb;
@@ -1670,7 +1914,7 @@ and statement_word env = function
 (*****************************************************************************)
 
 and statement_break env =
-  let stmt = Break (Pos.make env.lb) in
+  let stmt = Break (Pos.make env.file env.lb) in
   check_continue env;
   stmt
 
@@ -1679,12 +1923,12 @@ and statement_break env =
 (*****************************************************************************)
 
 and statement_continue env =
-  let stmt = Continue (Pos.make env.lb) in
+  let stmt = Continue (Pos.make env.file env.lb) in
   check_continue env;
   stmt
 
 and check_continue env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc -> ()
   | Tint -> error_continue env
   | _ -> error_expect env ";"
@@ -1703,12 +1947,12 @@ and statement_throw env =
 (*****************************************************************************)
 
 and statement_return env =
-  let pos = Pos.make env.lb in
+  let pos = Pos.make env.file env.lb in
   let value = return_value env in
   Return (pos, value)
 
 and return_value env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc -> None
   | _ ->
       L.back env.lb;
@@ -1721,8 +1965,8 @@ and return_value env =
 (*****************************************************************************)
 
 and statement_static env =
-  let pos = Pos.make env.lb in
-  match L.token env.lb with
+  let pos = Pos.make env.file env.lb in
+  match L.token env.file env.lb with
   | Tlvar ->
       L.back env.lb;
       let el = static_var_list env in
@@ -1736,7 +1980,7 @@ and statement_static env =
 and static_var_list env =
   let error_state = !(env.errors) in
   let cst = static_var env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc ->
       [cst]
   | Tcomma ->
@@ -1746,13 +1990,13 @@ and static_var_list env =
   | _ -> error_expect env ";"; [cst]
 
 and static_var_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let cst = static_var env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Tsc ->
           [cst]
       | Tcomma ->
@@ -1777,7 +2021,7 @@ and statement_switch env =
 
 (* switch(...) { _ } *)
 and switch_body env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trcb ->
       []
   | Tword ->
@@ -1801,7 +2045,7 @@ and switch_body_word env = function
 
 (* switch(...) { case/default: _ } *)
 and case_body env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
       (match Lexing.lexeme env.lb with
       | "case" | "default" -> L.back env.lb; []
@@ -1834,7 +2078,7 @@ and statement_if env =
   If (e, [st1], [st2])
 
 and statement_else env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
       (match Lexing.lexeme env.lb with
       | "else" -> statement env
@@ -1865,8 +2109,8 @@ and statement_while env =
 
 and statement_for env =
   expect env Tlp;
-  let start = Pos.make env.lb in
-  let _ = L.token env.lb in
+  let start = Pos.make env.file env.lb in
+  let _ = L.token env.file env.lb in
   let _ = L.back env.lb in
   let last, el = for_expr env in
   let e1 = Pos.btw start last, Expr_list el in
@@ -1880,46 +2124,46 @@ and statement_for env =
   For (e1, e2, e3, [st])
 
 and for_expr env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc ->
-      Pos.make env.lb, []
+      Pos.make env.file env.lb, []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let e = expr env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Tsc ->
-          Pos.make env.lb, [e]
+          Pos.make env.file env.lb, [e]
       | _ when !(env.errors) != error_state ->
           L.back env.lb;
-          Pos.make env.lb, [e]
+          Pos.make env.file env.lb, [e]
       | Tcomma ->
             let last, el = for_expr env in
             last, e :: el
       | _ ->
           error_expect env ";";
-          Pos.make env.lb, [e]
+          Pos.make env.file env.lb, [e]
 
 and for_last_expr env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp ->
-      Pos.make env.lb, []
+      Pos.make env.file env.lb, []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let e = expr env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Trp ->
-          Pos.make env.lb, [e]
+          Pos.make env.file env.lb, [e]
       | _ when !(env.errors) != error_state ->
           L.back env.lb;
-          Pos.make env.lb, [e]
+          Pos.make env.file env.lb, [e]
       | Tcomma ->
           let last, el = for_last_expr env in
           last, e :: el
       | _ ->
           error_expect env ")";
-          Pos.make env.lb, [e]
+          Pos.make env.file env.lb, [e]
 
 (*****************************************************************************)
 (* Foreach statement *)
@@ -1929,8 +2173,8 @@ and statement_foreach env =
   expect env Tlp;
   let e = expr env in
   let await =
-    match L.token env.lb with
-    | Tword when Lexing.lexeme env.lb = "await" -> Some (Pos.make env.lb)
+    match L.token env.file env.lb with
+    | Tword when Lexing.lexeme env.lb = "await" -> Some (Pos.make env.file env.lb)
     | _ -> L.back env.lb; None in
   expect_word env "as";
   let as_expr = foreach_as env in
@@ -1939,14 +2183,14 @@ and statement_foreach env =
 
 and foreach_as env =
   let e1 = expr env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsarrow ->
       let e2 = expr env in
-      check_lvalue env e2;
+      check_foreach_lvalue env e2;
       expect env Trp;
       As_kv (e1, e2)
   | Trp ->
-      check_lvalue env e1;
+      check_foreach_lvalue env e1;
       As_v e1
   | _ ->
       error_expect env ")";
@@ -1963,7 +2207,7 @@ and statement_try env =
   Try ([st], cl, fin)
 
 and catch_list env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword when Lexing.lexeme env.lb = "catch" ->
       expect env Tlp;
       let name = identifier env in
@@ -1974,7 +2218,7 @@ and catch_list env =
   | _ -> L.back env.lb; []
 
 and finally env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword when Lexing.lexeme env.lb = "finally" ->
     let st = statement env in
     [st]
@@ -1985,14 +2229,14 @@ and finally env =
 (*****************************************************************************)
 
 and statement_echo env =
-  let pos = Pos.make env.lb in
+  let pos = Pos.make env.file env.lb in
   let args = echo_args env in
   let f = pos, Id (pos, "echo") in
-  Expr (pos, Call (f, args))
+  Expr (pos, Call (f, args, []))
 
 and echo_args env =
   let e = expr env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsc ->
       [e]
   | Tcomma ->
@@ -2009,7 +2253,7 @@ and parameter_list env =
   parameter_list_remain env
 
 and parameter_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp -> []
   | Tellipsis ->
       [parameter_varargs env]
@@ -2017,7 +2261,7 @@ and parameter_list_remain env =
       L.back env.lb;
       let error_state = !(env.errors) in
       let p = param ~variadic:false env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Trp ->
           [p]
       | Tellipsis ->
@@ -2030,8 +2274,8 @@ and parameter_list_remain env =
           error_expect env ")"; [p]
 
 and parameter_varargs env =
-  let pos = Pos.make env.lb in
-  (match L.token env.lb with
+  let pos = Pos.make env.file env.lb in
+  (match L.token env.file env.lb with
     | Tcomma -> expect env Trp; make_param_ellipsis pos
     | Trp -> make_param_ellipsis pos;
     | _ ->
@@ -2047,14 +2291,14 @@ and make_param_ellipsis pos =
     param_id = (pos, "...");
     param_expr = None;
     param_modifier = None;
-    param_user_attributes = SMap.empty;
+    param_user_attributes = [];
   }
 
-and param ~variadic env  =
+and param ~variadic env =
   let attrs = attribute env in
   let modifs = parameter_modifier env in
   let h = parameter_hint env in
-  let variadic_after_hint, name = ref_param env in
+  let is_ref, variadic_after_hint, name = ref_param env in
   assert ((not variadic_after_hint) || (not variadic));
   let variadic = variadic || variadic_after_hint in
   let default = parameter_default env in
@@ -2068,7 +2312,7 @@ and param ~variadic env  =
     L.back env.lb
   end else ();
   { param_hint = h;
-    param_is_reference = false;
+    param_is_reference = is_ref;
     param_is_variadic = variadic;
     param_id = name;
     param_expr = default;
@@ -2077,7 +2321,7 @@ and param ~variadic env  =
   }
 
 and parameter_modifier env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
       (match Lexing.lexeme env.lb with
       | "private" -> Some Private
@@ -2094,13 +2338,13 @@ and parameter_hint env =
 
 and parameter_has_hint env =
   look_ahead env begin fun env ->
-    match L.token env.lb with
+    match L.token env.file env.lb with
     | Tellipsis | Tamp | Tlvar -> false
     | _ -> true
   end
 
 and parameter_default env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Teq ->
       let default = expr env in
       Some default
@@ -2111,7 +2355,7 @@ and parameter_default env =
 (*****************************************************************************)
 
 and expr env =
-  let e1 = expr_atomic env in
+  let e1 = expr_atomic ~allow_class:false ~class_const:false env in
   let e2 = expr_remain env e1 in
   e2
 
@@ -2120,13 +2364,13 @@ and expr_list env =
   expr_list_remain env
 
 and expr_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let e = expr { env with priority = 0 } in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Trp ->
           [e]
       | Tcomma ->
@@ -2136,13 +2380,15 @@ and expr_list_remain env =
       | _ -> error_expect env ")"; [e]
 
 and expr_remain env e1 =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tplus ->
       expr_binop env Tplus Plus e1
   | Tminus ->
       expr_binop env Tminus Minus e1
   | Tstar ->
       expr_binop env Tstar Star e1
+  | Tstarstar ->
+      expr_binop env Tstarstar Starstar e1
   | Tslash ->
       expr_binop env Tslash Slash e1
   | Teq ->
@@ -2205,13 +2451,16 @@ and expr_remain env e1 =
       expr_binop env Txor Xor e1
   | Tincr | Tdecr as uop  ->
       expr_postfix_unary env uop e1
-  | Tarrow ->
-      expr_arrow env e1
+  | Tarrow | Tnsarrow as tok ->
+      expr_arrow env e1 tok
   | Tcolcol ->
       expr_colcol env e1
   | Tlp ->
       expr_call env e1
   | Tlb ->
+      expr_array_get env e1
+  | Tlcb ->
+      error env "Do not use { to subscript, use [";
       expr_array_get env e1
   | Tqm ->
       expr_if env e1
@@ -2274,28 +2523,44 @@ and reduce_ env e1 op make =
 (*****************************************************************************)
 
 and lambda_expr_body : env -> block = fun env ->
+  (* check for an async block *)
+  let tok = L.token env.file env.lb in
+  let value = Lexing.lexeme env.lb in
+  let () =
+    if tok <> Tword || value <> "async"
+    then L.back env.lb
+    else
+      (* in sync lambda: just transform into an async lambda *)
+      (* in async lambda: be explicit about the Awaitable<Awaitable<X>> return
+       * type with a return statement *)
+      error_back env "Unexpected use of async {...} as lambda expression"
+  in
+
   let (p, e1) = expr env in
   [Return (p, (Some (p, e1)))]
 
-and lambda_body env params ret =
-  let body =
-    if peek env = Tlcb
-    then function_body env
-    else lambda_expr_body env
+and lambda_body ~sync env params ret =
+  let is_generator, body_stmts =
+    (if peek env = Tlcb
+     then function_body env
+     (* as of Apr 2015, a lambda expression body can't contain a yield *)
+     else false, (lambda_expr_body env))
   in
+  let f_fun_kind = fun_kind sync is_generator in
   let f = {
     f_name = (Pos.none, ";anonymous");
     f_tparams = [];
     f_params = params;
     f_ret = ret;
-    f_body = body;
-    f_user_attributes = Utils.SMap.empty;
-    f_fun_kind = FSync;
+    f_ret_by_ref = false;
+    f_body = body_stmts;
+    f_user_attributes = [];
+    f_fun_kind;
     f_mode = env.mode;
     f_mtime = 0.0;
     f_namespace = Namespace_env.empty;
   }
-  in Lfun f;
+  in Lfun f
 
 and make_lambda_param : id -> fun_param = fun var_id ->
   {
@@ -2305,12 +2570,12 @@ and make_lambda_param : id -> fun_param = fun var_id ->
     param_id = var_id;
     param_expr = None;
     param_modifier = None;
-    param_user_attributes = Utils.SMap.empty;
+    param_user_attributes = [];
   }
 
-and lambda_single_arg env var_id =
+and lambda_single_arg ~(sync:fun_decl_kind) env var_id : expr_ =
   expect env Tlambda;
-  lambda_body env [make_lambda_param var_id] None
+  lambda_body ~sync env [make_lambda_param var_id] None
 
 and try_short_lambda env =
   try_parse env begin fun env ->
@@ -2328,18 +2593,47 @@ and try_short_lambda env =
       then None
       else begin
         drop env;
-        Some (lambda_body env param_list ret)
+        Some (lambda_body ~sync:FDeclSync env param_list ret)
       end
     end
+  end
+
+and try_xhp_attr_use env =
+  try_parse env begin fun env ->
+    match L.token env.file env.lb with
+      | Tcolon ->
+        (match L.xhpname env.file env.lb with
+        | Txhpname ->
+          let name = (Pos.make env.file env.lb, ":"^Lexing.lexeme env.lb) in
+            (match L.token env.file env.lb with
+            | Tcomma | Tsc ->
+              L.back env.lb;
+              Some (XhpAttrUse (class_hint_with_name env name))
+            | _ ->
+              L.back env.lb;
+              None)
+        | _ -> None)
+      | _ -> None
+  end
+
+and try_xhp_enum_hint env =
+  try_parse env begin fun env ->
+    match L.token env.file env.lb with
+      | Tword when Lexing.lexeme env.lb = "enum" ->
+        let pos = Pos.make env.file env.lb in
+        expect env Tlcb;
+        let items = xhp_enum_decl_list env in
+        Some (pos, items)
+      | _ -> None
   end
 
 (*****************************************************************************)
 (* Expressions *)
 (*****************************************************************************)
 
-and expr_atomic ?(allow_class=false) env  =
-  let tok = L.token env.lb in
-  let pos = Pos.make env.lb in
+and expr_atomic ~allow_class ~class_const env =
+  let tok = L.token env.file env.lb in
+  let pos = Pos.make env.file env.lb in
   match tok with
   | Tint ->
       let tok_value = Lexing.lexeme env.lb in
@@ -2356,21 +2650,19 @@ and expr_atomic ?(allow_class=false) env  =
       let tok_value = Lexing.lexeme env.lb in
       let var_id = (pos, tok_value) in
       pos, if peek env = Tlambda
-           then lambda_single_arg env var_id
-           else Lvar var_id
+        then lambda_single_arg ~sync:FDeclSync env var_id
+        else Lvar var_id
   | Tcolon ->
       L.back env.lb;
       let name = identifier env in
       fst name, Id name
-  | Tem | Tincr | Tdecr | Ttild | Tplus | Tminus as op ->
+  | Tem | Tincr | Tdecr | Ttild | Tplus | Tminus | Tamp as op ->
       expr_prefix_unary env pos op
-  | Tamp ->
-      with_priority env Tref expr
   | Tat ->
       with_priority env Tat expr
   | Tword ->
       let word = Lexing.lexeme env.lb in
-      expr_atomic_word ~allow_class env pos word
+      expr_atomic_word ~allow_class ~class_const env pos word
   | Tlp ->
       (match try_short_lambda env with
       | None ->
@@ -2379,7 +2671,7 @@ and expr_atomic ?(allow_class=false) env  =
           else with_base_priority env begin fun env ->
             let e = expr env in
             expect env Trp;
-            let end_ = Pos.make env.lb in
+            let end_ = Pos.make env.file env.lb in
             Pos.btw pos end_, snd e
           end
       | Some l -> pos, l
@@ -2396,24 +2688,24 @@ and expr_atomic ?(allow_class=false) env  =
       expr env
   | Tunsafeexpr ->
       let e = expr env in
-      let end_ = Pos.make env.lb in
+      let end_ = Pos.make env.file env.lb in
       Pos.btw pos end_, Unsafeexpr e
   | _ ->
       error_expect env "expression";
       pos, Null
 
-and expr_atomic_word ~allow_class env pos = function
+and expr_atomic_word ~allow_class ~class_const env pos = function
   | "class" when not allow_class ->
       error_expect env "expression";
       pos, Null
   | "final" | "abstract" | "interface" | "trait" ->
       error_expect env "expression";
       pos, Null
-  | "true"  ->
+  | "true" when not class_const ->
       pos, True
-  | "false" ->
+  | "false" when not class_const ->
       pos, False
-  | "null"  ->
+  | "null" when not class_const ->
       pos, Null
   | "array" ->
       expr_array env pos
@@ -2424,25 +2716,36 @@ and expr_atomic_word ~allow_class env pos = function
   | "async" ->
       expr_anon_async env pos
   | "function" ->
-      expr_anon_fun env pos ~sync:FSync
+      expr_anon_fun env pos ~sync:FDeclSync
   | name when is_collection env ->
       expr_collection env pos name
   | "await" ->
       expr_await env pos
   | "yield" ->
+      env.in_generator := true;
       expr_yield env pos
   | "clone" ->
       expr_clone env pos
   | "list" ->
       expr_php_list env pos
-  | "require" | "require_once" ->
-      if env.mode = Ast.Mstrict
+  | r when is_import r ->
+      if env.mode = FileInfo.Mstrict
       then
         error env
-          ("Parse error: require_once is supported only as a toplevel "^
+          ("Parse error: "^r^" is supported only as a toplevel "^
           "declaration");
-      let _ = expr env in
+      expr_import r env pos
+  | x when not class_const && String.lowercase x = "true" ->
+      Lint.lowercase_constant pos x;
+      pos, True
+  | x when not class_const && String.lowercase x = "false" ->
+      Lint.lowercase_constant pos x;
+      pos, False
+  | x when not class_const && String.lowercase x = "null" ->
+      Lint.lowercase_constant pos x;
       pos, Null
+  | x when String.lowercase x = "array" ->
+      expr_array env pos
   | x ->
       pos, Id (pos, x)
 
@@ -2483,17 +2786,20 @@ and expr_binop env bop ast_bop e1 =
 (* Object Access ($obj->method) *)
 (*****************************************************************************)
 
-and expr_arrow env e1 =
-  reduce env e1 Tarrow begin fun e1 env ->
+and expr_arrow env e1 tok =
+  reduce env e1 tok begin fun e1 env ->
     let e2 =
-      match L.token env.lb with
+      match L.varname env.lb with
       | Tword ->
           let name = Lexing.lexeme env.lb in
-          let pos = Pos.make env.lb in
+          let pos = Pos.make env.file env.lb in
           pos, Id (pos, name)
       | _ -> L.back env.lb; expr env
     in
-    btw e1 e2, Obj_get (e1, e2)
+    btw e1 e2, (match tok with
+      | Tarrow -> Obj_get (e1, e2, OG_nullthrows)
+      | Tnsarrow -> Obj_get (e1, e2, OG_nullsafe)
+      | _ -> assert false)
   end
 
 (*****************************************************************************)
@@ -2516,7 +2822,7 @@ and expr_colcol env e1 =
   end
 
 and expr_colcol_remain ~allow_class env e1 cname =
-  match expr_atomic env ~allow_class with
+  match expr_atomic env ~allow_class ~class_const:true with
   | _, Lvar x ->
       btw e1 x, Class_get (cname, x)
   | _, Id x ->
@@ -2526,16 +2832,51 @@ and expr_colcol_remain ~allow_class env e1 cname =
       e1
 
 (*****************************************************************************)
-(* Function call (foo(params)) *)
+(* Function call (f(params)) *)
 (*****************************************************************************)
 
 and expr_call env e1 =
   reduce env e1 Tlp begin fun e1 env ->
     L.back env.lb;
-    let args = expr_list env in
-    let end_ = Pos.make env.lb in
-    Pos.btw (fst e1) end_, Call (e1, args)
+    let args1, args2 = expr_call_list env in
+    let end_ = Pos.make env.file env.lb in
+    Pos.btw (fst e1) end_, Call (e1, args1, args2)
   end
+
+(* An expr_call_list is the same as an expr_list except for the possibility
+ * of ParamUnpack (aka splat) calls of the form:
+ *   f(...$unpacked);
+ *)
+and expr_call_list env =
+  expect env Tlp;
+  expr_call_list_remain env
+
+and expr_call_list_remain env =
+  match L.token env.file env.lb with
+    | Trp -> [], []
+    | Tellipsis -> (* f($x, $y, << ...$args >> ) *)
+      let unpack_e = expr { env with priority = 0 } in
+      (* no regular params after an unpack *)
+      (match L.token env.file env.lb with
+        | Tcomma ->
+            expect env Trp;
+            [], [unpack_e]
+        | Trp -> [], [unpack_e]
+        | _ -> error_expect env ")"; [], [unpack_e])
+    | _ ->
+      L.back env.lb;
+      let error_state = !(env.errors) in
+      let e = expr { env with priority = 0 } in
+      match L.token env.file env.lb with
+        | Trp -> [e], []
+        | Tcomma ->
+          if !(env.errors) != error_state
+          then [e], []
+          else begin
+            let reg, unpack = expr_call_list_remain env
+            in e :: reg, unpack
+          end
+        | _ -> error_expect env ")"; [e], []
 
 (*****************************************************************************)
 (* Collections *)
@@ -2551,7 +2892,7 @@ and expr_collection env pos name =
 and build_collection env pos name =
   let name = pos, name in
   let fds = collection_field_list env in
-  let end_ = Pos.make env.lb in
+  let end_ = Pos.make env.file env.lb in
   Pos.btw pos end_, Collection (name, fds)
 
 and collection_field_list env =
@@ -2559,13 +2900,13 @@ and collection_field_list env =
   collection_field_list_remain env
 
 and collection_field_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trcb -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let fd = array_field env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Trcb ->
           [fd]
       | Tcomma ->
@@ -2574,6 +2915,27 @@ and collection_field_list_remain env =
           else fd :: collection_field_list_remain env
       | _ ->
           error_expect env "}"; []
+
+(*****************************************************************************)
+(* Imports - require/include/require_once/include_once *)
+(*****************************************************************************)
+
+and is_import r =
+  List.mem ["require"; "require_once"; "include"; "include_once"] r
+
+and expr_import r env start =
+  let flavor = match r with
+  | "require" -> Require
+  | "include" -> Include
+  | "require_once" -> RequireOnce
+  | "include_once" -> IncludeOnce
+    (* We just checked for this very condition *)
+  | _ -> assert false in
+  (* all the import statements have the same priority *)
+  with_priority env Timport begin fun env ->
+    let e = expr env in
+    Pos.btw start (fst e), Import (flavor, e)
+  end
 
 (*****************************************************************************)
 (* InstanceOf *)
@@ -2591,9 +2953,9 @@ and expr_instanceof env e1 =
 
 and expr_yield env start =
   with_priority env Tyield begin fun env ->
-    match L.token env.lb with
+    match L.token env.file env.lb with
     | Tword when Lexing.lexeme env.lb = "break" ->
-        let end_ = Pos.make env.lb in
+        let end_ = Pos.make env.file env.lb in
         Pos.btw start end_, Yield_break
     | _ ->
         L.back env.lb;
@@ -2623,42 +2985,48 @@ and expr_clone env start =
 
 and expr_php_list env start =
   let el = expr_list env in
-  let end_ = Pos.make env.lb in
+  let end_ = Pos.make env.file env.lb in
   Pos.btw start end_, List el
 
 (*****************************************************************************)
 (* Anonymous functions *)
 (*****************************************************************************)
 
-and is_function env =
-  look_ahead env begin fun env ->
-    let tok = L.token env.lb in
-    tok = Tword &&
-    Lexing.lexeme env.lb = "function"
-  end
-
 and expr_anon_async env pos =
-  if is_function env
-  then begin
-    expect_word env "function";
-    expr_anon_fun env pos ~sync:FAsync
-  end
-  else pos, Id (pos, "async")
+  match L.token env.file env.lb with
+  | Tword when Lexing.lexeme env.lb = "function" ->
+      expr_anon_fun env pos ~sync:FDeclAsync
+  | Tlvar ->
+      let var_pos = Pos.make env.file env.lb in
+      pos, lambda_single_arg ~sync:FDeclAsync env (var_pos, Lexing.lexeme env.lb)
+  | Tlp ->
+      let param_list = parameter_list_remain env in
+      let ret = hint_return_opt env in
+      expect env Tlambda;
+      pos, lambda_body ~sync:FDeclAsync env param_list ret
+  | Tlcb -> (* async { ... } *)
+      L.back env.lb;
+      let lambda = pos, lambda_body ~sync:FDeclAsync env [] None in
+      pos, Call (lambda, [], [])
+  | _ ->
+      L.back env.lb;
+      pos, Id (pos, "async")
 
-and expr_anon_fun env pos ~sync =
+and expr_anon_fun env pos ~(sync:fun_decl_kind) =
   let env = { env with priority = 0 } in
   let params = parameter_list env in
   let ret = hint_return_opt env in
   let use = function_use env in
-  let body = function_body env in
+  let is_generator, body_stmts = function_body env in
   let f = {
     f_name = (Pos.none, ";anonymous");
     f_tparams = [];
     f_params = params;
     f_ret = ret;
-    f_body = body;
-    f_user_attributes = Utils.SMap.empty;
-    f_fun_kind = sync;
+    f_ret_by_ref = false;
+    f_body = body_stmts;
+    f_user_attributes = [];
+    f_fun_kind = fun_kind sync is_generator;
     f_mode = env.mode;
     f_mtime = 0.0;
     f_namespace = Namespace_env.empty;
@@ -2671,20 +3039,20 @@ and expr_anon_fun env pos ~sync =
 (*****************************************************************************)
 
 and function_use env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword when Lexing.lexeme env.lb = "use" ->
       expect env Tlp;
       use_list env
   | _ -> L.back env.lb; []
 
 and use_list env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let var = ref_variable env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Tcomma ->
           if !(env.errors) != error_state
           then [var]
@@ -2704,22 +3072,19 @@ and expr_new env pos_start =
     let cname =
       let e = expr env in
       match e with
-      | p, Lvar _
-      | p, Array_get _
-      | p, Obj_get _
-      | p, Class_get _
-      | p, Call _ ->
-          if env.mode = Ast.Mstrict
-          then error env "Cannot use dynamic new in strict mode";
-          p, "*Unknown*"
-      | _, Id x -> x
+      | _, Lvar _
+      | _, Array_get _
+      | _, Obj_get _
+      | _, Class_get _
+      | _, Call _
+      | _, Id _ -> e
       | p, _ ->
           error_expect env "class name";
-          p, "*Unknown*"
+          e
     in
-    let args = expr_list env in
-    let pos_end = Pos.make env.lb in
-    Pos.btw pos_start pos_end, New (cname, args)
+    let args1, args2 = expr_call_list env in
+    let pos_end = Pos.make env.file env.lb in
+    Pos.btw pos_start pos_end, New (cname, args1, args2)
   end
 
 (*****************************************************************************)
@@ -2737,11 +3102,11 @@ and is_cast_type = function
  * hand, (x) >> 1 is parsed like `x >> 1`, because (x) is not a cast token. *)
 and is_cast env =
   look_ahead env begin fun env ->
-    L.token env.lb = Tword &&
+    L.token env.file env.lb = Tword &&
     let cast_name = Lexing.lexeme env.lb in
-    L.token env.lb = Trp && begin
+    L.token env.file env.lb = Trp && begin
       is_cast_type cast_name ||
-      match L.token env.lb with
+      match L.token env.file env.lb with
       (* We cannot be making a cast if the next token is a binary / ternary
        * operator, or if it's the end of a statement (i.e. a semicolon.) *)
       | Tqm | Tsc | Tstar | Tslash | Txor | Tpercent | Tlt | Tgt | Tltlt | Tgtgt
@@ -2752,10 +3117,10 @@ and is_cast env =
 
 and expr_cast env start_pos =
   with_priority env Tcast begin fun env ->
-    let tok = L.token env.lb in
+    let tok = L.token env.file env.lb in
     let cast_type = Lexing.lexeme env.lb in
     assert (tok = Tword);
-    let p = Pos.make env.lb in
+    let p = Pos.make env.file env.lb in
     expect env Trp;
     let ty = p, Happly ((p, cast_type), []) in
     let e = expr env in
@@ -2768,6 +3133,7 @@ and expr_cast env start_pos =
 
 and unary_priority = function
   | Tplus | Tminus -> Tincr
+  | Tamp -> Tref
   | x -> x
 
 and expr_prefix_unary env start op =
@@ -2776,33 +3142,28 @@ and expr_prefix_unary env start op =
     let op =
       match op with
       | Tem -> Unot
-      | Tincr -> Uincr
-      | Tdecr -> Udecr
+      | Tincr -> (check_lvalue env e; Uincr)
+      | Tdecr -> (check_lvalue env e; Udecr)
       | Ttild -> Utild
       | Tplus -> Uplus
       | Tminus -> Uminus
+      | Tamp -> Uref
       | _ -> assert false
     in
     Pos.btw start (fst e), Unop (op, e)
   end
 
 and expr_postfix_unary env uop e1 =
-  let end_ = Pos.make env.lb in
-  let e =
-    reduce env e1 (unary_priority uop) begin fun e1 env ->
-      let op =
-        match uop with
-        | Tincr -> Upincr
-        | Tdecr -> Updecr
-        | _ -> assert false
-      in
-      Pos.btw (fst e1) end_, Unop (op, e1)
-    end
+  let end_ = Pos.make env.file env.lb in
+  let op =
+    check_lvalue env e1;
+    match uop with
+    | Tincr -> Upincr
+    | Tdecr -> Updecr
+    | _ -> assert false
   in
-  let x = L.token env.lb in
-  if x = uop
-  then expr_remain env e
-  else (L.back env.lb; expr_remain env e)
+  let e = Pos.btw (fst e1) end_, Unop (op, e1) in
+  expr_remain env e
 
 (*****************************************************************************)
 (* If expression: _?_:_ *)
@@ -2810,7 +3171,7 @@ and expr_postfix_unary env uop e1 =
 
 and is_colon_if env =
   look_ahead env begin fun env ->
-    let tok = L.token env.lb in
+    let tok = L.token env.file env.lb in
     tok = Tcolon &&
     (* At this point, we might still be dealing with an xhp identifier *)
     L.no_space_id env.lb <> Tword
@@ -2843,39 +3204,67 @@ and colon_if env e1 =
 (* Strings *)
 (*****************************************************************************)
 
+and make_string env pos content f_unescape =
+  let unescaped =
+    try f_unescape content with
+      | Php_escaping.Invalid_string error -> error_at env pos error; ""
+  in String (pos, unescaped)
+
 and expr_string env start abs_start =
-  match L.string env.lb with
+  match L.string env.file env.lb with
   | Tquote ->
-      let pos = Pos.btw start (Pos.make env.lb) in
+      let pos = Pos.btw start (Pos.make env.file env.lb) in
       let len = env.lb.Lexing.lex_curr_pos - abs_start - 1 in
       let content = String.sub env.lb.Lexing.lex_buffer abs_start len in
-      pos, String (pos, content)
+      pos, make_string env pos content Php_escaping.unescape_single
   | Teof ->
       error_at env start "string not closed";
       start, String (start, "")
   | _ -> assert false
 
 and expr_encapsed env start =
-  let abs_start = env.lb.Lexing.lex_curr_pos in
-  let pos_start = Pos.make env.lb in
+  let pos_start = Pos.make env.file env.lb in
   let el = encapsed_nested pos_start env in
-  let pos_end = Pos.make env.lb in
+  let pos_end = Pos.make env.file env.lb in
   let pos = Pos.btw pos_start pos_end in
-  let len = env.lb.Lexing.lex_curr_pos - abs_start - 1 in
-  let content = String.sub env.lb.Lexing.lex_buffer abs_start len in
-  pos, String2 (el, (pos, content))
+  (* Represent purely literal strings as just String *)
+  match el with
+  | [] -> pos, String (pos, "")
+  | [_, String (_, s)] -> pos, String (pos, s)
+  | el -> pos, String2 el
 
 and encapsed_nested start env =
-  match L.string2 env.lb with
+  let abs_start = env.lb.Lexing.lex_curr_pos in
+  (* Advance the lexer so we can get a start position that doesn't
+   * include the opening quote or the last bit of the expression or
+   * whatever. Then rewind it. *)
+  let _ = L.string2 env.file env.lb in
+  let frag_start = Pos.make env.file env.lb in
+  L.back env.lb;
+  encapsed_nested_inner start (frag_start, abs_start) env
+
+and encapsed_text env (start, abs_start) (stop, abs_stop) =
+  let len = abs_stop - abs_start in
+  if len = 0 then [] else
+    let pos = Pos.btw start stop in
+    let content = String.sub env.lb.Lexing.lex_buffer abs_start len in
+    [pos, make_string env pos content Php_escaping.unescape_double]
+
+and encapsed_nested_inner start frag env =
+  let cur_pos = Pos.make env.file env.lb, env.lb.Lexing.lex_curr_pos in
+  (* Get any literal string part that occurs before this point *)
+  let get_text () = encapsed_text env frag cur_pos in
+
+  match L.string2 env.file env.lb with
   | Tdquote ->
-      []
+      get_text ()
   | Teof ->
       error_at env start "string not properly closed";
       []
-  | Tlcb when env.mode = Ast.Mdecl ->
+  | Tlcb when env.mode = FileInfo.Mdecl ->
       encapsed_nested start env
   | Tlcb ->
-      (match L.string2 env.lb with
+      (match L.string2 env.file env.lb with
       | Tdollar ->
           error env "{ not supported";
           L.back env.lb;
@@ -2883,43 +3272,41 @@ and encapsed_nested start env =
       | Tlvar ->
           L.back env.lb;
           let error_state = !(env.errors) in
-          let e = encapsed_expr env in
-          (match L.string2 env.lb with
+          let e = expr env in
+          (match L.string2 env.file env.lb with
           | Trcb -> ()
           | _ -> error_expect env "}");
           if !(env.errors) != error_state
           then [e]
-          else e :: encapsed_nested start env
+          else get_text () @ e :: encapsed_nested start env
       | _ ->
           L.back env.lb;
-          encapsed_nested start env
+          encapsed_nested_inner start frag env
       )
-  | Trcb ->
-      encapsed_nested start env
   | Tdollar ->
-      (match L.string2 env.lb with
+      (match L.string2 env.file env.lb with
       | Tlcb ->
-          if env.mode = Ast.Mstrict
+          if env.mode = FileInfo.Mstrict
           then error env "${ not supported";
           let error_state = !(env.errors) in
-          let result = (match L.string2 env.lb with
+          let result = (match L.string2 env.file env.lb with
           | Tword ->
               (* The first token after ${ will lex as a word, but is actually
                * an lvar, so we need to fix it up. For example, "${foo}" should
                * be Lvar $foo, but will lex as Tdollar-Tlcb-Tword foo. *)
-              let pos = Pos.make env.lb in
+              let pos = Pos.make env.file env.lb in
               let lvar = pos, Lvar (pos, "$" ^ Lexing.lexeme env.lb) in
               encapsed_expr_reduce pos env lvar
           | _ ->
               error_expect env "variable";
-              Pos.make env.lb, Null) in
+              Pos.make env.file env.lb, Null) in
           expect env Trcb;
           if !(env.errors) != error_state
           then [result]
-          else result :: encapsed_nested start env
+          else get_text () @ result :: encapsed_nested start env
       | _ ->
           L.back env.lb;
-          encapsed_nested start env
+          encapsed_nested_inner start frag env
       )
   | Tlvar ->
       L.back env.lb;
@@ -2927,32 +3314,32 @@ and encapsed_nested start env =
       let e = encapsed_expr env in
       if !(env.errors) != error_state
       then [e]
-      else e :: encapsed_nested start env
-  | _ -> encapsed_nested start env
+      else get_text () @ e :: encapsed_nested start env
+  | _ -> encapsed_nested_inner start frag env
 
 and encapsed_expr env =
-  match L.string2 env.lb with
-  | Tlcb when env.mode = Ast.Mdecl ->
-      Pos.make env.lb, Null
+  match L.string2 env.file env.lb with
+  | Tlcb when env.mode = FileInfo.Mdecl ->
+      Pos.make env.file env.lb, Null
   | Tquote ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       let absolute_pos = env.lb.Lexing.lex_curr_pos in
       expr_string env pos absolute_pos
   | Tint ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       let tok_value = Lexing.lexeme env.lb in
       pos, Int (pos, tok_value)
   | Tword ->
-      let pid = Pos.make env.lb in
+      let pid = Pos.make env.file env.lb in
       let id = Lexing.lexeme env.lb in
       pid, (Id (pid, id))
   | Tlvar ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       let lvar = pos, Lvar (pos, Lexing.lexeme env.lb) in
       encapsed_expr_reduce pos env lvar
   | _ ->
       error_expect env "expression";
-      Pos.make env.lb, Null
+      Pos.make env.file env.lb, Null
 
 and encapsed_expr_reduce start env e1 =
   let e1, continue = encapsed_expr_reduce_left start env e1 in
@@ -2961,35 +3348,35 @@ and encapsed_expr_reduce start env e1 =
   else e1
 
 and encapsed_expr_reduce_left start env e1 =
-  match L.string2 env.lb with
+  match L.string2 env.file env.lb with
   | Tlb ->
       let e2 =
-        match L.string2 env.lb with
+        match L.string2 env.file env.lb with
         | Tword ->
             (* We need to special case this because any identifier
              * (including keywords) is allowed in this context.
              * For example: $x[function] is legal.
              *)
-            let pid = Pos.make env.lb in
+            let pid = Pos.make env.file env.lb in
             let id = Lexing.lexeme env.lb in
-            pid, (Id (pid, id))
+            pid, (String (pid, id))
         | _ ->
             L.back env.lb;
             expr { env with priority = 0 }
       in
-      (match L.string2 env.lb with
+      (match L.string2 env.file env.lb with
       | Trb -> ()
       | _ -> error_expect env "]"
       );
-      let pos = Pos.btw start (Pos.make env.lb) in
+      let pos = Pos.btw start (Pos.make env.file env.lb) in
       (pos, Array_get (e1, Some e2)), true
   | Tarrow ->
-      (match L.string2 env.lb with
+      (match L.string2 env.file env.lb with
       | Tword ->
           L.back env.lb;
           let e2 = encapsed_expr env in
-          let pos = Pos.btw start (Pos.make env.lb) in
-          (pos, Obj_get (e1, e2)), true
+          let pos = Pos.btw start (Pos.make env.file env.lb) in
+          (pos, Obj_get (e1, e2, OG_nullthrows)), true
       | _ ->
           L.back env.lb;
           e1, false
@@ -3011,18 +3398,18 @@ and expr_heredoc env =
   fst tag, String (fst tag, content)
 
 and heredoc_tag env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword ->
-      Pos.make env.lb, Lexing.lexeme env.lb
+      Pos.make env.file env.lb, Lexing.lexeme env.lb
   | Tquote ->
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       let abs_pos = env.lb.Lexing.lex_curr_pos in
       (match expr_string env pos abs_pos with
       | _, String x -> x
       | _ -> assert false)
   | _ ->
       error_expect env "heredoc or nowdoc identifier";
-      Pos.make env.lb, "HEREDOC"
+      Pos.make env.file env.lb, "HEREDOC"
 
 and heredoc_body (pos, tag_value as tag) env =
   match L.heredoc_token env.lb with
@@ -3071,14 +3458,14 @@ and expr_short_array env pos =
   pos, Array fields
 
 and array_field_list_remain env terminal acc =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | x when x = terminal -> List.rev acc
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let fd = array_field env in
       let acc = fd :: acc in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | x when x = terminal ->
           List.rev acc
       | Tcomma ->
@@ -3090,7 +3477,7 @@ and array_field_list_remain env terminal acc =
 and array_field env =
   let env = { env with priority = 0 } in
   let e1 = expr env in
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tsarrow ->
       let e2 = expr env in
       AFkvalue (e1, e2)
@@ -3111,13 +3498,13 @@ and shape_field_list env =
   shape_field_list_remain env
 
 and shape_field_list_remain env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Trp -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
       let fd = shape_field env in
-      match L.token env.lb with
+      match L.token env.file env.lb with
       | Trp ->
           [fd]
       | Tcomma ->
@@ -3132,13 +3519,13 @@ and shape_field env =
   let value = expr { env with priority = 0 } in
   name, value
 
- and shape_field_name env =
-   let pos, e = expr env in
-   match e with
-   | String p -> SFlit p
-   | Class_const (id, ps) -> SFclass_const (id, ps)
-   | _ -> error_expect env "string literal or class constant";
-     SFlit (pos, "")
+and shape_field_name env =
+  let pos, e = expr env in
+  match e with
+  | String p -> SFlit p
+  | Class_const (id, ps) -> SFclass_const (id, ps)
+  | _ -> error_expect env "string literal or class constant";
+    SFlit (pos, "")
 
 
 (*****************************************************************************)
@@ -3147,18 +3534,17 @@ and shape_field env =
 
 and expr_array_get env e1 =
   reduce env e1 Tlb begin fun e1 env ->
-    match L.token env.lb with
+    match L.token env.file env.lb with
     | Trb ->
-        let end_ = Pos.make env.lb in
+        let end_ = Pos.make env.file env.lb in
         Pos.btw (fst e1) end_, Array_get (e1, None)
     | _ ->
         L.back env.lb;
         let e2 = expr { env with priority = 0 } in
         expect env Trb;
-        let end_ = Pos.make env.lb in
+        let end_ = Pos.make env.file env.lb in
         Pos.btw (fst e1) end_, Array_get (e1, Some e2)
   end
-
 
 (*****************************************************************************)
 (* XHP *)
@@ -3166,44 +3552,44 @@ and expr_array_get env e1 =
 
 and is_xhp env =
   look_ahead env begin fun env ->
-    let tok = L.xhpname env.lb in
+    let tok = L.xhpname env.file env.lb in
     tok = Txhpname &&
-    let tok2 = L.xhpattr env.lb in
+    let tok2 = L.xhpattr env.file env.lb in
     tok2 = Tgt || tok2 = Tword ||
-    (tok2 = Tslash && L.xhpattr env.lb = Tgt)
+    (tok2 = Tslash && L.xhpattr env.file env.lb = Tgt)
   end
 
 and xhp env =
-  match L.xhpname env.lb with
+  match L.xhpname env.file env.lb with
   | Txhpname ->
-      let start = Pos.make env.lb in
+      let start = Pos.make env.file env.lb in
       let name = Lexing.lexeme env.lb in
       let pname = start, ":"^name in
       let attrl, closed = xhp_attributes env in
-      let end_tag = Pos.make env.lb in
+      let end_tag = Pos.make env.file env.lb in
       if closed
       then Pos.btw start end_tag, Xml (pname, attrl, [])
       else
         let tag_pos = Pos.btw start end_tag in
         let el = xhp_body tag_pos name env in
-        let end_ = Pos.make env.lb in
+        let end_ = Pos.make env.file env.lb in
         Pos.btw start end_, Xml (pname, attrl, el)
   | _ ->
       error_expect env "xhpname";
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       pos, Xml ((pos, "xhp"), [], [])
 
 and xhp_attributes env =
-  match L.xhpattr env.lb with
+  match L.xhpattr env.file env.lb with
   | Tslash ->
-      if L.xhpattr env.lb <> Tgt
+      if L.xhpattr env.file env.lb <> Tgt
       then error_expect env ">";
       [], true
   | Tgt ->
       [], false
   | Tword ->
       let error_state = !(env.errors) in
-      let attr_name = Pos.make env.lb, Lexing.lexeme env.lb in
+      let attr_name = Pos.make env.file env.lb, Lexing.lexeme env.lb in
       expect env Teq;
       let attr_value = xhp_attribute_value env in
       if !(env.errors) != error_state
@@ -3217,8 +3603,8 @@ and xhp_attributes env =
       [], true
 
 and xhp_attribute_value env =
-  match L.xhpattr env.lb with
-  | Tlcb when env.mode = Ast.Mdecl ->
+  match L.xhpattr env.file env.lb with
+  | Tlcb when env.mode = FileInfo.Mdecl ->
       ignore_body env;
       Pos.none, Null
   | Tlcb ->
@@ -3226,30 +3612,64 @@ and xhp_attribute_value env =
       expect env Trcb;
       result
   | Tdquote ->
-      let start = Pos.make env.lb in
+      let start = Pos.make env.file env.lb in
       let abs_start = env.lb.Lexing.lex_curr_pos in
       xhp_attribute_string env start abs_start
   | _ ->
       error_expect env "attribute value";
-      let pos = Pos.make env.lb in
+      let pos = Pos.make env.file env.lb in
       pos, String (pos, "")
 
 and xhp_attribute_string env start abs_start =
-  match L.string2 env.lb with
+  match L.string2 env.file env.lb with
   | Teof ->
       error_at env start "Xhp attribute not closed";
       start, String (start, "")
   | Tdquote ->
       let len = env.lb.Lexing.lex_curr_pos - abs_start - 1 in
       let content = String.sub env.lb.Lexing.lex_buffer abs_start len in
-      let pos = Pos.btw start (Pos.make env.lb) in
+      let pos = Pos.btw start (Pos.make env.file env.lb) in
       pos, String (pos, content)
   | _ ->
       xhp_attribute_string env start abs_start
 
+
 and xhp_body pos name env =
-  match L.xhptoken env.lb with
-  | Tlcb when env.mode = Ast.Mdecl ->
+  (* First grab any literal text that appears before the next
+   * bit of markup *)
+  let start = Pos.make env.file env.lb in
+  let abs_start = env.lb.Lexing.lex_curr_pos in
+  let text = xhp_text env start abs_start in
+  (* Now handle any markup *)
+  text @ xhp_body_inner pos name env
+
+(* Grab literal text that appears inside of xhp. *)
+and xhp_text env start abs_start =
+  match L.xhptoken env.file env.lb with
+  (* If we have hit something that is meaningful,
+   * we have to stop collecting literal text and go back
+   * to xhp_body. Grab any text, clean it up, and return. *)
+  | Tlcb | Tlt | Topen_xhp_comment | Teof ->
+    L.back env.lb;
+
+    let len = env.lb.Lexing.lex_curr_pos - abs_start in
+    let pos = Pos.btw start (Pos.make env.file env.lb) in
+
+    let content = String.sub env.lb.Lexing.lex_buffer abs_start len in
+    (* need to squash whitespace down to a single space *)
+    let squished = Regexp_utils.squash_whitespace content in
+    (* if it is empty or all whitespace just ignore it *)
+    if squished = "" || squished = " " then [] else
+      [pos, String (pos, squished)]
+    (* TODO: xhp can contain html/xhp entities that need to be decoded. *)
+
+  | _ -> xhp_text env start abs_start
+
+(* parses an xhp body where we know that the next token is not
+ * just more literal text *)
+and xhp_body_inner pos name env =
+  match L.xhptoken env.file env.lb with
+  | Tlcb when env.mode = FileInfo.Mdecl ->
       ignore_body env;
       xhp_body pos name env
   | Tlcb ->
@@ -3262,17 +3682,15 @@ and xhp_body pos name env =
   | Tlt ->
       if is_xhp env
       then
-        (match xhp env with
-        | (_, Xml (_, _, _)) as xml ->
-            xml :: xhp_body pos name env
-        | _ -> xhp_body pos name env)
+        let xml = xhp env in
+        xml :: xhp_body pos name env
       else
-        (match L.xhptoken env.lb with
+        (match L.xhptoken env.file env.lb with
         | Tslash ->
-            let closing_tok = L.xhpname env.lb in
+            let closing_tok = L.xhpname env.file env.lb in
             let closing_name = Lexing.lexeme env.lb in
             if closing_tok = Txhpname &&
-              (L.xhptoken env.lb = Tgt)
+              (L.xhptoken env.file env.lb = Tgt)
             then
               if closing_name = name
               then []
@@ -3280,69 +3698,84 @@ and xhp_body pos name env =
                 error_expect env name;
                 []
               end
-            else xhp_body pos name env
+            else begin
+              error_expect env "closing tag name";
+              xhp_body pos name env
+            end
         | _ ->
+            error_at env pos "Stray < in xhp";
             L.back env.lb;
             xhp_body pos name env
         )
   | Teof ->
       error_at env pos "Xhp tag not closed";
       []
-  | Tword ->
+  (* The lexer returns open comments so that we can notice them and
+   * drop them from our text fields. Parse the comment and continue. *)
+  | Topen_xhp_comment ->
+      xhp_comment env.file env.lb;
       xhp_body pos name env
-  | _ -> xhp_body pos name env
+  (* xhp_body_inner only gets called when one of the above was seen *)
+  | _ -> assert false
 
 (*****************************************************************************)
 (* Typedefs *)
 (*****************************************************************************)
 
-and typedef env =
+and typedef ~attr ~is_abstract env =
   let id = identifier env in
   let tparams = class_params env in
   let tconstraint = typedef_constraint env in
   expect env Teq;
-  let td = typedef_body env in
+  let td = hint env in
   expect env Tsc;
-  id, tparams, tconstraint, td
+  let kind = if is_abstract then NewType td else Alias td in
+  {
+    t_id = id;
+    t_tparams = tparams;
+    t_constraint = tconstraint;
+    t_kind = kind;
+    t_user_attributes = attr;
+    t_namespace = Namespace_env.empty;
+    t_mode = env.mode;
+  }
 
 and typedef_constraint env =
-  match L.token env.lb with
+  match L.token env.file env.lb with
   | Tword when Lexing.lexeme env.lb = "as" ->
       Some (hint env)
   | _ ->
       L.back env.lb;
       None
 
-and typedef_body env =
-  match L.token env.lb with
-  | Tword when Lexing.lexeme env.lb = "shape" ->
-      let pos = Pos.make env.lb in
-      pos, Hshape (typedef_shape_field_list env)
-  | _ -> L.back env.lb; hint env
+and hint_shape_field_list env shape_keyword_pos =
+  match L.token env.file env.lb with
+  | Tlp -> hint_shape_field_list_remain env
+  | _ ->
+    L.back env.lb;
+    error_at env shape_keyword_pos "\"shape\" is an invalid type; you need to \
+    declare and use a specific shape type.";
+    []
 
-and typedef_shape_field_list env =
-  expect env Tlp;
-  typedef_shape_field_list_remain env
-
-and typedef_shape_field_list_remain env =
-  match L.token env.lb with
+and hint_shape_field_list_remain env =
+  match L.token env.file env.lb with
   | Trp -> []
   | _ ->
       L.back env.lb;
       let error_state = !(env.errors) in
-      let fd = typedef_shape_field env in
-      match L.token env.lb with
+      let fd = hint_shape_field env in
+      match L.token env.file env.lb with
       | Trp ->
           [fd]
       | Tcomma ->
           if !(env.errors) != error_state
           then [fd]
-          else fd :: typedef_shape_field_list_remain env
+          else fd :: hint_shape_field_list_remain env
       | _ ->
           error_expect env ")";
           [fd]
 
-and typedef_shape_field env =
+and hint_shape_field env =
   let name = shape_field_name env in
   expect env Tsarrow;
   let ty = hint env in
@@ -3360,17 +3793,17 @@ and namespace env =
    * that we like. So every time we recurse we'll consume at least one token,
    * so we can't get stuck in an infinite loop. *)
   let tl = match env.mode with
-    | Ast.Mdecl -> ignore_toplevel ~attr:SMap.empty
+    | FileInfo.Mdecl -> ignore_toplevel ~attr:[]
     | _ -> toplevel in
   (* The name for a namespace is actually optional, so we need to check for
    * the name first. Setting the name to an empty string if there's no
    * identifier following the `namespace` token *)
-  let id = match L.token env.lb with
+  let id = match L.token env.file env.lb with
     | Tword -> L.back env.lb; identifier env
-    | _ -> L.back env.lb; Pos.make env.lb, "" in
-  match L.token env.lb with
+    | _ -> L.back env.lb; Pos.make env.file env.lb, "" in
+  match L.token env.file env.lb with
   | Tlcb ->
-      let body = tl [] env (fun x -> x = Trcb) in
+      let body = tl [] env (fun x -> x = Trcb || x = Teof) in
       expect env Trcb;
       id, body
   | Tsc when (snd id) = "" ->
@@ -3391,7 +3824,7 @@ and namespace_use_list env acc =
   let p1, s1 = identifier env in
   let id1 = p1, if s1.[0] = '\\' then s1 else "\\" ^ s1 in
   let id2 =
-    match L.token env.lb with
+    match L.token env.file env.lb with
     | Tword when Lexing.lexeme env.lb = "as" ->
         identifier env
     | _ ->
@@ -3402,7 +3835,7 @@ and namespace_use_list env acc =
         fst id1, String.sub str start len
   in
   let acc = (id1, id2) :: acc in
-  match L.token env.lb with
+  match L.token env.file env.lb with
     | Tsc -> acc
     | Tcomma -> namespace_use_list env acc
     | _ ->
@@ -3413,7 +3846,7 @@ and namespace_use_list env acc =
 (* Helper *)
 (*****************************************************************************)
 
-let from_file filename =
-  Pos.file := filename;
-  let content = try Utils.cat filename with _ -> "" in
-  program content
+let from_file file =
+  let content =
+    try Sys_utils.cat (Relative_path.to_absolute file) with _ -> "" in
+  program file content

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -35,11 +35,15 @@ using namespace HPHP;
 
 ObjectMethodExpression::ObjectMethodExpression
 (EXPRESSION_CONSTRUCTOR_PARAMETERS,
- ExpressionPtr object, ExpressionPtr method, ExpressionListPtr params)
+ ExpressionPtr object, ExpressionPtr method, ExpressionListPtr params,
+ bool nullsafe)
   : FunctionCall(
       EXPRESSION_CONSTRUCTOR_PARAMETER_VALUES(ObjectMethodExpression),
       method, "", false, params, ExpressionPtr()),
-    m_object(object), m_bindClass(true) {
+    m_object(object),
+    m_nullsafe(nullsafe),
+    m_xhpGetAttr(false),
+    m_bindClass(true) {
   m_object->setContext(Expression::ObjectContext);
   m_object->clearContext(Expression::LValue);
   m_object->clearContext(Expression::AccessContext);
@@ -64,47 +68,24 @@ void ObjectMethodExpression::analyzeProgram(AnalysisResultPtr ar) {
 
   if (ar->getPhase() == AnalysisResult::AnalyzeAll) {
     FunctionScopePtr func = m_funcScope;
-    if (!func && m_object->isThis() && !m_name.empty()) {
+    if (!func && m_object->isThis() && !m_origName.empty()) {
       ClassScopePtr cls = getClassScope();
       if (cls) {
         m_classScope = cls;
-        func = cls->findFunction(ar, m_name, true, true);
+        func = cls->findFunction(ar, m_origName, true, true);
         if (func &&
             !cls->isInterface() &&
             !(func->isVirtual() &&
               (func->isAbstract() ||
                (func->hasOverride() &&
-                cls->getAttribute(ClassScope::NotFinal))) &&
-              !func->isPerfectVirtual())) {
+                cls->getAttribute(ClassScope::NotFinal))))) {
           m_funcScope = func;
           func->addCaller(getScope());
         }
       }
     }
 
-    markRefParams(func, m_name, canInvokeFewArgs());
-  }
-
-  // This is OK because AnalyzeFinal is guaranteed to run for a CPP
-  // target, regardless of opts (and we only need the following
-  // for CPP targets)
-  if (ar->getPhase() == AnalysisResult::AnalyzeFinal) {
-    // necessary because we set the expected type of m_object to
-    // Type::Some during type inference.
-    TypePtr at(m_object->getActualType());
-    TypePtr it(m_object->getImplementedType());
-    if (!m_object->isThis() && at && at->is(Type::KindOfObject)) {
-      if (at->isSpecificObject() && it && Type::IsMappedToVariant(it)) {
-        // fast-cast inference
-        ClassScopePtr scope(ar->findClass(at->getName()));
-        if (scope) {
-          // add a dependency to m_object's class type
-          // to allow the fast cast to succeed
-          addUserClass(ar, at->getName());
-        }
-      }
-      m_object->setExpectedType(at);
-    }
+    markRefParams(func, m_origName);
   }
 }
 
@@ -121,159 +102,8 @@ void ObjectMethodExpression::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-TypePtr ObjectMethodExpression::inferTypes(AnalysisResultPtr ar,
-                                           TypePtr type, bool coerce) {
-  assert(false);
-  return TypePtr();
-}
-
-void ObjectMethodExpression::setInvokeParams(AnalysisResultPtr ar) {
-  FunctionScope::FunctionInfoPtr info;
-  if (Option::WholeProgram) {
-    info = FunctionScope::GetFunctionInfo(m_name);
-  }
-  if (!Option::WholeProgram || info || m_name.empty()) {
-    for (int i = m_params->getCount(); i--; ) {
-      if (!info || info->isRefParam(i)) {
-        m_params->markParam(i, canInvokeFewArgs());
-      }
-    }
-  }
-  // If we cannot find information of the so-named function, it might not
-  // exist, or it might go through __call(), either of which cannot have
-  // reference parameters.
-  for (int i = 0; i < m_params->getCount(); i++) {
-    (*m_params)[i]->inferAndCheck(ar, Type::Variant, false);
-  }
-}
-
 ExpressionPtr ObjectMethodExpression::preOptimize(AnalysisResultConstPtr ar) {
-  if (ar->getPhase() < AnalysisResult::FirstPreOptimize) {
-    return ExpressionPtr();
-  }
-
-  if (m_classScope && m_funcScope &&
-      (!m_funcScope->isVirtual() ||
-       (Option::WholeProgram && !m_funcScope->hasOverride()))) {
-
-    if (Option::DynamicInvokeFunctions.size()) {
-      if (Option::DynamicInvokeFunctions.find(
-            m_classScope->getName() + "::" + m_funcScope->getName()) !=
-          Option::DynamicInvokeFunctions.end()) {
-        setNoInline();
-      }
-    }
-
-    return inliner(ar, m_object, "");
-  }
-
   return ExpressionPtr();
-}
-
-TypePtr ObjectMethodExpression::inferAndCheck(AnalysisResultPtr ar,
-                                              TypePtr type, bool coerce) {
-  assert(type);
-  IMPLEMENT_INFER_AND_CHECK_ASSERT(getScope());
-  resetTypes();
-  reset();
-
-  ConstructPtr self = shared_from_this();
-  TypePtr objectType = m_object->inferAndCheck(ar, Type::Some, false);
-  m_valid = true;
-  m_bindClass = true;
-
-  if (m_name.empty()) {
-    m_nameExp->inferAndCheck(ar, Type::Some, false);
-    setInvokeParams(ar);
-    // we have to use a variant to hold dynamic value
-    return checkTypesImpl(ar, type, Type::Variant, coerce);
-  }
-
-  ClassScopePtr cls;
-  if (objectType && !objectType->getName().empty()) {
-    if (m_classScope && !strcasecmp(objectType->getName().c_str(),
-                                    m_classScope->getName().c_str())) {
-      cls = m_classScope;
-    } else {
-      cls = ar->findExactClass(shared_from_this(), objectType->getName());
-    }
-  }
-
-  if (!cls) {
-    m_classScope.reset();
-    m_funcScope.reset();
-
-    m_valid = false;
-    setInvokeParams(ar);
-    return checkTypesImpl(ar, type, Type::Variant, coerce);
-  }
-
-  if (m_classScope != cls) {
-    m_classScope = cls;
-    m_funcScope.reset();
-  }
-
-  FunctionScopePtr func = m_funcScope;
-  if (!func) {
-    func = cls->findFunction(ar, m_name, true, true);
-    if (!func) {
-      if (!cls->isTrait() &&
-          !cls->getAttribute(ClassScope::MayHaveUnknownMethodHandler) &&
-          !cls->getAttribute(ClassScope::HasUnknownMethodHandler) &&
-          !cls->getAttribute(ClassScope::InheritsUnknownMethodHandler)) {
-        if (ar->classMemberExists(m_name, AnalysisResult::MethodName)) {
-          if (!Option::AllDynamic) {
-            setDynamicByIdentifier(ar, m_name);
-          }
-        } else {
-          Compiler::Error(Compiler::UnknownObjectMethod, self);
-        }
-      }
-
-      m_valid = false;
-      setInvokeParams(ar);
-      return checkTypesImpl(ar, type, Type::Variant, coerce);
-    }
-    m_funcScope = func;
-    func->addCaller(getScope(), !type->is(Type::KindOfAny));
-  }
-
-  bool valid = true;
-  m_bindClass = func->isStatic();
-
-  // use $this inside a static function
-  if (m_object->isThis()) {
-    FunctionScopePtr localfunc = getFunctionScope();
-    if (localfunc->isStatic()) {
-      if (getScope()->isFirstPass()) {
-        Compiler::Error(Compiler::MissingObjectContext, self);
-      }
-      valid = false;
-    }
-  }
-
-  // invoke() will return Variant
-  if (cls->isInterface() ||
-      (func->isVirtual() &&
-       (!Option::WholeProgram || func->isAbstract() ||
-        (func->hasOverride() && cls->getAttribute(ClassScope::NotFinal))) &&
-       !func->isPerfectVirtual())) {
-    valid = false;
-  }
-
-  if (!valid) {
-    setInvokeParams(ar);
-    checkTypesImpl(ar, type, Type::Variant, coerce);
-    m_valid = false; // so we use invoke() syntax
-    if (!Option::AllDynamic) {
-      func->setDynamic();
-    }
-    assert(m_actualType);
-    return m_actualType;
-  }
-
-  assert(func);
-  return checkParamsAndReturn(ar, type, coerce, func, false);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -294,7 +124,7 @@ void ObjectMethodExpression::outputCodeModel(CodeGenerator &cg) {
     cg.printExpressionVector(m_params);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

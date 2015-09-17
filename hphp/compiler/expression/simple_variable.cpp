@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -82,63 +82,18 @@ void SimpleVariable::updateSymbol(SimpleVariablePtr src) {
   }
 }
 
-bool SimpleVariable::couldBeAliased() const {
-  if (m_globals || m_superGlobal) return true;
-  if (m_name == "http_response_header") return true;
-  if (m_name == "php_errormsg") return true;
-  always_assert(m_sym);
-  if (m_sym->isGlobal() || m_sym->isStatic()) return true;
-  if (getScope()->inPseudoMain() && !m_sym->isHidden()) return true;
-  if (isReferencedValid()) return isReferenced();
-  return m_sym->isReferenced();
-}
-
 bool SimpleVariable::isHidden() const {
   return m_sym && m_sym->isHidden();
 }
 
-void SimpleVariable::coalesce(SimpleVariablePtr other) {
-  always_assert(m_sym);
-  always_assert(other->m_sym);
-  if (!m_originalSym) m_originalSym = m_sym;
-  m_sym->clearUsed();
-  m_sym->clearNeeded();
-  m_sym = other->m_sym;
-  m_name = m_sym->getName();
-}
-
-/*
-  This simple variable is about to go out of scope.
-  Is it ok to kill the last assignment?
-  What if its a reference assignment (or an unset)?
-*/
-bool SimpleVariable::canKill(bool isref) const {
-  if (m_globals || m_superGlobal) return false;
-  always_assert(m_sym);
-  if (m_sym->isGlobal() || m_sym->isStatic()) {
-    return isref && !getScope()->inPseudoMain();
-  }
-
-  return
-    (isref && (m_sym->isHidden() || !getScope()->inPseudoMain())) ||
-    (isReferencedValid() ? !isReferenced() : !m_sym->isReferenced());
-}
-
 void SimpleVariable::analyzeProgram(AnalysisResultPtr ar) {
   m_superGlobal = BuiltinSymbols::IsSuperGlobal(m_name);
-  m_superGlobalType = BuiltinSymbols::GetSuperGlobalType(m_name);
 
   VariableTablePtr variables = getScope()->getVariables();
-  if (m_superGlobal) {
-    variables->setAttribute(VariableTable::NeedGlobalPointer);
-  } else if (m_name == "GLOBALS") {
+  if (m_name == "GLOBALS") {
     m_globals = true;
   } else {
     m_sym = variables->addDeclaredSymbol(m_name, shared_from_this());
-  }
-
-  if (m_name == "http_response_header" || m_name == "php_errormsg") {
-    setInited();
   }
 
   if (ar->getPhase() == AnalysisResult::AnalyzeAll) {
@@ -153,11 +108,8 @@ void SimpleVariable::analyzeProgram(AnalysisResultPtr ar) {
             hasAnyContext(RefValue | RefAssignmentLHS) ||
             m_sym->isRefClosureVar() || unset);
           if (variables->getAttribute(VariableTable::ContainsDynamicVariable)) {
-            ClassScopePtr cls = getClassScope();
-            TypePtr t = !cls || cls->isRedeclaring() ?
-              Type::Variant : Type::CreateObjectType(cls->getName());
-            variables->add(m_sym, t, true, ar, shared_from_this(),
-                           getScope()->getModifiers());
+            variables->add(m_sym, true, ar, shared_from_this(),
+                           ModifierExpressionPtr());
           }
         }
       }
@@ -196,121 +148,9 @@ void SimpleVariable::analyzeProgram(AnalysisResultPtr ar) {
   }
 }
 
-bool SimpleVariable::canonCompare(ExpressionPtr e) const {
-  return Expression::canonCompare(e) &&
-    getName() == static_cast<SimpleVariable*>(e.get())->getName();
-}
-
-TypePtr SimpleVariable::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                   bool coerce) {
-  assert(false);
-  return TypePtr();
-}
-
 bool SimpleVariable::checkUnused() const {
   return !m_superGlobal && !m_globals &&
     getScope()->getVariables()->checkUnused(m_sym);
-}
-
-static inline TypePtr GetAssertedInType(AnalysisResultPtr ar,
-                                        TypePtr assertedType,
-                                        TypePtr ret) {
-  assert(assertedType);
-  if (!ret) return assertedType;
-  TypePtr res = Type::Inferred(ar, ret, assertedType);
-  // if the asserted type and the symbol table type are compatible, then use
-  // the result of Inferred() (which is at least as strict as assertedType).
-  // otherwise, go with the asserted type
-  return res ? res : assertedType;
-}
-
-TypePtr SimpleVariable::inferAndCheck(AnalysisResultPtr ar, TypePtr type,
-                                      bool coerce) {
-  IMPLEMENT_INFER_AND_CHECK_ASSERT(getScope());
-
-  resetTypes();
-  TypePtr ret;
-  ConstructPtr construct = shared_from_this();
-  BlockScopePtr scope = getScope();
-  VariableTablePtr variables = scope->getVariables();
-
-  // check function parameter that can occur in lval context
-  if (m_sym && m_sym->isParameter() &&
-      m_context & (LValue | RefValue | DeepReference |
-                   UnsetContext | InvokeArgument | OprLValue | DeepOprLValue)) {
-    m_sym->setLvalParam();
-  }
-
-  if (coerce && m_sym && type && type->is(Type::KindOfAutoSequence)) {
-    TypePtr t = m_sym->getType();
-    if (!t || t->is(Type::KindOfVoid) ||
-        t->is(Type::KindOfSome) || t->is(Type::KindOfArray)) {
-      type = Type::Array;
-    }
-  }
-
-  if (m_this) {
-    ret = Type::Object;
-    ClassScopePtr cls = getOriginalClass();
-    if (cls && (hasContext(ObjectContext) || !cls->derivedByDynamic())) {
-      ret = Type::CreateObjectType(cls->getName());
-    }
-    if (!hasContext(ObjectContext) &&
-        variables->getAttribute(VariableTable::ContainsDynamicVariable)) {
-      if (variables->getAttribute(VariableTable::ContainsLDynamicVariable)) {
-        ret = Type::Variant;
-      }
-      ret = variables->add(m_sym, ret, true, ar,
-                           construct, scope->getModifiers());
-    }
-  } else if ((m_context & (LValue|Declaration)) &&
-             !(m_context & (ObjectContext|RefValue))) {
-    if (m_globals) {
-      ret = Type::Array;
-    } else if (m_superGlobal) {
-      ret = m_superGlobalType;
-    } else if (m_superGlobalType) { // For system
-      ret = variables->add(m_sym, m_superGlobalType,
-                           ((m_context & Declaration) != Declaration), ar,
-                           construct, scope->getModifiers());
-    } else {
-      ret = variables->add(m_sym, type,
-                           ((m_context & Declaration) != Declaration), ar,
-                           construct, scope->getModifiers());
-    }
-  } else {
-    if (m_superGlobalType) {
-      ret = m_superGlobalType;
-    } else if (m_globals) {
-      ret = Type::Array;
-    } else if (scope->is(BlockScope::ClassScope)) {
-      assert(getClassScope().get() == scope.get());
-      // ClassVariable expression will come to this block of code
-      ret = getClassScope()->checkProperty(getScope(), m_sym, type, true, ar);
-    } else {
-      TypePtr tmpType = type;
-      if (m_context & RefValue) {
-        tmpType = Type::Variant;
-        coerce = true;
-      }
-      ret = variables->checkVariable(m_sym, tmpType, coerce, ar, construct);
-      if (ret && (ret->is(Type::KindOfSome) || ret->is(Type::KindOfAny))) {
-        ret = Type::Variant;
-      }
-    }
-  }
-
-  // if m_assertedType is set, then this is a type assertion node
-  TypePtr inType = m_assertedType ?
-    GetAssertedInType(ar, m_assertedType, ret) : ret;
-  TypePtr actual = propagateTypes(ar, inType);
-  setTypes(ar, actual, type);
-  if (Type::SameType(actual, ret)) {
-    m_implementedType.reset();
-  } else {
-    m_implementedType = ret;
-  }
-  return actual;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -320,7 +160,7 @@ void SimpleVariable::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("variableName");
   cg.printValue(m_name);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

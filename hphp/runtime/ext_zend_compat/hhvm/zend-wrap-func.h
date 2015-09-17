@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -21,7 +21,6 @@
 
 #include "hphp/runtime/vm/bytecode.h"
 #include "hphp/runtime/vm/runtime.h"
-#include "hphp/runtime/base/macros.h"
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/ini-setting.h"
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-exception-store.h"
@@ -65,8 +64,11 @@ TypedValue* zend_wrap_func(ActRec* ar);
 #else
 
 namespace HPHP {
-  inline void zBoxAndProxy(TypedValue* arg) {}
-  inline void zBoxAndProxy(const TypedValue* arg) {}
+
+struct TypedValue;
+inline void zBoxAndProxy(TypedValue* arg) {}
+inline void zBoxAndProxy(const TypedValue* arg) {}
+
 }
 
 #include "hphp/runtime/vm/native.h"

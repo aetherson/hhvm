@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -83,15 +83,6 @@ void YieldExpression::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-TypePtr YieldExpression::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                    bool coerce) {
-  if (m_keyExp) {
-    m_keyExp->inferAndCheck(ar, Type::Some, false);
-  }
-  m_valExp->inferAndCheck(ar, Type::Some, false);
-  return Type::Variant;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void YieldExpression::outputCodeModel(CodeGenerator &cg) {
@@ -103,7 +94,7 @@ void YieldExpression::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("value");
   m_valExp->outputCodeModel(cg);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

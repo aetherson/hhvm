@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,7 +16,6 @@
 
 #include "hphp/runtime/vm/verifier/cfg.h"
 #include "hphp/runtime/vm/verifier/util.h"
-#include "hphp/util/range.h"
 
 namespace HPHP {
 namespace Verifier {
@@ -45,8 +44,7 @@ void GraphBuilder::createBlocks() {
   // DV entry points
   m_graph->entries = new (m_arena) Block*[m_graph->param_count + 1];
   int dv_index = 0;
-  for (Range<Func::ParamInfoVec> p(m_func->params()); !p.empty(); ) {
-    const Func::ParamInfo& param = p.popFront();
+  for (auto& param : m_func->params()) {
     m_graph->entries[dv_index++] = !param.hasDefaultValue() ? 0 :
                                    createBlock(param.funcletOff);
   }
@@ -56,13 +54,11 @@ void GraphBuilder::createBlocks() {
   // ordinary basic block boundaries
   for (InstrRange i = funcInstrs(m_func); !i.empty(); ) {
     PC pc = i.popFront();
-    if (isCF(pc) && !i.empty()) createBlock(i.front());
-    if (isSwitch(*reinterpret_cast<const Op*>(pc))) {
-      foreachSwitchTarget(reinterpret_cast<const Op*>(pc), [&](Offset& o) {
-        createBlock(pc + o);
-      });
+    if ((isCF(pc) || isTF(pc)) && !i.empty()) createBlock(i.front());
+    if (isSwitch(peek_op(pc))) {
+      foreachSwitchTarget(pc, [&](Offset o) { createBlock(pc + o); });
     } else {
-      Offset target = instrJumpTarget((Op*)bc, pc - bc);
+      Offset target = instrJumpTarget(bc, pc - bc);
       if (target != InvalidAbsoluteOffset) createBlock(target);
     }
   }
@@ -80,13 +76,13 @@ void GraphBuilder::linkBlocks() {
     PC pc = i.popFront();
     block->last = pc;
     if (isCF(pc)) {
-      if (isSwitch(*reinterpret_cast<const Op*>(pc))) {
+      if (isSwitch(peek_op(pc))) {
         int i = 0;
-        foreachSwitchTarget((Op*)pc, [&](Offset& o) {
+        foreachSwitchTarget(pc, [&](Offset o) {
           succs(block)[i++] = at(pc + o);
         });
       } else {
-        Offset target = instrJumpTarget((Op*)bc, pc - bc);
+        Offset target = instrJumpTarget(bc, pc - bc);
         if (target != InvalidAbsoluteOffset) {
           assert(numSuccBlocks(block) > 0);
           succs(block)[numSuccBlocks(block) - 1] = at(target);
@@ -116,16 +112,15 @@ void GraphBuilder::linkBlocks() {
  */
 void GraphBuilder::createExBlocks() {
   m_graph->exn_cap = m_func->ehtab().size();
-  for (Range<Func::EHEntVec> i(m_func->ehtab()); !i.empty(); ) {
-    const EHEnt& handler = i.popFront();
+  for (auto& handler : m_func->ehtab()) {
     createBlock(handler.m_base);
     if (handler.m_past != m_func->past()) {
       createBlock(handler.m_past);
     }
     if (handler.m_type == EHEnt::Type::Catch) {
       m_graph->exn_cap += handler.m_catches.size() - 1;
-      for (Range<EHEnt::CatchVec> c(handler.m_catches); !c.empty(); ) {
-        createBlock(c.popFront().second);
+      for (auto const& c : handler.m_catches) {
+        createBlock(c.second);
       }
     } else {
       createBlock(handler.m_fault);
@@ -140,11 +135,10 @@ void GraphBuilder::createExBlocks() {
  */
 const EHEnt* findFunclet(const Func::EHEntVec& ehtab, Offset off) {
   const EHEnt* nearest = 0;
-  for (Range<Func::EHEntVec> i(ehtab); !i.empty(); ) {
-    const EHEnt* eh = &i.popFront();
-    if (eh->m_type != EHEnt::Type::Fault) continue;
-    if (eh->m_fault <= off && (!nearest || eh->m_fault > nearest->m_fault)) {
-      nearest = eh;
+  for (auto& eh : ehtab) {
+    if (eh.m_type != EHEnt::Type::Fault) continue;
+    if (eh.m_fault <= off && (!nearest || eh.m_fault > nearest->m_fault)) {
+      nearest = &eh;
     }
   }
   assert(nearest != 0 && nearest->m_fault <= off);
@@ -184,8 +178,8 @@ void GraphBuilder::linkExBlocks() {
       assert(eh->m_base <= off && off < eh->m_past);
       if (eh->m_type == EHEnt::Type::Catch) {
         // each catch block is reachable from b
-        for (Range<EHEnt::CatchVec> j(eh->m_catches); !j.empty(); ) {
-          exns(b)[exn_index++] = at(j.popFront().second);
+        for (auto const& j : eh->m_catches) {
+          exns(b)[exn_index++] = at(j.second);
         }
         eh = nextOuter(ehtab, eh);
       } else {
@@ -194,7 +188,7 @@ void GraphBuilder::linkExBlocks() {
         break;
       }
     }
-    if (Op(*b->last) == OpUnwind) {
+    if (peek_op(b->last) == OpUnwind) {
       // We're in a fault funclet.  Find which one, then add edges
       // to reachable catches and the enclosing fault funclet, if any.
       const EHEnt* eh = findFunclet(ehtab, offset(b->last));
@@ -202,8 +196,8 @@ void GraphBuilder::linkExBlocks() {
       while (eh) {
         if (eh->m_type == EHEnt::Type::Catch) {
           // each catch target for eh is reachable from b
-          for (Range<EHEnt::CatchVec> j(eh->m_catches); !j.empty(); ) {
-            exns(b)[exn_index++] = at(j.popFront().second);
+          for (auto const& j : eh->m_catches) {
+            exns(b)[exn_index++] = at(j.second);
           }
           eh = nextOuter(ehtab, eh);
         } else {

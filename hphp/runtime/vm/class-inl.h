@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,9 @@
 #ifndef incl_HPHP_VM_CLASS_INL_H_
 #error "class-inl.h should only be included by class.h"
 #endif
+
+#include "hphp/runtime/base/runtime-error.h"
+#include "hphp/runtime/base/strings.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -53,18 +56,26 @@ inline const TypedValueAux& Class::PropInitVec::operator[](size_t i) const {
 ///////////////////////////////////////////////////////////////////////////////
 // Pre- and post-allocations.
 
-inline const LowClassPtr* Class::classVec() const {
+inline const LowPtr<Class>* Class::classVec() const {
   return m_classVec;
 }
 
-inline unsigned Class::classVecLen() const {
+inline Class::veclen_t Class::classVecLen() const {
   return m_classVecLen;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Ancestry.
 
-inline uint64_t Class::classof(const Class* cls) const {
+inline bool Class::classofNonIFace(const Class* cls) const {
+  assert(!(cls->attrs() & AttrInterface));
+  if (m_classVecLen >= cls->m_classVecLen) {
+    return (m_classVec[cls->m_classVecLen-1] == cls);
+  }
+  return false;
+}
+
+inline bool Class::classof(const Class* cls) const {
   // If `cls' is an interface, we can simply check to see if cls is in
   // this->m_interfaces.  Otherwise, if `this' is not an interface, the
   // classVec check will determine whether it's an instance of cls (including
@@ -77,10 +88,7 @@ inline uint64_t Class::classof(const Class* cls) const {
     return this == cls ||
       m_interfaces.lookupDefault(cls->m_preClass->name(), nullptr) == cls;
   }
-  if (m_classVecLen >= cls->m_classVecLen) {
-    return (m_classVec[cls->m_classVecLen-1] == cls);
-  }
-  return false;
+  return classofNonIFace(cls);
 }
 
 inline bool Class::ifaceofDirect(const StringData* name) const {
@@ -146,19 +154,19 @@ inline bool Class::isBuiltin() const {
 }
 
 inline const ClassInfo* Class::clsInfo() const {
-  return m_clsInfo;
+  return m_extra->m_clsInfo;
 }
 
 inline BuiltinCtorFunction Class::instanceCtor() const {
-  return m_instanceCtor;
+  return m_extra->m_instanceCtor;
 }
 
 inline BuiltinDtorFunction Class::instanceDtor() const {
-  return m_instanceDtor;
+  return m_extra->m_instanceDtor;
 }
 
 inline int32_t Class::builtinODTailSize() const {
-  return m_builtinODTailSize;
+  return m_extra->m_builtinODTailSize;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -169,12 +177,12 @@ inline size_t Class::numMethods() const {
 }
 
 inline Func* Class::getMethod(Slot idx) const {
-  Func** funcVec = (Func**)this;
+  auto funcVec = (LowPtr<Func>*)this;
   return funcVec[-((int32_t)idx + 1)];
 }
 
 inline void Class::setMethod(Slot idx, Func* func) {
-  Func** funcVec = (Func**)this;
+  auto funcVec = (LowPtr<Func>*)this;
   funcVec[-((int32_t)idx + 1)] = func;
 }
 
@@ -216,11 +224,11 @@ inline Slot Class::lookupSProp(const StringData* sPropName) const {
 }
 
 inline RepoAuthType Class::declPropRepoAuthType(Slot index) const {
-  return m_declProperties[index].m_repoAuthType;
+  return m_declProperties[index].repoAuthType;
 }
 
 inline RepoAuthType Class::staticPropRepoAuthType(Slot index) const {
-  return m_staticProperties[index].m_repoAuthType;
+  return m_staticProperties[index].repoAuthType;
 }
 
 inline bool Class::hasDeepInitProps() const {
@@ -238,7 +246,7 @@ inline const Class::PropInitVec& Class::declPropInit() const {
   return m_declPropInit;
 }
 
-inline const std::vector<const Func*>& Class::pinitVec() const {
+inline const FixedVector<const Func*>& Class::pinitVec() const {
   return m_pinitVec;
 }
 
@@ -249,15 +257,15 @@ inline void Class::initPropHandle() const {
   m_propDataCache.bind();
 }
 
-inline RDS::Handle Class::propHandle() const {
+inline rds::Handle Class::propHandle() const {
   return m_propDataCache.handle();
 }
 
-inline RDS::Handle Class::sPropInitHandle() const {
+inline rds::Handle Class::sPropInitHandle() const {
   return m_sPropCacheInit.handle();
 }
 
-inline RDS::Handle Class::sPropHandle(Slot index) const {
+inline rds::Handle Class::sPropHandle(Slot index) const {
   assert(m_sPropCacheInit.bound());
   assert(numStaticProperties() > index);
   return m_sPropCache[index].handle();
@@ -275,14 +283,26 @@ inline const Class::Const* Class::constants() const {
 }
 
 inline bool Class::hasConstant(const StringData* clsCnsName) const {
-  return m_constants.contains(clsCnsName);
+  // m_constants.contains(clsCnsName) returns abstract constants
+  auto clsCnsInd = m_constants.findIndex(clsCnsName);
+  return (clsCnsInd != kInvalidSlot) &&
+    !m_constants[clsCnsInd].isAbstract() &&
+    !m_constants[clsCnsInd].isType();
+}
+
+inline bool Class::hasTypeConstant(const StringData* typeConstName,
+                                   bool includeAbs) const {
+  auto typeConstInd = m_constants.findIndex(typeConstName);
+  return (typeConstInd != kInvalidSlot) &&
+    (!m_constants[typeConstInd].isAbstract() || includeAbs) &&
+    m_constants[typeConstInd].isType();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Interfaces and traits.
 
-inline boost::iterator_range<const ClassPtr*> Class::declInterfaces() const {
-  return boost::make_iterator_range(
+inline folly::Range<const ClassPtr*> Class::declInterfaces() const {
+  return folly::range(
     m_declInterfaces.get(),
     m_declInterfaces.get() + m_numDeclInterfaces
   );
@@ -293,15 +313,19 @@ inline const Class::InterfaceMap& Class::allInterfaces() const {
 }
 
 inline Slot Class::traitsBeginIdx() const {
-  return m_traitsBeginIdx;
+  return m_extra->m_traitsBeginIdx;
 }
 
 inline Slot Class::traitsEndIdx() const   {
-  return m_traitsEndIdx;
+  return m_extra->m_traitsEndIdx;
 }
 
 inline const std::vector<ClassPtr>& Class::usedTraitClasses() const {
-  return m_usedTraits;
+  return m_extra->m_usedTraits;
+}
+
+inline const Class::TraitAliasVec& Class::traitAliases() const {
+  return m_extra->m_traitAliases;
 }
 
 inline const Class::RequirementMap& Class::allRequirements() const {
@@ -316,13 +340,13 @@ inline bool Class::callsCustomInstanceInit() const {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Other methods.
+// JIT data.
 
-inline RDS::Handle Class::classHandle() const {
+inline rds::Handle Class::classHandle() const {
   return m_cachedClass.handle();
 }
 
-inline void Class::setClassHandle(RDS::Link<Class*> link) const {
+inline void Class::setClassHandle(rds::Link<Class*> link) const {
   assert(!m_cachedClass.bound());
   m_cachedClass = link;
 }
@@ -335,15 +359,136 @@ inline void Class::setCached() {
   *m_cachedClass = this;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// Native data.
+
 inline const Native::NativeDataInfo* Class::getNativeDataInfo() const {
-  return m_nativeDataInfo;
+  return m_extra->m_nativeDataInfo;
 }
 
-inline DataType Class::enumBaseTy() const {
+///////////////////////////////////////////////////////////////////////////////
+// Closure subclasses.
+
+inline bool Class::isScopedClosure() const {
+  return m_scoped;
+}
+
+inline const Class::ScopedClonesMap& Class::scopedClones() const {
+  return m_extra->m_scopedClones;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Other methods.
+
+inline MaybeDataType Class::enumBaseTy() const {
   return m_enumBaseTy;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// ExtraData.
+
+inline void Class::allocExtraData() {
+  if (!m_extra) {
+    m_extra = new ExtraData();
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Trait method import.
+
+inline bool Class::TMIOps::strEmpty(const StringData* str) {
+  return str->empty();
+}
+
+inline const StringData* Class::TMIOps::clsName(const Class* traitCls) {
+  return traitCls->name();
+}
+
+inline bool Class::TMIOps::isTrait(const Class* traitCls) {
+  return traitCls->attrs() & AttrTrait;
+}
+
+inline bool Class::TMIOps::isAbstract(Attr modifiers) {
+  return modifiers & AttrAbstract;
+}
+
+inline Class::TraitMethod
+Class::TMIOps::traitMethod(const Class* traitCls,
+                           const Func* traitMeth,
+                           Class::TMIOps::alias_type rule) {
+  return TraitMethod { traitCls, traitMeth, rule.modifiers() };
+}
+
+inline const StringData*
+Class::TMIOps::precMethodName(Class::TMIOps::prec_type rule) {
+  return rule.methodName();
+}
+
+inline const StringData*
+Class::TMIOps::precSelectedTraitName(Class::TMIOps::prec_type rule) {
+  return rule.selectedTraitName();
+}
+
+inline TraitNameSet
+Class::TMIOps::precOtherTraitNames(Class::TMIOps::prec_type rule) {
+  return rule.otherTraitNames();
+}
+
+inline const StringData*
+Class::TMIOps::aliasTraitName(Class::TMIOps::alias_type rule) {
+  return rule.traitName();
+}
+
+inline const StringData*
+Class::TMIOps::aliasOrigMethodName(Class::TMIOps::alias_type rule) {
+  return rule.origMethodName();
+}
+
+inline const StringData*
+Class::TMIOps::aliasNewMethodName(Class::TMIOps::alias_type rule) {
+  return rule.newMethodName();
+}
+
+inline Attr
+Class::TMIOps::aliasModifiers(Class::TMIOps::alias_type rule) {
+  return rule.modifiers();
+}
+
+inline const Func*
+Class::TMIOps::findTraitMethod(const Class* cls,
+                               const Class* traitCls,
+                               const StringData* origMethName) {
+  return traitCls->lookupMethod(origMethName);
+}
+
+inline void
+Class::TMIOps::errorUnknownMethod(Class::TMIOps::prec_type rule) {
+  raise_error("unknown method '%s'", rule.methodName()->data());
+}
+
+inline void
+Class::TMIOps::errorUnknownMethod(Class::TMIOps::alias_type rule,
+                                  const StringData* methName) {
+  raise_error(Strings::TRAITS_UNKNOWN_TRAIT_METHOD, methName->data());
+}
+
+template <class Rule>
+inline void
+Class::TMIOps::errorUnknownTrait(const Rule& rule,
+                                 const StringData* traitName) {
+  raise_error(Strings::TRAITS_UNKNOWN_TRAIT, traitName->data());
+}
+
+inline void
+Class::TMIOps::errorDuplicateMethod(const Class* cls,
+                                    const StringData* methName) {
+  // No error if the class will override the method.
+  if (cls->preClass()->hasMethod(methName)) return;
+  raise_error(Strings::METHOD_IN_MULTIPLE_TRAITS, methName->data());
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Non-member functions.
 
 inline Attr classKindAsAttr(ClassKind kind) {
   return static_cast<Attr>(kind);
@@ -361,7 +506,7 @@ inline bool isInterface(const Class* cls) {
   return cls->attrs() & AttrInterface;
 }
 
-inline bool isNormalClass(const Class* cls ) {
+inline bool isNormalClass(const Class* cls) {
   return !(cls->attrs() & (AttrTrait | AttrInterface | AttrEnum));
 }
 
@@ -370,7 +515,7 @@ inline bool isAbstract(const Class* cls) {
 }
 
 inline bool classHasPersistentRDS(const Class* cls) {
-  return cls && RDS::isPersistentHandle(cls->classHandle());
+  return cls && rds::isPersistentHandle(cls->classHandle());
 }
 
 ///////////////////////////////////////////////////////////////////////////////

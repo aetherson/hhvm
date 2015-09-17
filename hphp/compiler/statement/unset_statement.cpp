@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -85,15 +85,6 @@ StatementPtr UnsetStatement::preOptimize(AnalysisResultConstPtr ar) {
   return StatementPtr();
 }
 
-StatementPtr UnsetStatement::postOptimize(AnalysisResultConstPtr ar) {
-  if (m_exp->getCount() == 0) return NULL_STATEMENT();
-  return StatementPtr();
-}
-
-void UnsetStatement::inferTypes(AnalysisResultPtr ar) {
-  m_exp->inferAndCheck(ar, Type::Variant, true);
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void UnsetStatement::outputCodeModel(CodeGenerator &cg) {
@@ -101,7 +92,7 @@ void UnsetStatement::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("expressions");
   cg.printExpressionVector(m_exp);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

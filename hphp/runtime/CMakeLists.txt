@@ -2,34 +2,51 @@ set(RECURSIVE_SOURCE_SUBDIRS base debugger eval server vm)
 foreach (dir ${RECURSIVE_SOURCE_SUBDIRS})
   HHVM_SELECT_SOURCES("${CMAKE_CURRENT_SOURCE_DIR}/${dir}")
 endforeach(dir ${RECURSIVE_SOURCE_SUBDIRS})
+list(APPEND HEADER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/version.h")
 
 if(NOT LINUX)
-  add_definitions(-DNO_HARDWARE_COUNTERS)
   list(REMOVE_ITEM CXX_SOURCES
        ${CMAKE_CURRENT_SOURCE_DIR}/vm/debug/elfwriter.cpp)
+  list(REMOVE_ITEM HEADER_SOURCES
+       ${CMAKE_CURRENT_SOURCE_DIR}/vm/debug/elfwriter.h)
 endif()
 
 if(NOT ENABLE_FASTCGI)
-  foreach (file ${CXX_SOURCES})
-    if (${file} MATCHES "/fastcgi/")
-      list(REMOVE_ITEM CXX_SOURCES ${file})
-    endif()
-  endforeach(file ${CXX_SOURCES})
+  HHVM_REMOVE_MATCHES_FROM_LISTS(CXX_SOURCES HEADER_SOURCES
+    MATCHES "/fastcgi/")
+endif()
+
+if(NOT ENABLE_PROXYGEN_SERVER)
+  HHVM_REMOVE_MATCHES_FROM_LISTS(CXX_SOURCES HEADER_SOURCES
+    MATCHES "/proxygen/")
 endif()
 
 if(NOT HAVE_CUSTOM_LIBEVENT)
-  # Not working with off-the-shelf libevent
-  list(REMOVE_ITEM CXX_SOURCES
-       "${CMAKE_CURRENT_SOURCE_DIR}/server/server-name-indication.cpp")
-  foreach (file ${CXX_SOURCES})
-    if(${file} MATCHES "/server/libevent-")
-      list(REMOVE_ITEM CXX_SOURCES ${file})
-    endif()
-  endforeach(file ${CXX_SOURES})
+  HHVM_REMOVE_MATCHES_FROM_LISTS(CXX_SOURCES HEADER_SOURCES
+    MATCHES "/server/libevent-")
 endif()
 
+add_custom_command(
+  OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/ir-opcode-generated.h"
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/../doc/generate-ir-opcodes.sh"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../doc/ir.specification"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../doc/generate-ir-opcodes.pl"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../doc/generate-ir-opcodes.sh"
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  COMMENT "Generating HHIR opcode table"
+  VERBATIM)
+
+add_precompiled_header(
+  "${HPHP_HOME}/hphp/pch/hphp_runtime_static.h"
+  "${HPHP_HOME}/hphp/pch/hphp_runtime_static.cpp"
+  CXX_SOURCES
+)
+
 ADD_LIBRARY(hphp_runtime_static STATIC
-            ${CXX_SOURCES} ${C_SOURCES} ${ASM_SOURCES})
+            ${CXX_SOURCES} ${C_SOURCES} ${ASM_SOURCES} ${HEADER_SOURCES}
+            "ir-opcode-generated.h")
+auto_source_group("hphp_runtime_static" "${CMAKE_CURRENT_SOURCE_DIR}"
+  ${ASM_SOURCES} ${C_SOURCES} ${CXX_SOURCES} ${HEADER_SOURCES})
 SET_TARGET_PROPERTIES(hphp_runtime_static PROPERTIES OUTPUT_NAME "hphp_runtime")
 SET_TARGET_PROPERTIES(hphp_runtime_static PROPERTIES PREFIX "lib")
 SET_TARGET_PROPERTIES(hphp_runtime_static PROPERTIES CLEAN_DIRECT_OUTPUT 1)
@@ -48,3 +65,9 @@ if(CYGWIN AND CMAKE_BUILD_TYPE MATCHES "Debug")
     ${CMAKE_CURRENT_SOURCE_DIR}/vm/jit/hhbc-translator.cpp
     PROPERTIES COMPILE_FLAGS -Og)
 endif()
+
+set(EZC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/ext_zend_compat/")
+include_directories("${EZC_DIR}/php-src")
+include_directories("${EZC_DIR}/php-src/main")
+include_directories("${EZC_DIR}/php-src/Zend")
+include_directories("${EZC_DIR}/php-src/TSRM")

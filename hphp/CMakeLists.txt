@@ -61,10 +61,23 @@ if (ENABLE_COTIRE)
       "${CMAKE_BINARY_DIR}")
 endif()
 
+# Only thing to do directly in tools is install this one script. Tools also has
+# its own Makefile, so just do it here instead of dealing with moving that all
+# around.
+install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/tools/oss-repo-mode
+  RENAME hhvm-repo-mode
+  DESTINATION bin
+  COMPONENT dev)
+
 add_definitions("-DHHVM")
 add_definitions("-DUSE_CMAKE")
 
+enable_language(ASM)
+
 add_subdirectory(tools/bootstrap)
+add_subdirectory(tools/hfsort)
+add_subdirectory(tools/version)
+add_subdirectory(tools/tc-print)
 
 add_subdirectory(compiler)
 add_subdirectory(hack)
@@ -89,6 +102,8 @@ option(TEST_BIN "Create the HHVM test binary" OFF)
 if (TEST_BIN)
   add_subdirectory(test)
 endif ()
+
+add_subdirectory(tools/gdb)
 
 # Keep this last
 add_subdirectory(tools/hphpize)

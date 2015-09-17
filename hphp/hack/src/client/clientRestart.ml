@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,15 +8,10 @@
  *
  *)
 
-type env = {
-  root: Path.path;
-  wait: bool;
-}
-
 let main env =
-  if ClientUtils.server_exists env.root
-  then begin
-    HackClientStop.kill_server env.root;
-    ClientStart.start_server ~wait:env.wait env.root
-  end else Printf.fprintf stderr "Error: no server to restart for %s\n%!"
-    (Path.string_of_path env.root)
+  if ClientConnectSimple.server_exists env.ClientStart.root
+  then ClientStop.kill_server env.ClientStart.root
+  else Printf.eprintf "Warning: no server to restart for %s\n%!"
+    (Path.to_string env.ClientStart.root);
+  ClientStart.start_server env;
+  Exit_status.Ok

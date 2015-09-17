@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -15,13 +15,18 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/ext/extension.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/runtime-error.h"
 #include "hphp/runtime/base/string-buffer.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/zend-functions.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/request-event-handler.h"
+
+#include <boost/algorithm/string/predicate.hpp>
 
 #define ICONV_SUPPORTS_ERRNO 1
 #include <iconv.h>
@@ -69,39 +74,50 @@ typedef enum _php_iconv_err_t {
   PHP_ICONV_ERR_ALLOC             = 8
 } php_iconv_err_t;
 
-static void _php_iconv_show_error(php_iconv_err_t err, const char *out_charset,
+static void _php_iconv_show_error(const char *func, php_iconv_err_t &err,
+                                  const char *out_charset,
                                   const char *in_charset) {
+  if (!strncmp(func, "libiconv", 8)) func += 3;
   switch (err) {
   case PHP_ICONV_ERR_SUCCESS:
     break;
   case PHP_ICONV_ERR_CONVERTER:
-    raise_warning("iconv: Cannot open converter");
+    raise_notice("%s(): Cannot open converter", func);
     break;
   case PHP_ICONV_ERR_WRONG_CHARSET:
-    raise_warning("iconv: Wrong charset, "
+    raise_notice("%s(): Wrong charset, "
                   "conversion from `%s' to `%s' is not allowed",
-                  in_charset, out_charset);
+                  func, in_charset, out_charset);
     break;
   case PHP_ICONV_ERR_ILLEGAL_CHAR:
-    raise_notice("iconv: Detected an incomplete multibyte character "
-                    "in input string");
+    raise_notice("%s(): Detected an incomplete multibyte character "
+                  "in input string", func);
     break;
   case PHP_ICONV_ERR_ILLEGAL_SEQ:
-    raise_notice("iconv: Detected an illegal character in input string");
+    if (RuntimeOption::IconvIgnoreCorrect == HackStrictOption::ON) {
+      if (boost::ends_with(out_charset, "//IGNORE")) {
+        err = PHP_ICONV_ERR_SUCCESS;
+        break;
+      }
+    }
+    raise_notice("%s(): Detected an illegal character in input string",
+                  func);
     break;
   case PHP_ICONV_ERR_TOO_BIG:
     // should not happen
-    raise_warning("iconv: Buffer length exceeded");
+    raise_warning("%s(): Buffer length exceeded", func);
     break;
   case PHP_ICONV_ERR_MALFORMED:
-    raise_notice("iconv: Malformed string");
+    raise_warning("%s(): Malformed string", func);
     break;
   default:
     // other error
-    raise_notice("iconv: Unknown error (%d)", errno);
+    raise_notice("%s(): Unknown error (%d)", func, errno);
     break;
   }
 }
+
+const StaticString s_ISO_8859_1("ISO-8859-1");
 
 struct ICONVGlobals final : RequestEventHandler {
   String input_encoding;
@@ -110,10 +126,16 @@ struct ICONVGlobals final : RequestEventHandler {
 
   ICONVGlobals() {}
 
+  void vscan(IMarker& mark) const override {
+    mark(input_encoding);
+    mark(output_encoding);
+    mark(internal_encoding);
+  }
+
   void requestInit() override {
-    input_encoding = "ISO-8859-1";
-    output_encoding = "ISO-8859-1";
-    internal_encoding = "ISO-8859-1";
+    input_encoding = s_ISO_8859_1;
+    output_encoding = s_ISO_8859_1;
+    internal_encoding = s_ISO_8859_1;
   }
 
   void requestShutdown() override {
@@ -127,6 +149,61 @@ IMPLEMENT_STATIC_REQUEST_LOCAL(ICONVGlobals, s_iconv_globals);
 
 ///////////////////////////////////////////////////////////////////////////////
 // helpers
+
+namespace {
+
+/*
+ * input string is in the form
+ *    charset//options
+ * where the //options part is optional.
+ *
+ * we've already checked that charset needs to be replaced by rep,
+ * so now check if we can just return rep as is, or if we need to
+ * graft the options back onto it.
+ */
+const char* munge_one(const char* chs, char** tofree,
+                      const char* rep, size_t replen, size_t len) {
+  if (!chs[len]) return rep;
+  if (chs[len] != '/' || chs[len + 1] != '/') return chs;
+  auto chslen = strlen(chs);
+  *tofree = static_cast<char*>(malloc(replen + chslen - len + 1));
+  memcpy(*tofree, rep, replen);
+  memcpy(*tofree + replen, chs + len, chslen - len + 1);
+  return *tofree;
+}
+
+/*
+ * libiconv disagrees with glibc iconv on some charsets. Performing
+ * these substitutions gets libiconv closer to the glibc behavior.
+ * Its not clear that glibc's behavior is better (in fact for uCs-2
+ * its definitely worse); but it avoids unexpected changes in
+ * behavior.
+ */
+const char* munge_charset(const char* chs, char** tofree) {
+#define MUNGE_ONE(name, repl) do {                                      \
+  if (!strncasecmp(name, chs, strlen(name))) {                          \
+    return munge_one(chs, tofree, repl, strlen(repl), strlen(name));    \
+  } } while (0)
+
+  MUNGE_ONE("BIG5", "CP950");
+  MUNGE_ONE("uCs-2", "uCs-2le");
+  MUNGE_ONE("Unicode", "UTF-16");
+#undef MUNGE_ONE
+  return chs;
+}
+
+iconv_t iconv_open_helper(const char* out, const char* in) {
+  char* tofree1 = nullptr;
+  in = munge_charset(in, &tofree1);
+  char* tofree2 = nullptr;
+  out = munge_charset(out, &tofree2);
+  auto ret = iconv_open(out, in);
+  free(tofree1);
+  free(tofree2);
+  return ret;
+}
+
+}
 
 #ifndef ICONV_CSNMAXLEN
 #define ICONV_CSNMAXLEN 64
@@ -244,7 +321,7 @@ static php_iconv_err_t php_iconv_string(const char *in_p, size_t in_len,
 
   in_size = in_len;
 
-  cd = iconv_open(out_charset, in_charset);
+  cd = iconv_open_helper(out_charset, in_charset);
 
   if (cd == (iconv_t)(-1)) {
     return PHP_ICONV_ERR_UNKNOWN;
@@ -286,11 +363,13 @@ static php_iconv_err_t php_iconv_string(const char *in_p, size_t in_len,
   char *out_p, *out_buf, *tmp_buf;
   size_t bsz, result = 0;
   php_iconv_err_t retval = PHP_ICONV_ERR_SUCCESS;
+  int ignore_ilseq = boost::ends_with(out_charset, "//IGNORE") ||
+                     boost::ends_with(out_charset, "//IGNORE//TRANSLIT");
 
   *out = NULL;
   *out_len = 0;
 
-  cd = iconv_open(out_charset, in_charset);
+  cd = iconv_open_helper(out_charset, in_charset);
 
   if (cd == (iconv_t)(-1)) {
     if (errno == EINVAL) {
@@ -310,6 +389,16 @@ static php_iconv_err_t php_iconv_string(const char *in_p, size_t in_len,
     result = iconv(cd, (ICONV_CONST char **)&in_p, &in_left, (char **)&out_p, &out_left);
     out_size = bsz - out_left;
     if (result == (size_t)(-1)) {
+      if (ignore_ilseq && errno == EILSEQ) {
+        if (in_left <= 1) {
+          result = 0;
+        } else {
+          errno = 0;
+          in_p++;
+          in_left--;
+          continue;
+        }
+      }
       if (errno == E2BIG && in_left > 0) {
         // converted string is longer than out buffer
         bsz += in_len;
@@ -385,7 +474,7 @@ static php_iconv_err_t _php_iconv_strlen(unsigned int *pretval,
 
   *pretval = (unsigned int)-1;
 
-  cd = iconv_open(GENERIC_SUPERSET_NAME, enc);
+  cd = iconv_open_helper(GENERIC_SUPERSET_NAME, enc);
   if (cd == (iconv_t)(-1)) {
 #if ICONV_SUPPORTS_ERRNO
     if (errno == EINVAL) {
@@ -487,7 +576,7 @@ static php_iconv_err_t _php_iconv_substr(StringBuffer &pretval,
     return PHP_ICONV_ERR_SUCCESS;
   }
 
-  cd1 = iconv_open(GENERIC_SUPERSET_NAME, enc);
+  cd1 = iconv_open_helper(GENERIC_SUPERSET_NAME, enc);
 
   if (cd1 == (iconv_t)(-1)) {
 #if ICONV_SUPPORTS_ERRNO
@@ -520,7 +609,7 @@ static php_iconv_err_t _php_iconv_substr(StringBuffer &pretval,
 
     if (cnt >= (unsigned int)offset) {
       if (cd2 == (iconv_t)NULL) {
-        cd2 = iconv_open(enc, GENERIC_SUPERSET_NAME);
+        cd2 = iconv_open_helper(enc, GENERIC_SUPERSET_NAME);
 
         if (cd2 == (iconv_t)(-1)) {
           cd2 = (iconv_t)NULL;
@@ -617,7 +706,7 @@ static php_iconv_err_t _php_iconv_strpos(unsigned int *pretval,
     return err;
   }
 
-  cd = iconv_open(GENERIC_SUPERSET_NAME, enc);
+  cd = iconv_open_helper(GENERIC_SUPERSET_NAME, enc);
 
   if (cd == (iconv_t)(-1)) {
     if (ndl_buf != NULL) {
@@ -782,7 +871,7 @@ static php_iconv_err_t _php_iconv_mime_decode(StringBuffer &retval,
   if (next_pos != NULL) {
     *next_pos = NULL;
   }
-  cd_pl = iconv_open(enc, "ASCII");
+  cd_pl = iconv_open_helper(enc, "ASCII");
 
   if (cd_pl == (iconv_t)(-1)) {
 #if ICONV_SUPPORTS_ERRNO
@@ -898,21 +987,28 @@ static php_iconv_err_t _php_iconv_mime_decode(StringBuffer &retval,
           iconv_close(cd);
         }
 
-        cd = iconv_open(enc, tmpbuf);
+        cd = iconv_open_helper(enc, tmpbuf);
 
         if (cd == (iconv_t)(-1)) {
           if ((mode & PHP_ICONV_MIME_DECODE_CONTINUE_ON_ERROR)) {
+            auto qmarks = 2;
+            while (qmarks > 0 && str_left > 1) {
+              p1++;
+              qmarks -= *p1 == '?' ? 1 : 0 ;
+              str_left--;
+            }
+
+            if (*(p1+1) == '=') {
+              ++p1;
+              --str_left;
+            }
+
             err = _php_iconv_appendl(retval, encoded_word,
                                      (size_t)((p1 + 1) - encoded_word), cd_pl);
             if (err != PHP_ICONV_ERR_SUCCESS) {
               goto out;
             }
-            encoded_word = NULL;
-            if ((mode & PHP_ICONV_MIME_DECODE_STRICT)) {
-              scan_stat = 12;
-            } else {
-              scan_stat = 0;
-            }
+            scan_stat = 12;
             break;
           } else {
 #if ICONV_SUPPORTS_ERRNO
@@ -1351,7 +1447,7 @@ static Variant HHVM_FUNCTION(iconv_mime_encode,
     goto out;
   }
 
-  cd_pl = iconv_open("ASCII", in_charset.data());
+  cd_pl = iconv_open_helper("ASCII", in_charset.data());
   if (cd_pl == (iconv_t)(-1)) {
 #if ICONV_SUPPORTS_ERRNO
     if (errno == EINVAL) {
@@ -1365,7 +1461,7 @@ static Variant HHVM_FUNCTION(iconv_mime_encode,
     goto out;
   }
 
-  cd = iconv_open(out_charset.data(), in_charset.data());
+  cd = iconv_open_helper(out_charset.data(), in_charset.data());
   if (cd == (iconv_t)(-1)) {
 #if ICONV_SUPPORTS_ERRNO
     if (errno == EINVAL) {
@@ -1640,7 +1736,7 @@ static Variant HHVM_FUNCTION(iconv_mime_decode,
   php_iconv_err_t err =
     _php_iconv_mime_decode(retval, encoded_string.data(),
                            encoded_string.size(), enc.data(), NULL, mode);
-  _php_iconv_show_error(err, enc.data(), "???");
+  _php_iconv_show_error(__FUNCTION__+2, err, enc.data(), "???");
 
   if (err == PHP_ICONV_ERR_SUCCESS) {
     return retval.detach();
@@ -1714,7 +1810,7 @@ static Variant HHVM_FUNCTION(iconv_mime_decode_headers,
   }
 
   if (err != PHP_ICONV_ERR_SUCCESS) {
-    _php_iconv_show_error(err, enc.data(), "???");
+    _php_iconv_show_error(__FUNCTION__+2, err, enc.data(), "???");
     return false;
   }
   return ret;
@@ -1767,8 +1863,9 @@ static Variant HHVM_FUNCTION(iconv, const String& in_charset,
   php_iconv_err_t err =
     php_iconv_string(str.data(), str.size(), &out_buffer, &out_len,
                      out_charset.data(), in_charset.data());
-  _php_iconv_show_error(err, out_charset.data(), in_charset.data());
-  if (out_buffer != NULL) {
+  _php_iconv_show_error(__FUNCTION__+2, err,
+                        out_charset.data(), in_charset.data());
+  if (err == PHP_ICONV_ERR_SUCCESS && out_buffer != nullptr) {
     return String(out_buffer, out_len, AttachString);
   }
   return false;
@@ -1782,7 +1879,7 @@ static Variant HHVM_FUNCTION(iconv_strlen,
   unsigned int retval;
   php_iconv_err_t err = _php_iconv_strlen(&retval, str.data(), str.size(),
                                           enc.data());
-  _php_iconv_show_error(err, GENERIC_SUPERSET_NAME, enc.data());
+  _php_iconv_show_error(__FUNCTION__+2, err, GENERIC_SUPERSET_NAME, enc.data());
   if (err == PHP_ICONV_ERR_SUCCESS) {
     return (int64_t)retval;
   }
@@ -1807,7 +1904,7 @@ static Variant HHVM_FUNCTION(iconv_strpos,
   php_iconv_err_t err =
     _php_iconv_strpos(&retval, haystack.data(), haystack.size(),
                       needle.data(), needle.size(), offset, enc.data());
-  _php_iconv_show_error(err, GENERIC_SUPERSET_NAME, enc.data());
+  _php_iconv_show_error(__FUNCTION__+2, err, GENERIC_SUPERSET_NAME, enc.data());
   if (err == PHP_ICONV_ERR_SUCCESS && retval != (unsigned int)-1) {
     return (long)retval;
   }
@@ -1828,7 +1925,7 @@ static Variant HHVM_FUNCTION(iconv_strrpos,
   php_iconv_err_t err =
     _php_iconv_strpos(&retval, haystack.data(), haystack.size(),
                       needle.data(), needle.size(), -1, enc.data());
-  _php_iconv_show_error(err, GENERIC_SUPERSET_NAME, enc.data());
+  _php_iconv_show_error(__FUNCTION__+2, err, GENERIC_SUPERSET_NAME, enc.data());
   if (err == PHP_ICONV_ERR_SUCCESS && retval != (unsigned int)-1) {
     return (long)retval;
   }
@@ -1845,7 +1942,7 @@ static Variant HHVM_FUNCTION(iconv_substr,
   StringBuffer retval;
   php_iconv_err_t err = _php_iconv_substr(retval, str.data(), str.size(),
                                           offset, length, enc.data());
-  _php_iconv_show_error(err, GENERIC_SUPERSET_NAME, enc.data());
+  _php_iconv_show_error(__FUNCTION__+2, err, GENERIC_SUPERSET_NAME, enc.data());
   if (err == PHP_ICONV_ERR_SUCCESS && !str.empty() && retval.data()) {
     return retval.detach();
   }
@@ -1862,7 +1959,7 @@ static String HHVM_FUNCTION(ob_iconv_handler,
       php_iconv_string(contents.data(), contents.size(), &out_buffer, &out_len,
                        ICONVG(output_encoding).c_str(),
                        ICONVG(internal_encoding).c_str());
-    _php_iconv_show_error(err, ICONVG(output_encoding).c_str(),
+    _php_iconv_show_error(__FUNCTION__+2, err, ICONVG(output_encoding).c_str(),
                           ICONVG(internal_encoding).c_str());
     if (out_buffer != NULL) {
       g_context->setContentType(mimetype, ICONVG(output_encoding));
@@ -1874,21 +1971,39 @@ static String HHVM_FUNCTION(ob_iconv_handler,
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifdef _LIBICONV_VERSION
+const char* iconv_impl() { return "libiconv"; };
+std::string iconv_version() {
+  return folly::sformat("{}.{}",
+                        _LIBICONV_VERSION >> 8, _LIBICONV_VERSION & 255);
+}
+#else
+const char* iconv_impl() { return "glibc"; };
+#ifdef __GLIBC__
+std::string iconv_version() {
+  return folly::sformat("{}.{}",
+                        __GLIBC__, __GLIBC_MINOR__);
+}
+#else
+const char* iconv_version() { return "2.5"; }
+#endif
+#endif
+
 const StaticString
   s_ICONV_IMPL("ICONV_IMPL"),
   s_ICONV_MIME_DECODE_CONTINUE_ON_ERROR("ICONV_MIME_DECODE_CONTINUE_ON_ERROR"),
   s_ICONV_MIME_DECODE_STRICT("ICONV_MIME_DECODE_STRICT"),
   s_ICONV_VERSION("ICONV_VERSION"),
-  s_glibc("glibc"),
-  s_2_5("2.5");
+  s_iconv_impl(iconv_impl()),
+  s_iconv_version(iconv_version());
 
-class iconvExtension : public Extension {
+class iconvExtension final : public Extension {
 public:
   iconvExtension() : Extension("iconv") {}
 
-  virtual void moduleInit() {
+  void moduleInit() override {
     Native::registerConstant<KindOfStaticString>(
-        s_ICONV_IMPL.get(), s_glibc.get()
+        s_ICONV_IMPL.get(), s_iconv_impl.get()
     );
     Native::registerConstant<KindOfInt64>(
         s_ICONV_MIME_DECODE_CONTINUE_ON_ERROR.get(), 2
@@ -1897,7 +2012,7 @@ public:
         s_ICONV_MIME_DECODE_STRICT.get(), 1
     );
     Native::registerConstant<KindOfStaticString>(
-        s_ICONV_VERSION.get(), s_2_5.get()
+        s_ICONV_VERSION.get(), s_iconv_version.get()
     );
 
     HHVM_FE(iconv_get_encoding);

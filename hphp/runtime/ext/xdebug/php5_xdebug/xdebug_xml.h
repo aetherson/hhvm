@@ -15,71 +15,110 @@
    | Authors:  Derick Rethans <derick@xdebug.org>                         |
    +----------------------------------------------------------------------+
  */
-// TODO(#4489053) This could fairly easily be abstracted into a c++ class
+// TODO(#3704) This could fairly easily be abstracted into a c++ class
 
 #ifndef incl_XDEBUG_XML_H_
 #define incl_XDEBUG_XML_H_
 
-#include "hphp/runtime/ext/xdebug/php5_xdebug/xdebug_str.h"
+#include <cstring>
 
-typedef struct _xdebug_xml_attribute xdebug_xml_attribute;
-typedef struct _xdebug_xml_text_node xdebug_xml_text_node;
-typedef struct _xdebug_xml_node xdebug_xml_node;
+namespace HPHP {
+////////////////////////////////////////////////////////////////////////////////
 
-struct _xdebug_xml_attribute {
-  char *name;
-  char *value;
-  int   name_len;
-  int   value_len;
-  struct _xdebug_xml_attribute *next;
-  int   free_name;
-  int   free_value;
+struct String;
+
+struct xdebug_xml_attribute {
+  char* name;
+  char* value;
+  int name_len;
+  int value_len;
+  xdebug_xml_attribute* next;
+  int free_name;
+  int free_value;
 };
 
 /* todo: support multiple text nodes inside an element */
-struct _xdebug_xml_text_node {
-  char *text;
-  int   free_value;
-  int   encode;
-  int   text_len;
+struct xdebug_xml_text_node {
+  char* text;
+  int free_value;
+  int encode;
+  int text_len;
 };
 
-struct _xdebug_xml_node {
-  char *tag;
-  struct _xdebug_xml_text_node *text;
-  struct _xdebug_xml_attribute *attribute;
-  struct _xdebug_xml_node      *child;
-  struct _xdebug_xml_node      *next;
-  int   free_tag;
+struct xdebug_xml_node {
+  char* tag;
+  xdebug_xml_text_node* text;
+  xdebug_xml_attribute* attribute;
+  xdebug_xml_node* child;
+  xdebug_xml_node* next;
+  int free_tag;
 };
 
+////////////////////////////////////////////////////////////////////////////////
+// Construction/Destruction
+xdebug_xml_node* xdebug_xml_node_init(char* tag, int free_tag = 0);
+void xdebug_xml_node_dtor(xdebug_xml_node*);
 
-#define xdebug_xml_node_init(t)            xdebug_xml_node_init_ex((t), 0)
-#define xdebug_xml_add_attribute_ex(x,a,v,fa,fv) { \
-  char *ta = (a), *tv = (v); \
-  xdebug_xml_add_attribute_exl((x), (ta), strlen((ta)), (tv), \
-                               strlen((tv)), fa, fv); \
-}
-#define xdebug_xml_add_attribute(x,a,v) \
-  xdebug_xml_add_attribute_ex((x), (a), (v), 0, 0);
+String xdebug_xml_return_node(xdebug_xml_node*);
 
-xdebug_xml_node *xdebug_xml_node_init_ex(char *tag, int free_tag);
+////////////////////////////////////////////////////////////////////////////////
+// Attribute adding
 void xdebug_xml_add_attribute_exl(xdebug_xml_node* xml, char *attribute,
                                   size_t attribute_len, char *value,
                                   size_t value_len, int free_name,
                                   int free_value);
+
+inline void xdebug_xml_add_attribute_ex(xdebug_xml_node* xml,
+                                        const char* attr, const char* val,
+                                        int freeAttr, int freeVal) {
+  // const_cast is safe since we are not freeing the strings or writing into
+  // them.
+  xdebug_xml_add_attribute_exl(
+    xml,
+    const_cast<char*>(attr),
+    strlen(attr),
+    const_cast<char*>(val),
+    strlen(val),
+    freeAttr,
+    freeVal
+  );
+}
+
+// This is not a solution, just a temporary fix
+inline void xdebug_xml_add_attribute(xdebug_xml_node* xml,
+                                     const char* attr, const char* val) {
+  xdebug_xml_add_attribute_ex(xml, attr, val, 0, 0);
+}
+
+/* Duplicates the passed value before adding the attribute. */
+void xdebug_xml_add_attribute_dup(xdebug_xml_node*, const char*, const char*);
+
+/* Adds the given attribute, int value pair. */
+void xdebug_xml_add_attribute(xdebug_xml_node* xml, const char* attr, int val);
+
+////////////////////////////////////////////////////////////////////////////////
+// Adding Children
 void xdebug_xml_add_child(xdebug_xml_node *xml, xdebug_xml_node *child);
 
+////////////////////////////////////////////////////////////////////////////////
+// Adding text
 void xdebug_xml_add_text_ex(xdebug_xml_node *xml, char *text, int length,
                             int free_text, int encode);
-void xdebug_xml_add_text(xdebug_xml_node *xml, char *text, int free = 1);
+void xdebug_xml_add_text(xdebug_xml_node *xml, const char* text, int free = 1);
 void xdebug_xml_add_text_encode(xdebug_xml_node *xml, char *text);
-#define xdebug_xml_add_textl(x,t,l) \
-  xdebug_xml_add_text_ex((x), (t), (l), 1, 0)
-#define xdebug_xml_add_text_encodel(x,t,l) \
-  xdebug_xml_add_text_ex((x), (t), (l), 1, 1)
 
-void xdebug_xml_return_node(xdebug_xml_node* node, struct xdebug_str *output);
-void xdebug_xml_node_dtor(xdebug_xml_node* xml);
+inline void xdebug_xml_add_textl(xdebug_xml_node* xml, char* text, int length) {
+  xdebug_xml_add_text_ex(xml, text, length, 1, 0);
+}
+
+inline void xdebug_xml_add_text_encodel(xdebug_xml_node* xml, char* tag,
+                                        int length) {
+  xdebug_xml_add_text_ex(xml, tag, length, 1, 1);
+}
+
+String xdebug_xmlize(const char*, size_t);
+
+////////////////////////////////////////////////////////////////////////////////
+}
 
 #endif

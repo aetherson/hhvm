@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,8 +17,14 @@
 #ifndef incl_HPHP_HTTP_SERVER_SERVER_H_
 #define incl_HPHP_HTTP_SERVER_SERVER_H_
 
+#include <algorithm>
 #include <chrono>
+#include <functional>
+#include <list>
 #include <memory>
+#include <string>
+
+#include <boost/noncopyable.hpp>
 
 #include "hphp/runtime/server/takeover-agent.h"
 #include "hphp/runtime/server/transport.h"
@@ -86,16 +92,39 @@ public:
   virtual ~RequestHandler() {}
 
   /**
+   * Called before and after request-handling work.
+   */
+  virtual void setupRequest(Transport* transport) {}
+  virtual void teardownRequest(Transport* transport) noexcept {}
+
+  /**
    * Sub-class handles a request by implementing this function.
    */
-  virtual void handleRequest(Transport *transport) = 0;
+  virtual void handleRequest(Transport* transport) = 0;
+
   /**
    * Sub-class handles a request by implementing this function. This is called
-   * when the server determines this request should not be processed (ie. due to
-   * timeout).
+   * when the server determines this request should not be processed (e.g., due
+   * to timeout).
    */
-  virtual void abortRequest(Transport *transport) = 0;
+  virtual void abortRequest(Transport* transport) = 0;
+
+  /**
+   * Convenience wrapper around {setup,handle,teardown}Request().
+   */
+  void run(Transport* transport) {
+    SCOPE_EXIT { teardownRequest(transport); };
+    setupRequest(transport);
+    handleRequest(transport);
+  }
+
+  /**
+   * Write an entry to the handler's access log.
+   */
+  virtual void logToAccessLog(Transport* transport) {}
+
   int getDefaultTimeout() const { return m_timeout; }
+
 private:
   int m_timeout;
 };
@@ -344,7 +373,8 @@ private:
  */
 class ServerException : public Exception {
 public:
-  ServerException(const char *fmt, ...) ATTRIBUTE_PRINTF(2,3);
+  ServerException(ATTRIBUTE_PRINTF_STRING const char *fmt, ...)
+    ATTRIBUTE_PRINTF(2,3);
 };
 
 class FailedToListenException : public ServerException {

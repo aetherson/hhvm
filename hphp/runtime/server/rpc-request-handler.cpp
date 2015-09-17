@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,11 @@
 #include "hphp/runtime/server/rpc-request-handler.h"
 
 #include "hphp/runtime/server/http-request-handler.h"
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/base/init-fini-node.h"
+#include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/server/server-stats.h"
@@ -27,16 +32,23 @@
 #include "hphp/runtime/ext/json/ext_json.h"
 #include "hphp/runtime/ext/std/ext_std_output.h"
 #include "hphp/runtime/base/php-globals.h"
+#include "hphp/runtime/vm/vm-regs.h"
 #include "hphp/util/process.h"
 #include "hphp/runtime/server/satellite-server.h"
 #include "hphp/system/constants.h"
 
-#include "folly/ScopeGuard.h"
+#include <folly/ScopeGuard.h>
 
 using std::set;
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
+
+IMPLEMENT_THREAD_LOCAL(AccessLog::ThreadData,
+                       RPCRequestHandler::s_accessLogThreadData);
+
+AccessLog RPCRequestHandler::s_accessLog(
+  &(RPCRequestHandler::getAccessLogThreadData));
 
 RPCRequestHandler::RPCRequestHandler(int timeout, bool info)
   : RequestHandler(timeout),
@@ -44,11 +56,10 @@ RPCRequestHandler::RPCRequestHandler(int timeout, bool info)
     m_reset(false),
     m_logResets(info),
     m_returnEncodeType(ReturnEncodeType::Json) {
-  initState();
 }
 
 RPCRequestHandler::~RPCRequestHandler() {
-  cleanupState();
+  if (vmStack().isAllocated()) cleanupState();
 }
 
 void RPCRequestHandler::initState() {
@@ -80,6 +91,7 @@ void RPCRequestHandler::cleanupState() {
 
 bool RPCRequestHandler::needReset() const {
   return (m_reset ||
+          !vmStack().isAllocated() ||
           m_serverInfo->alwaysReset() ||
           ((time(0) - m_lastReset) > m_serverInfo->getMaxDuration()) ||
           (m_requestsSinceReset >= m_serverInfo->getMaxRequest()));
@@ -87,7 +99,7 @@ bool RPCRequestHandler::needReset() const {
 
 void RPCRequestHandler::handleRequest(Transport *transport) {
   if (needReset()) {
-    cleanupState();
+    if (vmStack().isAllocated()) cleanupState();
     initState();
   }
   ++m_requestsSinceReset;
@@ -95,7 +107,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   ExecutionProfiler ep(ThreadInfo::RuntimeFunctions);
 
   Logger::OnNewRequest();
-  HttpRequestHandler::GetAccessLog().onNewRequest();
+  GetAccessLog().onNewRequest();
   m_context->setTransport(transport);
   transport->enableCompression();
 
@@ -106,6 +118,23 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   StackTraceNoHeap::ExtraLoggingClearer clearer;
   StackTraceNoHeap::AddExtraLogging("RPC-URL", transport->getUrl());
 
+  // Checking functions whitelist
+  const std::set<std::string> &functions = m_serverInfo->getFunctions();
+  if (!functions.empty()) {
+    auto iter = functions.find(transport->getCommand());
+    if (iter == functions.end()) {
+      transport->sendString("Forbidden", 403);
+      transport->onSendEnd();
+      GetAccessLog().log(transport, nullptr);
+      /*
+       * HPHP logs may need to access data in ServerStats, so we have to
+       * clear the hashtable after writing the log entry.
+       */
+      ServerStats::Reset();
+      return;
+    }
+  }
+
   // authentication
   const std::set<std::string> &passwords = m_serverInfo->getPasswords();
   if (!passwords.empty()) {
@@ -113,7 +142,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
     if (iter == passwords.end()) {
       transport->sendString("Unauthorized", 401);
       transport->onSendEnd();
-      HttpRequestHandler::GetAccessLog().log(transport, nullptr);
+      GetAccessLog().log(transport, nullptr);
       /*
        * HPHP logs may need to access data in ServerStats, so we have to
        * clear the hashtable after writing the log entry.
@@ -126,7 +155,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
     if (!password.empty() && password != transport->getParam("auth")) {
       transport->sendString("Unauthorized", 401);
       transport->onSendEnd();
-      HttpRequestHandler::GetAccessLog().log(transport, nullptr);
+      GetAccessLog().log(transport, nullptr);
       /*
        * HPHP logs may need to access data in ServerStats, so we have to
        * clear the hashtable after writing the log entry.
@@ -148,7 +177,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   if (vhost->disabled()) {
     transport->sendString("Virtual host disabled.", 404);
     transport->onSendEnd();
-    HttpRequestHandler::GetAccessLog().log(transport, vhost);
+    GetAccessLog().log(transport, vhost);
     return;
   }
 
@@ -156,6 +185,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   reqData.setTimeout(vhost->getRequestTimeoutSeconds(getDefaultTimeout()));
   SCOPE_EXIT {
     reqData.setTimeout(0);  // can't throw when you pass zero
+    reqData.setCPUTimeout(0);
     reqData.reset();
   };
 
@@ -177,7 +207,7 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
   // record request for debugging purpose
   std::string tmpfile = HttpProtocol::RecordRequest(transport);
   bool ret = executePHPFunction(transport, sourceRootInfo, returnEncodeType);
-  HttpRequestHandler::GetAccessLog().log(transport, vhost);
+  GetAccessLog().log(transport, vhost);
   /*
    * HPHP logs may need to access data in ServerStats, so we have to
    * clear the hashtable after writing the log entry.
@@ -187,11 +217,11 @@ void RPCRequestHandler::handleRequest(Transport *transport) {
 }
 
 void RPCRequestHandler::abortRequest(Transport *transport) {
-  HttpRequestHandler::GetAccessLog().onNewRequest();
+  GetAccessLog().onNewRequest();
   const VirtualHost *vhost = HttpProtocol::GetVirtualHost(transport);
   assert(vhost);
   transport->sendString("Service Unavailable", 503);
-  HttpRequestHandler::GetAccessLog().log(transport, vhost);
+  GetAccessLog().log(transport, vhost);
 }
 
 const StaticString
@@ -211,6 +241,7 @@ bool RPCRequestHandler::executePHPFunction(Transport *transport,
     auto env = php_global(s__ENV);
     env.toArrRef().set(s_HPHP_RPC, 1);
     php_global_set(s__ENV, std::move(env));
+    InitFiniNode::GlobalsInit();
   }
 
   bool isFile = rpcFunc.rfind('.') != std::string::npos;

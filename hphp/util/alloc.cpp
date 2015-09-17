@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,8 @@
 
 #include <atomic>
 
+#include <sys/time.h>
+#include <sys/resource.h>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -26,13 +28,34 @@
 #include <numa.h>
 #endif
 
-#include "folly/Bits.h"
-#include "folly/Format.h"
+#include <folly/Bits.h>
+#include <folly/Format.h>
 
 #include "hphp/util/logger.h"
+#include "hphp/util/async-func.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
+
+// Default dirty page purging threshold.  This setting is especially relevant to
+// arena 0, which all the service requests use.  Arena 1, the low_malloc arena,
+// also uses this setting, but that arena is not tuning-sensitive.
+#define LG_DIRTY_MULT_DEFAULT 5
+// Dirty page purging thresholds for the per NUMA node arenas used by request
+// threads.  These arenas tend to have proportionally large memory usage
+// fluctuations because requests clean up nearly all allocated memory at request
+// end.  Depending on number of request threads, current load, etc., this can
+// easily result in excessive dirty page purging.  Therefore, apply loose
+// constraints on unused dirty page accumulation under normal operation, but
+// momentarily toggle the threshold when a thread idles so that the accumulated
+// dirty pages aren't excessive compared to the likely memory usage needs of the
+// remaining active threads.
+#define LG_DIRTY_MULT_REQUEST_ACTIVE -1
+#define LG_DIRTY_MULT_REQUEST_IDLE 3
+
+#ifdef USE_JEMALLOC
+static void numa_purge_arena();
+#endif
 
 void flush_thread_caches() {
 #ifdef USE_JEMALLOC
@@ -41,12 +64,7 @@ void flush_thread_caches() {
     if (UNLIKELY(err != 0)) {
       Logger::Warning("mallctl thread.tcache.flush failed with error %d", err);
     }
-
-    // hhvm uses only 1 jemalloc arena per numa node, instead of the
-    // jemalloc default of 4 per cpu, avoiding arena thrashing by pinning
-    // threads.  This means purging the arena assigned to the thread is
-    // unnecessary (and probably actively harmful).  Compare this code to
-    // folly::detail::MemoryIdler
+    numa_purge_arena();
   }
 #endif
 #ifdef USE_TCMALLOC
@@ -71,6 +89,7 @@ static NEVER_INLINE uintptr_t get_stack_top() {
 void init_stack_limits(pthread_attr_t* attr) {
   size_t stacksize, guardsize;
   void *stackaddr;
+  struct rlimit rlim;
 
 #ifndef __APPLE__
   if (pthread_attr_getstack(attr, &stackaddr, &stacksize) != 0) {
@@ -86,7 +105,7 @@ void init_stack_limits(pthread_attr_t* attr) {
   // On OSX 10.9, we are lied to about the main thread's stack size.
   // Set it to the minimum stack size, which is set earlier by
   // execute_program_impl.
-  const size_t stackSizeMinimum = 8 * 1024 * 1024;
+  const size_t stackSizeMinimum = AsyncFuncImpl::kStackSizeMinimum;
   if (pthread_main_np() == 1) {
     if (s_stackSize < stackSizeMinimum) {
       char osRelease[256];
@@ -115,6 +134,17 @@ void init_stack_limits(pthread_attr_t* attr) {
   assert(stacksize >= PTHREAD_STACK_MIN);
   s_stackLimit = uintptr_t(stackaddr) + guardsize;
   s_stackSize = stacksize - guardsize;
+
+  // The main thread's native stack may be larger than desired if
+  // set_stack_size() failed.  Make sure that even if the native stack is
+  // extremely large (in which case anonymous mmap() could map some of the
+  // "stack space"), we can differentiate between the part of the native stack
+  // that could conceivably be used in practice and all anonymous mmap() memory.
+  if (getrlimit(RLIMIT_STACK, &rlim) == 0 && rlim.rlim_cur == RLIM_INFINITY &&
+      s_stackSize > AsyncFuncImpl::kStackSizeMinimum) {
+    s_stackLimit += s_stackSize - AsyncFuncImpl::kStackSizeMinimum;
+    s_stackSize = AsyncFuncImpl::kStackSizeMinimum;
+  }
 }
 
 void flush_thread_stack() {
@@ -198,6 +228,36 @@ static void initNuma() {
   numa_node_mask = folly::nextPowTwo(numa_num_nodes) - 1;
 }
 
+static void set_lg_dirty_mult(unsigned arena, ssize_t lg_dirty_mult) {
+  size_t miblen = 3;
+  size_t mib[miblen];
+  if (mallctlnametomib("arena.0.lg_dirty_mult", mib, &miblen) == 0) {
+    mib[1] = arena;
+    int err = mallctlbymib(mib, miblen, nullptr, nullptr, &lg_dirty_mult,
+                           sizeof(lg_dirty_mult));
+    if (err != 0) {
+      Logger::Warning("mallctl arena.%u.lg_dirty_mult failed with error %d",
+                      arena, err);
+    }
+  }
+}
+
+static void numa_purge_arena() {
+  // Only purge if the thread's assigned arena is one of those created for use
+  // by request threads.
+  if (!threads_bind_local) return;
+  unsigned arena;
+  size_t sz = sizeof(arena);
+  int DEBUG_ONLY err = mallctl("thread.arena", &arena, &sz, nullptr, 0);
+  assert(err == 0);
+  if (arena >= base_arena && arena < base_arena + numa_num_nodes) {
+    // Threads may race through the following calls, but the last call made by
+    // any idling thread will correctly restore lg_dirty_mult.
+    set_lg_dirty_mult(arena, LG_DIRTY_MULT_REQUEST_IDLE);
+    set_lg_dirty_mult(arena, LG_DIRTY_MULT_REQUEST_ACTIVE);
+  }
+}
+
 void enable_numa(bool local) {
   if (!numa_node_mask) return;
 
@@ -223,6 +283,8 @@ void enable_numa(bool local) {
         return;
       }
       arenas++;
+      // Tune dirty page purging for new arena.
+      set_lg_dirty_mult(arena, LG_DIRTY_MULT_REQUEST_ACTIVE);
     }
   }
 
@@ -286,7 +348,7 @@ void set_numa_binding(int node) {
   }
 
   char buf[32];
-  sprintf(buf, "hhvm.node.%d", node);
+  snprintf(buf, sizeof(buf), "hhvm.node.%d", node);
   prctl(PR_SET_NAME, buf);
 }
 
@@ -312,6 +374,7 @@ void numa_bind_to(void* start, size_t size, int node) {
 
 #else
 static void initNuma() {}
+static void numa_purge_arena() {}
 #endif
 
 struct JEMallocInitializer {
@@ -414,12 +477,7 @@ static void low_malloc_hugify(void* ptr) {
 }
 
 void* low_malloc_impl(size_t size) {
-#ifdef USE_JEMALLOC_MALLOCX
-  void* ptr = mallocx(size, MALLOCX_ARENA(low_arena));
-#else
-  void* ptr = nullptr;
-  allocm(&ptr, nullptr, size, ALLOCM_ARENA(low_arena));
-#endif
+  void* ptr = mallocx(size, low_mallocx_flags());
   low_malloc_hugify((char*)ptr + size - 1);
   return ptr;
 }
@@ -475,6 +533,10 @@ int jemalloc_pprof_dump(const std::string& prefix, bool force) {
 ///////////////////////////////////////////////////////////////////////////////
 }
 
+#define STRINGIFY_HELPER(x) #x
+#define STRINGIFY(x) STRINGIFY_HELPER(x)
+
 extern "C" {
-  const char* malloc_conf = "narenas:1,lg_tcache_max:16";
+  const char* malloc_conf = "narenas:1,lg_tcache_max:16,"
+    "lg_dirty_mult:" STRINGIFY(LG_DIRTY_MULT_DEFAULT);
 }

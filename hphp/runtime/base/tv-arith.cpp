@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -19,12 +19,13 @@
 #include <limits>
 #include <algorithm>
 
-#include "folly/ScopeGuard.h"
+#include <folly/ScopeGuard.h>
 
+#include "hphp/runtime/base/array-data-defs.h"
 #include "hphp/runtime/base/strings.h"
 #include "hphp/runtime/base/runtime-error.h"
 #include "hphp/runtime/base/tv-conversions.h"
-#include "hphp/runtime/ext/ext_math.h"
+#include "hphp/runtime/ext/std/ext_std_math.h"
 #include "hphp/util/overflow.h"
 
 namespace HPHP {
@@ -48,15 +49,31 @@ TypedNum numericConvHelper(Cell cell) {
   assert(cellIsPlausible(cell));
 
   switch (cell.m_type) {
-  case KindOfString:
-  case KindOfStaticString: return stringToNumeric(cell.m_data.pstr);
-  case KindOfBoolean:      return make_int(cell.m_data.num);
-  case KindOfUninit:
-  case KindOfNull:         return make_int(0);
-  case KindOfObject:       return make_int(cell.m_data.pobj->o_toInt64());
-  case KindOfResource:     return make_int(cell.m_data.pres->o_toInt64());
-  case KindOfArray:        throw_bad_array_operand();
-  default:                 break;
+    case KindOfUninit:
+    case KindOfNull:
+      return make_int(0);
+
+    case KindOfBoolean:
+      return make_int(cell.m_data.num);
+
+    case KindOfString:
+    case KindOfStaticString:
+      return stringToNumeric(cell.m_data.pstr);
+
+    case KindOfArray:
+      throw_bad_array_operand();
+
+    case KindOfObject:
+      return make_int(cell.m_data.pobj->toInt64());
+
+    case KindOfResource:
+      return make_int(cell.m_data.pres->data()->o_toInt64());
+
+    case KindOfInt64:
+    case KindOfDouble:
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
   not_reached();
 }
@@ -286,7 +303,6 @@ StringData* stringBitOp(BitOp bop, SzOp sop, StringData* s1, StringData* s2) {
   }
   newStr->setSize(newLen);
 
-  newStr->setRefCount(1);
   return newStr;
 }
 
@@ -295,7 +311,7 @@ Cell cellBitOp(StrLenOp strLenOp, Cell c1, Cell c2) {
   assert(cellIsPlausible(c1));
   assert(cellIsPlausible(c2));
 
-  if (IS_STRING_TYPE(c1.m_type) && IS_STRING_TYPE(c2.m_type)) {
+  if (isStringType(c1.m_type) && isStringType(c2.m_type)) {
     return make_tv<KindOfString>(
       stringBitOp(
         BitOp<char>(),
@@ -312,13 +328,16 @@ Cell cellBitOp(StrLenOp strLenOp, Cell c1, Cell c2) {
 template<class Op>
 void cellBitOpEq(Op op, Cell& c1, Cell c2) {
   auto const result = op(c1, c2);
-  cellSet(result, c1);
+  auto const type = c1.m_type;
+  auto const data = c1.m_data.num;
+  tvCopy(result, c1);
+  tvRefcountedDecRefHelper(type, data);
 }
 
 // Op must implement the interface described for cellIncDecOp.
 template<class Op>
 void stringIncDecOp(Op op, Cell& cell) {
-  assert(IS_STRING_TYPE(cell.m_type));
+  assert(isStringType(cell.m_type));
 
   auto const sd = cell.m_data.pstr;
   if (sd->empty()) {
@@ -329,23 +348,19 @@ void stringIncDecOp(Op op, Cell& cell) {
 
   int64_t ival;
   double dval;
-  auto const dt = sd->isNumericWithVal(ival, dval, true /* allow_errors */);
+  auto const dt = sd->isNumericWithVal(ival, dval, false /* allow_errors */);
 
-  switch (dt) {
-  case KindOfInt64:
+  if (dt == KindOfInt64) {
     decRefStr(sd);
     cellCopy(make_int(ival), cell);
     op.intCase(cell);
-    break;
-  case KindOfDouble:
+  } else if (dt == KindOfDouble) {
     decRefStr(sd);
     cellCopy(make_dbl(dval), cell);
     op.dblCase(cell);
-    break;
-  default:
+  } else {
     assert(dt == KindOfNull);
     op.nonNumericString(cell);
-    break;
   }
 }
 
@@ -365,31 +380,35 @@ void cellIncDecOp(Op op, Cell& cell) {
   assert(cellIsPlausible(cell));
 
   switch (cell.m_type) {
-  case KindOfInt64:
-    op.intCase(cell);
-    break;
-  case KindOfDouble:
-    op.dblCase(cell);
-    break;
+    case KindOfUninit:
+    case KindOfNull:
+      op.nullCase(cell);
+      return;
 
-  case KindOfString:
-  case KindOfStaticString:
-    stringIncDecOp(op, cell);
-    break;
+    case KindOfInt64:
+      op.intCase(cell);
+      return;
 
-  case KindOfUninit:
-  case KindOfNull:
-    op.nullCase(cell);
-    break;
+    case KindOfDouble:
+      op.dblCase(cell);
+      return;
 
-  case KindOfBoolean:
-  case KindOfObject:
-  case KindOfResource:
-  case KindOfArray:
-    break;
-  default:
-    not_reached();
+    case KindOfStaticString:
+    case KindOfString:
+      stringIncDecOp(op, cell);
+      return;
+
+    case KindOfBoolean:
+    case KindOfArray:
+    case KindOfObject:
+    case KindOfResource:
+      return;
+
+    case KindOfRef:
+    case KindOfClass:
+      break;
   }
+  not_reached();
 }
 
 const StaticString s_1("1");
@@ -409,13 +428,12 @@ struct IncBase {
       auto const tmp = StringData::Make(sd, CopyString);
       auto const tmp2 = tmp->increment();
       if (tmp2 != tmp) {
-        assert(tmp->getCount() == 0);
+        assert(tmp->hasExactlyOneRef());
         tmp->release();
         return tmp2;
       }
       return tmp;
     }();
-    newSd->incRefCount();
     decRefStr(sd);
     cellCopy(make_tv<KindOfString>(newSd), cell);
   }
@@ -498,7 +516,7 @@ Cell cellDiv(Cell c1, Cell c2) {
 }
 
 Cell cellPow(Cell c1, Cell c2) {
-  return *f_pow(tvAsVariant(&c1), tvAsVariant(&c2)).asCell();
+  return *HHVM_FN(pow)(tvAsVariant(&c1), tvAsVariant(&c2)).asCell();
 }
 
 Cell cellMod(Cell c1, Cell c2) {
@@ -554,9 +572,9 @@ void cellMulEq(Cell& c1, Cell c2) {
   cellOpEq(MulEq(), c1, c2);
 }
 
-void cellAddEqO(Cell& c1, Cell c2) { cellCopy(cellAddO(c1, c2), c1); }
-void cellSubEqO(Cell& c1, Cell c2) { cellCopy(cellSubO(c1, c2), c1); }
-void cellMulEqO(Cell& c1, Cell c2) { cellCopy(cellMulO(c1, c2), c1); }
+void cellAddEqO(Cell& c1, Cell c2) { cellSet(cellAddO(c1, c2), c1); }
+void cellSubEqO(Cell& c1, Cell c2) { cellSet(cellSubO(c1, c2), c1); }
+void cellMulEqO(Cell& c1, Cell c2) { cellSet(cellMulO(c1, c2), c1); }
 
 void cellDivEq(Cell& c1, Cell c2) {
   assert(cellIsPlausible(c1));
@@ -587,8 +605,8 @@ void cellBitXorEq(Cell& c1, Cell c2) {
   cellBitOpEq(cellBitXor, c1, c2);
 }
 
-void cellShlEq(Cell& c1, Cell c2) { cellCopy(cellShl(c1, c2), c1); }
-void cellShrEq(Cell& c1, Cell c2) { cellCopy(cellShr(c1, c2), c1); }
+void cellShlEq(Cell& c1, Cell c2) { cellSet(cellShl(c1, c2), c1); }
+void cellShrEq(Cell& c1, Cell c2) { cellSet(cellShr(c1, c2), c1); }
 
 void cellInc(Cell& cell) { cellIncDecOp(Inc(), cell); }
 void cellIncO(Cell& cell) { cellIncDecOp(IncO(), cell); }
@@ -599,45 +617,52 @@ void cellBitNot(Cell& cell) {
   assert(cellIsPlausible(cell));
 
   switch (cell.m_type) {
-  case KindOfInt64:
-    cell.m_data.num = ~cell.m_data.num;
-    break;
-  case KindOfDouble:
-    cell.m_type     = KindOfInt64;
-    cell.m_data.num = ~toInt64(cell.m_data.dbl);
-    break;
+    case KindOfInt64:
+      cell.m_data.num = ~cell.m_data.num;
+      break;
 
-  case KindOfString:
-    if (cell.m_data.pstr->hasMultipleRefs()) {
+    case KindOfDouble:
+      cell.m_type     = KindOfInt64;
+      cell.m_data.num = ~toInt64(cell.m_data.dbl);
+      break;
+
+    case KindOfString:
+      if (cell.m_data.pstr->hasMultipleRefs()) {
     case KindOfStaticString:
-      auto const newSd = StringData::Make(
-        cell.m_data.pstr->slice(),
-        CopyString
-      );
-      newSd->incRefCount();
-      cell.m_data.pstr->decRefCount(); // can't go to zero
-      cell.m_data.pstr = newSd;
-      cell.m_type = KindOfString;
-    } else {
-      // Unless we go through this branch, the string was just freshly
-      // created, so the following mutation will be safe wrt its
-      // internal hash caching.
-      cell.m_data.pstr->invalidateHash();
-    }
-
-    {
-      auto const sd   = cell.m_data.pstr;
-      auto const len  = sd->size();
-      auto const data = sd->mutableData();
-      assert(sd->hasExactlyOneRef());
-      for (uint32_t i = 0; i < len; ++i) {
-        data[i] = ~data[i];
+        auto const newSd = StringData::Make(
+          cell.m_data.pstr->slice(),
+          CopyString
+        );
+        cell.m_data.pstr->decRefCount(); // can't go to zero
+        cell.m_data.pstr = newSd;
+        cell.m_type = KindOfString;
+      } else {
+        // Unless we go through this branch, the string was just freshly
+        // created, so the following mutation will be safe wrt its
+        // internal hash caching.
+        cell.m_data.pstr->invalidateHash();
       }
-    }
-    break;
 
-  default:
-    raise_error("Unsupported operand type for ~");
+      {
+        auto const sd   = cell.m_data.pstr;
+        auto const len  = sd->size();
+        auto const data = sd->mutableData();
+        assert(sd->hasExactlyOneRef());
+        for (uint32_t i = 0; i < len; ++i) {
+          data[i] = ~data[i];
+        }
+      }
+      break;
+
+    case KindOfUninit:
+    case KindOfNull:
+    case KindOfBoolean:
+    case KindOfArray:
+    case KindOfObject:
+    case KindOfResource:
+    case KindOfRef:
+    case KindOfClass:
+      raise_error("Unsupported operand type for ~");
   }
 }
 

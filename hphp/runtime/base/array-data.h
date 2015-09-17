@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -20,17 +20,22 @@
 #include <climits>
 #include <vector>
 
-#include "folly/Likely.h"
+#include <folly/Likely.h>
 
+#include "hphp/runtime/base/memory-manager.h"
 #include "hphp/runtime/base/countable.h"
-#include "hphp/runtime/base/types.h"
-#include "hphp/runtime/base/macros.h"
 #include "hphp/runtime/base/typed-value.h"
+#include "hphp/runtime/base/sort-flags.h"
+#include "hphp/runtime/base/cap-code.h"
+#include "hphp/util/md5.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
+struct String;
 struct TypedValue;
+struct MArrayIter;
+class VariableSerializer;
 
 struct ArrayData {
   // Runtime type tag of possible array types.  This is intentionally
@@ -43,19 +48,17 @@ struct ArrayData {
   //
   // Beware if you change the order or the numerical values, as there are
   // a few places in the code that depends on the order or the numeric
-  // values. Also, all of the values need to be continguous from 0 to =
+  // values. Also, all of the values need to be continuous from 0 to =
   // kNumKinds-1 since we use these values to index into a table.
   enum ArrayKind : uint8_t {
     kPackedKind = 0,  // PackedArray with keys in range [0..size)
-    kMixedKind = 1,   // MixedArray arbitrary int or string keys, maybe holes
-    kStrMapKind = 2,  // StrMapArray, string keys, mixed values, like MixedArray
-    kIntMapKind = 3,  // IntMapArray, int keys, maybe holes, like MixedArray
-    kVPackedKind = 4, // PackedArray with extra warnings for certain operations
-    kEmptyKind = 5,   // The singleton static empty array
-    kSharedKind = 6,  // SharedArray
-    kNvtwKind = 7,    // NameValueTableWrapper
-    kProxyKind = 8,   // ProxyArray
-    kNumKinds = 9     // insert new values before kNumKinds.
+    kStructKind = 1,  // StructArray with static string keys
+    kMixedKind = 2,   // MixedArray arbitrary int or string keys, maybe holes
+    kEmptyKind = 3,   // The singleton static empty array
+    kApcKind = 4,     // APCLocalArray
+    kGlobalsKind = 5, // GlobalsArray
+    kProxyKind = 6,   // ProxyArray
+    kNumKinds = 7     // insert new values before kNumKinds.
   };
 
 protected:
@@ -63,12 +66,13 @@ protected:
    * NOTE: MixedArray no longer calls this constructor.  If you change
    * it, change the MixedArray::Make functions as appropriate.
    */
-  explicit ArrayData(ArrayKind kind)
-    : m_kind(kind)
-    , m_size(-1)
-    , m_pos(0)
-    , m_count(0)
-  {}
+  explicit ArrayData(ArrayKind kind, RefCount initial_count = 1)
+    : m_sizeAndPos(uint32_t(-1)) {
+    m_hdr.init(static_cast<HeaderKind>(kind), initial_count);
+    assert(m_size == -1);
+    assert(m_pos == 0);
+    assert(m_hdr.kind == static_cast<HeaderKind>(kind));
+  }
 
   /*
    * NOTE: MixedArray no longer calls this destructor.  If you need to
@@ -80,8 +84,9 @@ protected:
   ~ArrayData();
 
 public:
-  IMPLEMENT_COUNTABLE_METHODS
-  void setRefCount(RefCount n) { m_count = n; }
+  IMPLEMENT_COUNTABLE_METHODS_WITH_STATIC
+
+  bool kindIsValid() const { return isArrayKind(m_hdr.kind); }
 
   /**
    * Create a new ArrayData with specified array element(s).
@@ -93,11 +98,11 @@ public:
   static ArrayData *CreateRef(const Variant& name, Variant& value);
 
   /*
-   * Called to return an ArrayData to the smart allocator.  This is
+   * Called to return an ArrayData to the request heap.  This is
    * normally called when the reference count goes to zero (e.g. via a
    * helper like decRefArr).
    */
-  void release();
+  void release() noexcept;
 
   /**
    * Whether this array has any element.
@@ -110,7 +115,16 @@ public:
    * return the array kind for fast typechecks
    */
   ArrayKind kind() const {
-    return m_kind;
+    assert(kindIsValid());
+    return static_cast<ArrayKind>(m_hdr.kind);
+  }
+
+  /*
+   * Return the capacity stored in the header. Not to be confused
+   * with MixedArray::capacity
+   */
+  uint32_t cap() const {
+    return m_hdr.aux.decode();
   }
 
   /**
@@ -121,9 +135,9 @@ public:
     return m_size;
   }
 
-  // unlike ArrayData::size(), this functions doesn't delegate
+  // Unlike ArrayData::size(), this function doesn't delegate
   // to the vsize() function, so its more efficient to use this when
-  // you know you don't have a NameValueTableWrapper.
+  // you know you don't have a GlobalsArray or ProxyArray.
   size_t getSize() const {
     return m_size;
   }
@@ -144,63 +158,13 @@ public:
    */
   bool noCopyOnWrite() const;
 
-  /*
-   * Returns true if this is a PackedArray or a varray
-   */
-  bool isPacked() const {
-    bool b = !(m_kind & ~uint8_t{4});
-    assert(b == (m_kind == kPackedKind || m_kind == kVPackedKind));
-    return b;
-  }
-  /*
-   * Returns true if this is a MixedArray, msarray, or miarray
-   */
-  bool isMixed() const {
-    bool b = ((uint64_t{m_kind} - uint64_t{1}) <= uint64_t{2});
-    assert(b == (m_kind == kMixedKind || m_kind == kStrMapKind ||
-                 m_kind == kIntMapKind));
-    return b;
-  }
-
-  /*
-   * These three functions can be used to test if this array is a varray,
-   * msarray, or miarray respectively.
-   */
-  bool isVPackedArray() const { return m_kind == kVPackedKind; }
-  bool isStrMapArray() const { return m_kind == kStrMapKind; }
-  bool isIntMapArray() const { return m_kind == kIntMapKind; }
-
-  /*
-   * Returns true if this is any kind of "checked" array (varray, msarray,
-   * or miarray).
-   */
-  bool isCheckedArray() const {
-    bool b = ((uint64_t{m_kind} - uint64_t{2}) <= uint64_t{2});
-    assert(b == (m_kind == kStrMapKind || m_kind == kIntMapKind ||
-                 m_kind == kVPackedKind));
-    return b;
-  }
-
-  /*
-   * Returns true if this is a msarray or miarray.
-   */
-  bool isStrMapArrayOrIntMapArray() const {
-    bool b = ((uint64_t{m_kind} - uint64_t{2}) <= uint64_t{1});
-    assert(b == (m_kind == kStrMapKind || m_kind == kIntMapKind));
-    return b;
-  }
-  /*
-   * Returns true if this is a varray or miarray.
-   */
-  bool isVPackedArrayOrIntMapArray() const {
-    bool b = ((uint64_t{m_kind} - uint64_t{3}) <= uint64_t{1});
-    assert(b == (m_kind == kIntMapKind || m_kind == kVPackedKind));
-    return b;
-  }
-
-  bool isSharedArray() const { return m_kind == kSharedKind; }
-  bool isNameValueTableWrapper() const { return m_kind == kNvtwKind; }
-  bool isProxyArray() const { return m_kind == kProxyKind; }
+  bool isPacked() const { return kind() == kPackedKind; }
+  bool isStruct() const { return kind() == kStructKind; }
+  bool isMixed() const { return kind() == kMixedKind; }
+  bool isApcArray() const { return kind() == kApcKind; }
+  bool isGlobalsArray() const { return kind() == kGlobalsKind; }
+  bool isProxyArray() const { return kind() == kProxyKind; }
+  bool isEmptyArray() const { return kind() == kEmptyKind; }
 
   /*
    * Returns whether or not this array contains "vector-like" data.
@@ -244,7 +208,6 @@ public:
    * relying on this, but try not to in new code.)
    */
   const TypedValue* nvGet(int64_t k) const;
-  const TypedValue* nvGetConverted(int64_t k) const;
   const TypedValue* nvGet(const StringData* k) const;
   void nvGetKey(TypedValue* out, ssize_t pos) const;
 
@@ -275,7 +238,6 @@ public:
    * escalated array data.
    */
   ArrayData *set(int64_t k, const Variant& v, bool copy);
-  ArrayData *setConverted(int64_t k, const Variant& v, bool copy);
   ArrayData *set(StringData* k, const Variant& v, bool copy);
 
   ArrayData *setRef(int64_t k, Variant& v, bool copy);
@@ -349,7 +311,7 @@ public:
    */
   bool advanceMArrayIter(MArrayIter& fp);
 
-  ArrayData* escalateForSort();
+  ArrayData* escalateForSort(SortFunction sort_function);
   void ksort(int sort_flags, bool ascending);
   void sort(int sort_flags, bool ascending);
   void asort(int sort_flags, bool ascending);
@@ -360,13 +322,13 @@ public:
   /**
    * Make a copy of myself.
    *
-   * The nonSmartCopy() version means not to use the smart allocator.
-   * Is only implemented for array types that need to be able to go
+   * copyStatic() means not to use the request-scoped heap.
+   * It is only implemented for array types that need to be able to go
    * into the static array list.
    */
   ArrayData* copy() const;
   ArrayData* copyWithStrongIterators() const;
-  ArrayData* nonSmartCopy() const;
+  ArrayData* copyStatic() const;
 
   /**
    * Append a value to the array. If "copy" is true, make a copy first
@@ -406,10 +368,6 @@ public:
 
   void onSetEvalScalar();
 
-  // TODO(#3903818): move serialization out of ArrayData, Variant, etc.
-  void serialize(VariableSerializer *serializer,
-                 bool skipNestCheck = false) const;
-
   /**
    * Comparisons.
    */
@@ -424,26 +382,34 @@ public:
 
   ArrayData *escalate() const;
 
+  using ScalarArrayKey = MD5;
+  struct ScalarHash {
+    size_t operator()(const ScalarArrayKey& key) const {
+      return key.hash();
+    }
+    size_t hash(const ScalarArrayKey& key) const {
+      return key.hash();
+    }
+    bool equal(const ScalarArrayKey& k1,
+               const ScalarArrayKey& k2) const {
+      return k1 == k2;
+    }
+  };
+
+  static ScalarArrayKey GetScalarArrayKey(ArrayData* arr);
+  static ScalarArrayKey GetScalarArrayKey(const char* str, size_t sz);
   static ArrayData* GetScalarArray(ArrayData *arr);
-  static ArrayData* GetScalarArray(ArrayData *arr, const std::string& key);
+  static ArrayData* GetScalarArray(ArrayData *arr, const ScalarArrayKey& key);
 
-  static constexpr size_t offsetofKind() {
-    return offsetof(ArrayData, m_kind);
-  }
-
-  static constexpr size_t offsetofSize() {
-    return offsetof(ArrayData, m_size);
-  }
-  static constexpr size_t sizeofKind() { return sizeof(m_kind); }
+  static constexpr size_t offsetofSize() { return offsetof(ArrayData, m_size); }
   static constexpr size_t sizeofSize() { return sizeof(m_size); }
 
   static const char* kindToString(ArrayKind kind);
 
 private:
-  void serializeImpl(VariableSerializer *serializer) const;
   friend size_t getMemSize(const ArrayData*);
   static void compileTimeAssertions() {
-    static_assert(offsetof(ArrayData, m_count) == FAST_REFCOUNT_OFFSET, "");
+    static_assert(offsetof(ArrayData, m_hdr) == HeaderOffset, "");
   }
 
 protected:
@@ -463,6 +429,7 @@ protected:
   friend struct PackedArray;
   friend struct EmptyArray;
   friend struct MixedArray;
+  friend struct StructArray;
   friend class BaseVector;
   friend class c_Vector;
   friend class c_ImmVector;
@@ -475,30 +442,21 @@ protected:
   // this on its own.)
   union {
     struct {
-      union {
-        struct {
-          UNUSED uint16_t m_unused1;
-          UNUSED uint8_t m_unused0;
-          ArrayKind m_kind;
-        };
-        // Packed arrays overlay their encoded capacity with the kind field.
-        // kPackedKind is zero, and aliases the top byte of m_packedCapCode,
-        // so it won't influence the encoded capacity. For details on the
-        // encoding see the definition of packedCapToCode().
-        uint32_t m_packedCapCode;
-      };
       uint32_t m_size;
-    };
-    uint64_t m_kindAndSize;
-  };
-  union {
-    struct {
       int32_t m_pos;
-      mutable RefCount m_count;
     };
-    uint64_t m_posAndCount;   // be careful, m_pos is signed
+    uint64_t m_sizeAndPos; // careful, m_pos is signed
   };
+  HeaderWord<CapCode> m_hdr;
 };
+
+static_assert(ArrayData::kPackedKind == uint8_t(HeaderKind::Packed), "");
+static_assert(ArrayData::kStructKind == uint8_t(HeaderKind::Struct), "");
+static_assert(ArrayData::kMixedKind == uint8_t(HeaderKind::Mixed), "");
+static_assert(ArrayData::kEmptyKind == uint8_t(HeaderKind::Empty), "");
+static_assert(ArrayData::kApcKind == uint8_t(HeaderKind::Apc), "");
+static_assert(ArrayData::kGlobalsKind == uint8_t(HeaderKind::Globals), "");
+static_assert(ArrayData::kProxyKind == uint8_t(HeaderKind::Proxy), "");
 
 //////////////////////////////////////////////////////////////////////
 
@@ -523,18 +481,16 @@ ALWAYS_INLINE ArrayData* staticEmptyArray() {
  * ArrayFunctions is a hand-built virtual dispatch table.  Each field represents
  * one virtual method with an array of function pointers, one per ArrayKind.
  * There is one global instance of this table.  Arranging it this way allows
- * dispatch to be done with a single indexed load, using m_kind as the index.
+ * dispatch to be done with a single indexed load, using kind as the index.
  */
 struct ArrayFunctions {
   // NK stands for number of array kinds; here just for shorthand.
   static auto const NK = size_t(ArrayData::ArrayKind::kNumKinds);
   void (*release[NK])(ArrayData*);
   const TypedValue* (*nvGetInt[NK])(const ArrayData*, int64_t k);
-  const TypedValue* (*nvGetIntConverted[NK])(const ArrayData*, int64_t k);
   const TypedValue* (*nvGetStr[NK])(const ArrayData*, const StringData* k);
   void (*nvGetKey[NK])(const ArrayData*, TypedValue* out, ssize_t pos);
   ArrayData* (*setInt[NK])(ArrayData*, int64_t k, Cell v, bool copy);
-  ArrayData* (*setIntConverted[NK])(ArrayData*, int64_t k, Cell v, bool copy);
   ArrayData* (*setStr[NK])(ArrayData*, StringData* k, Cell v,
                            bool copy);
   size_t (*vsize[NK])(const ArrayData*);
@@ -561,7 +517,7 @@ struct ArrayFunctions {
   ssize_t (*iterRewind[NK])(const ArrayData*, ssize_t pos);
   bool (*validMArrayIter[NK])(const ArrayData*, const MArrayIter&);
   bool (*advanceMArrayIter[NK])(ArrayData*, MArrayIter&);
-  ArrayData* (*escalateForSort[NK])(ArrayData*);
+  ArrayData* (*escalateForSort[NK])(ArrayData*, SortFunction);
   void (*ksort[NK])(ArrayData* ad, int sort_flags, bool ascending);
   void (*sort[NK])(ArrayData* ad, int sort_flags, bool ascending);
   void (*asort[NK])(ArrayData* ad, int sort_flags, bool ascending);
@@ -570,7 +526,7 @@ struct ArrayFunctions {
   bool (*uasort[NK])(ArrayData* ad, const Variant& cmp_function);
   ArrayData* (*copy[NK])(const ArrayData*);
   ArrayData* (*copyWithStrongIterators[NK])(const ArrayData*);
-  ArrayData* (*nonSmartCopy[NK])(const ArrayData*);
+  ArrayData* (*copyStatic[NK])(const ArrayData*);
   ArrayData* (*append[NK])(ArrayData*, const Variant& v, bool copy);
   ArrayData* (*appendRef[NK])(ArrayData*, Variant& v, bool copy);
   ArrayData* (*appendWithRef[NK])(ArrayData*, const Variant& v, bool copy);
@@ -587,7 +543,8 @@ struct ArrayFunctions {
   ArrayData* (*zAppend[NK])(ArrayData*, RefData* v, int64_t* key_ptr);
 };
 
-extern const ArrayFunctions g_array_funcs;
+extern ArrayFunctions g_array_funcs;
+extern const ArrayFunctions g_array_funcs_unmodified;
 
 ALWAYS_INLINE
 void decRefArr(ArrayData* arr) {

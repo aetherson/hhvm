@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -40,11 +40,11 @@ module Make:
     val clear: unit -> unit
 
   end = functor(Value: sig type t end) -> struct
-    
+
     external hh_shared_store : string -> unit   = "hh_shared_store"
     external hh_shared_load  : unit   -> string = "hh_shared_load"
     external hh_shared_clear : unit   -> unit   = "hh_shared_clear"
-        
+
     let store x  = hh_shared_store (Marshal.to_string x [])
     let load ()  = Marshal.from_string (hh_shared_load()) 0
     let clear () = hh_shared_clear()

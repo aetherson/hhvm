@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,14 +18,21 @@
 
 #include <type_traits>
 
+#include "hphp/runtime/base/array-data-defs.h"
 #include "hphp/runtime/base/array-data.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/packed-array.h"
+#include "hphp/runtime/base/thread-info.h"
+#include "hphp/runtime/base/type-variant.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
+
+/*
+ * Flag indicating whether this allocation should be pre-checked for OOM.
+ */
+enum class CheckAllocation {};
 
 struct ArrayInit {
   enum class Map {};
@@ -45,8 +52,12 @@ struct ArrayInit {
    * Also, generally it's preferable to use make_map_array or
    * make_packed_array when it's easy, since you don't have to get 'n'
    * right in that case.
+   *
+   * For large array allocations, consider passing CheckAllocation, which will
+   * throw if the allocation would OOM the request.
    */
   ArrayInit(size_t n, Map);
+  ArrayInit(size_t n, Map, CheckAllocation);
 
   ArrayInit(ArrayInit&& other) noexcept
     : m_data(other.m_data)
@@ -65,7 +76,10 @@ struct ArrayInit {
   ArrayInit& operator=(const ArrayInit&) = delete;
 
   ~ArrayInit() {
-    if (m_data) MixedArray::Release(m_data);
+    // Use non-specialized release call so array instrumentation can track
+    // its destruction XXX rfc: keep this? what was it before?
+    assert(!m_data || m_data->hasExactlyOneRef());
+    if (m_data) m_data->release();
   }
 
   ArrayInit& set(const Variant& v) = delete;
@@ -106,9 +120,10 @@ struct ArrayInit {
     return *this;
   }
 
+  ArrayInit& set(const Variant& name, const Variant& v) = delete;
   ArrayInit& set(const Variant& name, const Variant& v,
                  bool keyConverted) = delete;
-  ArrayInit& set(const Variant& name, const Variant& v) {
+  ArrayInit& setValidKey(const Variant& name, const Variant& v) {
     performOp([&]{ return m_data->set(name, v, false); });
     return *this;
   }
@@ -120,11 +135,9 @@ struct ArrayInit {
    * using ArrayInit, and if not you should probably use toKey
    * yourself.
    */
-  ArrayInit& setKeyUnconverted(const Variant& name, const Variant& v) {
+  ArrayInit& setUnknownKey(const Variant& name, const Variant& v) {
     VarNR k(name.toKey());
-    // XXX: the old semantics of ArrayInit used to check if k.isNull
-    // and do nothing, but that's not php semantics so we're not doing
-    // that anymore.
+    if (UNLIKELY(k.isNull())) return *this;
     performOp([&]{ return m_data->set(k, v, false); });
     return *this;
   }
@@ -145,7 +158,8 @@ struct ArrayInit {
     return *this;
   }
 
-  ArrayInit& add(const String& name, const Variant& v, bool keyConverted = false) {
+  ArrayInit& add(const String& name, const Variant& v,
+                 bool keyConverted = false) {
     if (keyConverted) {
       performOp([&]{
         return MixedArray::AddStr(m_data, name.get(),
@@ -157,7 +171,8 @@ struct ArrayInit {
     return *this;
   }
 
-  ArrayInit& add(const Variant& name, const Variant& v, bool keyConverted = false) {
+  ArrayInit& add(const Variant& name, const Variant& v,
+                 bool keyConverted = false) {
     if (keyConverted) {
       performOp([&]{ return m_data->add(name, v, false); });
     } else {
@@ -234,6 +249,7 @@ struct ArrayInit {
   // Prefer toArray() in new code---it can save a null check when the
   // compiler can't prove m_data hasn't changed.
   ArrayData* create() {
+    assert(m_data->hasExactlyOneRef());
     auto const ret = m_data;
     m_data = nullptr;
 #ifndef NDEBUG
@@ -243,6 +259,7 @@ struct ArrayInit {
   }
 
   Array toArray() {
+    assert(m_data->hasExactlyOneRef());
     auto ptr = m_data;
     m_data = nullptr;
 #ifndef NDEBUG
@@ -252,6 +269,7 @@ struct ArrayInit {
   }
 
   Variant toVariant() {
+    assert(m_data->hasExactlyOneRef());
     auto ptr = m_data;
     m_data = nullptr;
 #ifndef NDEBUG
@@ -293,7 +311,26 @@ public:
     , m_expectedCount(n)
 #endif
   {
-    m_vec->setRefCount(0);
+    assert(m_vec->hasExactlyOneRef());
+  }
+
+  /*
+   * Before allocating, check if the allocation would cause the request to OOM.
+   *
+   * @throws RequestMemoryExceededException if allocating would OOM.
+   */
+  PackedArrayInit(size_t n, CheckAllocation) {
+    auto allocsz = sizeof(ArrayData) + sizeof(TypedValue) * n;
+    if (UNLIKELY(allocsz > kMaxSmallSize && MM().preAllocOOM(allocsz))) {
+      check_request_surprise_unlikely();
+    }
+    m_vec = MixedArray::MakeReserve(n);
+#ifndef NDEBUG
+    m_addCount = 0;
+    m_expectedCount = n;
+#endif
+    assert(m_vec->hasExactlyOneRef());
+    check_request_surprise_unlikely();
   }
 
   PackedArrayInit(PackedArrayInit&& other) noexcept
@@ -314,6 +351,7 @@ public:
 
   ~PackedArrayInit() {
     // In case an exception interrupts the initialization.
+    assert(!m_vec || m_vec->hasExactlyOneRef());
     if (m_vec) m_vec->release();
   }
 
@@ -348,6 +386,7 @@ public:
   }
 
   Variant toVariant() {
+    assert(m_vec->hasExactlyOneRef());
     auto ptr = m_vec;
     m_vec = nullptr;
 #ifndef NDEBUG
@@ -357,6 +396,7 @@ public:
   }
 
   Array toArray() {
+    assert(m_vec->hasExactlyOneRef());
     ArrayData* ptr = m_vec;
     m_vec = nullptr;
 #ifndef NDEBUG
@@ -366,6 +406,7 @@ public:
   }
 
   ArrayData *create() {
+    assert(m_vec->hasExactlyOneRef());
     auto ptr = m_vec;
     m_vec = nullptr;
 #ifndef NDEBUG
@@ -401,7 +442,7 @@ namespace make_array_detail {
 
   template<class Val, class... Vals>
   void packed_impl(PackedArrayInit& init, Val&& val, Vals&&... vals) {
-    init.append(std::forward<Val>(val));
+    init.append(Variant(std::forward<Val>(val)));
     packed_impl(init, std::forward<Vals>(vals)...);
   }
 
@@ -409,12 +450,13 @@ namespace make_array_detail {
   inline int64_t init_key(int k) { return k; }
   inline int64_t init_key(int64_t k) { return k; }
   inline const String& init_key(const String& k) { return k; }
+  inline const String init_key(StringData* k) { return String{k}; }
 
   inline void map_impl(ArrayInit&) {}
 
   template<class Key, class Val, class... KVPairs>
   void map_impl(ArrayInit& init, Key&& key, Val&& val, KVPairs&&... kvpairs) {
-    init.set(init_key(std::forward<Key>(key)), std::forward<Val>(val));
+    init.set(init_key(std::forward<Key>(key)), Variant(std::forward<Val>(val)));
     map_impl(init, std::forward<KVPairs>(kvpairs)...);
   }
 

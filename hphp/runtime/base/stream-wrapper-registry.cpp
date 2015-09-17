@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -23,7 +23,7 @@
 #include "hphp/runtime/base/glob-stream-wrapper.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/base/request-event-handler.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include <set>
 #include <map>
 #include <algorithm>
@@ -38,6 +38,13 @@ struct RequestWrappers final : RequestEventHandler {
   void requestShutdown() override {
     m_disabled.clear();
     m_wrappers.clear();
+  }
+  void vscan(IMarker& mark) const override {
+    for (auto& s : m_disabled) mark(s);
+    for (auto& p : m_wrappers) {
+      mark(p.first);
+      if (p.second) p.second->vscan(mark);
+    }
   }
 
   std::set<String> m_disabled;
@@ -65,7 +72,7 @@ const StaticString
   s_data("data");
 
 bool disableWrapper(const String& scheme) {
-  String lscheme = f_strtolower(scheme);
+  String lscheme = HHVM_FN(strtolower)(scheme);
   bool ret = false;
 
   // Unregister request-specific wrappers entirely
@@ -93,7 +100,7 @@ bool disableWrapper(const String& scheme) {
 }
 
 bool restoreWrapper(const String& scheme) {
-  String lscheme = f_strtolower(scheme);
+  String lscheme = HHVM_FN(strtolower)(scheme);
   bool ret = false;
 
   // Unregister request-specific wrapper
@@ -117,7 +124,7 @@ bool restoreWrapper(const String& scheme) {
 
 bool registerRequestWrapper(const String& scheme,
                             std::unique_ptr<Wrapper> wrapper) {
-  String lscheme = f_strtolower(scheme);
+  String lscheme = HHVM_FN(strtolower)(scheme);
 
   // Global, non-disabled wrapper
   if ((s_wrappers.find(lscheme.data()) != s_wrappers.end()) &&
@@ -156,10 +163,26 @@ Array enumWrappers() {
 }
 
 Wrapper* getWrapper(const String& scheme, bool warn /*= false */) {
-  String lscheme = f_strtolower(scheme);
+  /* As include() and require() support streams, we sometimes need to look up
+   * a wrapper outside of a request - eg in HPHP::lookupUnit when using
+   * StatCache. We can't look at the request locals then, as:
+   * 1. requestShutdown has already been called
+   * 2. dereferencing s_request_wrappers will call requestInit, and register
+   *    a request shutdown event handler
+   * 3. the list of request event handlers is a req::vector, so it gets lost
+   *    at the end of the request.
+   *
+   * The result of this is that s_request_wrappers is no longer request-local -
+   * requestInit() and requestShutdown() will never be called again. As it
+   * holds references to request-allocated data, this leads to intermittent
+   * segfaults.
+   */
+  bool have_request_wrappers = s_request_wrappers.getInited();
+
+  String lscheme = HHVM_FN(strtolower)(scheme);
 
   // Request local wrapper?
-  {
+  if (have_request_wrappers) {
     auto it = s_request_wrappers->m_wrappers.find(lscheme);
     if (it != s_request_wrappers->m_wrappers.end()) {
       return it->second.get();
@@ -170,8 +193,9 @@ Wrapper* getWrapper(const String& scheme, bool warn /*= false */) {
   {
     auto it = s_wrappers.find(lscheme.data());
     if ((it != s_wrappers.end()) &&
+        (!have_request_wrappers ||
         (s_request_wrappers->m_disabled.find(lscheme) ==
-         s_request_wrappers->m_disabled.end())) {
+         s_request_wrappers->m_disabled.end()))) {
       return it->second;
     }
   }
@@ -183,7 +207,7 @@ Wrapper* getWrapper(const String& scheme, bool warn /*= false */) {
 }
 
 String getWrapperProtocol(const char* uri_string, int* pathIndex) {
-  /* Special case for PHP4 Backward Compatability */
+  /* Special case for PHP4 Backward Compatibility */
   if (!strncasecmp(uri_string, "zlib:", sizeof("zlib:") - 1)) {
     return s_compress_zlib;
   }

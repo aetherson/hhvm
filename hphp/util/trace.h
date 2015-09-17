@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -21,7 +21,7 @@
 #include <vector>
 #include <stdarg.h>
 
-#include "folly/Format.h"
+#include <folly/Format.h>
 
 #include "hphp/util/assertions.h"
 #include "hphp/util/portability.h"
@@ -91,7 +91,10 @@ namespace Trace {
       TM(asmx64)        \
       TM(atomicvector)  \
       TM(bcinterp)      \
+      TM(bisector)      \
+      TM(class_load)     \
       TM(datablock)     \
+      TM(decreftype)    \
       TM(debugger)      \
       TM(debuggerflow)  \
       TM(debuginfo)     \
@@ -101,6 +104,7 @@ namespace Trace {
       TM(fr)            \
       TM(gc)            \
       TM(heap)          \
+      TM(heapreport)    \
       TM(hhas)          \
       TM(hhbbc)         \
       TM(hhbbc_dce)     \
@@ -108,11 +112,27 @@ namespace Trace {
       TM(hhbbc_emit)    \
       TM(hhbbc_index)   \
       TM(hhbbc_time)    \
+      TM(hhbbc_iface)   \
       TM(hhbc)          \
+      TM(vasm)          \
+      TM(vasm_copy)     \
+      TM(vasm_phi)      \
       TM(hhir)          \
       TM(hhirTracelets) \
+      TM(hhir_cfg)      \
+      TM(hhir_checkhoist) \
       TM(hhir_dce)      \
+      TM(hhir_store)    \
+      TM(hhir_alias)    \
+      TM(hhir_loop)     \
+      TM(hhir_load)     \
+      TM(hhir_refineTmps) \
+      TM(hhir_gvn)      \
       TM(hhir_refcount) \
+      TM(layout)        \
+      TM(hhir_licm)     \
+      TM(llvm)          \
+      TM(llvm_count)    \
       TM(inlining)      \
       TM(instancebits)  \
       TM(intercept)     \
@@ -128,10 +148,12 @@ namespace Trace {
       TM(refcount)      \
       TM(regalloc)      \
       TM(region)        \
+      TM(reusetc)       \
       TM(ringbuffer)    \
       TM(runtime)       \
       TM(servicereq)    \
-      TM(smartalloc)    \
+      TM(simplify)      \
+      TM(mm)            \
       TM(stat)          \
       TM(statgroups)    \
       TM(stats)         \
@@ -145,6 +167,7 @@ namespace Trace {
       TM(unwind)        \
       TM(ustubs)        \
       TM(xenon)         \
+      TM(objprof)       \
       TM(xls)           \
       /* Stress categories, to exercise rare paths */ \
       TM(stress_txInterpPct)  \
@@ -213,7 +236,8 @@ std::string prettyNode(const char* name, const P1& p1, const P2& p2) {
     string(")");
 }
 
-void traceRelease(const char*, ...) ATTRIBUTE_PRINTF(1,2);
+void traceRelease(ATTRIBUTE_PRINTF_STRING const char*, ...)
+  ATTRIBUTE_PRINTF(1,2);
 void traceRelease(const std::string& s);
 
 template<typename... Args>
@@ -221,12 +245,12 @@ void ftraceRelease(Args&&... args) {
   traceRelease("%s", folly::format(std::forward<Args>(args)...).str().c_str());
 }
 
-// Trace to the global ring buffer in all builds, and also trace normally
-// via the standard TRACE(n, ...) macro.
-#define TRACE_RB(n, ...)                            \
-  HPHP::Trace::traceRingBufferRelease(__VA_ARGS__); \
+// Trace to the global ring buffer and the normal TRACE destination.
+#define TRACE_RB(n, ...)                                        \
+  ONTRACE(n, HPHP::Trace::traceRingBufferRelease(__VA_ARGS__)); \
   TRACE(n, __VA_ARGS__);
-void traceRingBufferRelease(const char* fmt, ...) ATTRIBUTE_PRINTF(1,2);
+void traceRingBufferRelease(ATTRIBUTE_PRINTF_STRING const char* fmt, ...)
+  ATTRIBUTE_PRINTF(1,2);
 
 extern int levels[NumModules];
 extern __thread int tl_levels[NumModules];
@@ -336,13 +360,14 @@ inline void itraceImpl(const char* fmtRaw, Args&&... args) {
 #define ITRACE_MOD(mod, level, ...)                             \
   ONTRACE_MOD(mod, level, Trace::itraceImpl(__VA_ARGS__));
 
-void trace(const char *, ...) ATTRIBUTE_PRINTF(1,2);
+void trace(ATTRIBUTE_PRINTF_STRING const char *, ...) ATTRIBUTE_PRINTF(1,2);
 void trace(const std::string&);
 
 template<typename Pretty>
 inline void trace(Pretty p) { trace(p.pretty() + std::string("\n")); }
 
-void vtrace(const char *fmt, va_list args) ATTRIBUTE_PRINTF(1,0);
+void vtrace(ATTRIBUTE_PRINTF_STRING const char *fmt, va_list args)
+  ATTRIBUTE_PRINTF(1,0);
 void dumpRingbuffer();
 
 //////////////////////////////////////////////////////////////////////
@@ -363,6 +388,7 @@ void dumpRingbuffer();
   DEBUG_ONLY static const HPHP::Trace::Module TRACEMOD = HPHP::Trace::name;
 
 #define ITRACE(...)     do { } while (0)
+#define ITRACE_MOD(...) do { } while (0)
 struct Indent {
   Indent() {
     always_assert(true && "If this struct is completely empty we get unused "
@@ -423,7 +449,11 @@ namespace folly {
 template<typename Val>
 struct FormatValue<Val,
                    typename std::enable_if<
-                     HPHP::has_toString<Val, std::string() const>::value,
+                     HPHP::has_toString<Val, std::string() const>::value &&
+                     // This is here because MSVC decides that StringPiece matches
+                     // both this overload as well as the FormatValue overload for
+                     // string-y types in folly itself.
+                     !std::is_same<Val, StringPiece>::value,
                      void
                    >::type> {
   explicit FormatValue(const Val& val) : m_val(val) {}

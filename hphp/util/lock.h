@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -140,41 +140,36 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
-class ConditionalReadLock {
-public:
-  ConditionalReadLock(ReadWriteMutex &mutex, bool condition,
-                      bool profile = true)
-    : m_profiler(profile), m_mutex(mutex), m_acquired(false) {
-    if (condition) {
-      m_mutex.acquireRead();
-      m_acquired = true;
-    }
+struct ReadLock {
+  explicit ReadLock(ReadWriteMutex& mutex, bool profile = true)
+    : m_profiler(profile)
+    , m_mutex(mutex)
+  {
+    m_mutex.acquireRead();
   }
 
-  ~ConditionalReadLock() {
-    if (m_acquired) {
-      m_mutex.release();
-    }
+  ReadLock(const ReadLock&) = delete;
+  ReadLock& operator=(const ReadLock&) = delete;
+
+  ~ReadLock() {
+    m_mutex.release();
   }
 
 private:
   LockProfiler m_profiler;
-  ReadWriteMutex &m_mutex;
-  bool m_acquired;
+  ReadWriteMutex& m_mutex;
 };
 
-class ReadLock : public ConditionalReadLock {
-public:
-  explicit ReadLock(ReadWriteMutex &mutex, bool profile = true)
-    : ConditionalReadLock(mutex, true, profile) {}
-};
-
-class WriteLock {
-public:
-  explicit WriteLock(ReadWriteMutex &mutex, bool profile = true)
-    : m_profiler(profile), m_mutex(mutex) {
+struct WriteLock {
+  explicit WriteLock(ReadWriteMutex& mutex, bool profile = true)
+    : m_profiler(profile)
+    , m_mutex(mutex)
+  {
     m_mutex.acquireWrite();
   }
+
+  WriteLock(const WriteLock&) = delete;
+  WriteLock& operator=(const WriteLock&) = delete;
 
   ~WriteLock() {
     m_mutex.release();
@@ -182,7 +177,7 @@ public:
 
 private:
   LockProfiler m_profiler;
-  ReadWriteMutex &m_mutex;
+  ReadWriteMutex& m_mutex;
 };
 
 ///////////////////////////////////////////////////////////////////////////////

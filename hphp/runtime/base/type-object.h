@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,85 +18,122 @@
 #define incl_HPHP_OBJECT_H_
 
 #include "hphp/runtime/base/object-data.h"
-#include "hphp/runtime/base/smart-ptr.h"
+#include "hphp/runtime/base/req-ptr.h"
 #include "hphp/runtime/base/typed-value.h"
-#include "hphp/runtime/base/types.h"
 
 #include <algorithm>
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-#define null_object Object::s_nullObject
-
 /**
  * Object type wrapping around ObjectData to implement reference count.
  */
-class Object : protected SmartPtr<ObjectData> {
-  typedef SmartPtr<ObjectData> ObjectBase;
+class Object {
+  req::ptr<ObjectData> m_obj;
 
+  using NoIncRef = req::ptr<ObjectData>::NoIncRef;
 public:
   Object() {}
 
-  static const Object s_nullObject;
-
-  ObjectData* get() const { return m_px; }
-  void reset() { ObjectBase::reset(); }
+  ObjectData* get() const { return m_obj.get(); }
+  void reset(ObjectData* obj = nullptr) { m_obj.reset(obj); }
 
   ObjectData* operator->() const {
-    if (!m_px) throw_null_pointer_exception();
-    return m_px;
+    return m_obj.get();
   }
 
   /**
    * Constructors
    */
-  /* implicit */ Object(ObjectData *data) : ObjectBase(data) { }
-  /* implicit */ Object(const Object& src) : ObjectBase(src.m_px) { }
+  explicit Object(ObjectData *data) : m_obj(data) {
+    // The object must have at least two refs here. One pre-existing ref, and
+    // one caused by placing it under m_obj's control.
+    assert(!data || data->hasMultipleRefs());
+  }
+  /* implicit */ Object(const Object& src) : m_obj(src.m_obj) {
+    assert(!m_obj || m_obj->hasMultipleRefs());
+  }
+
+  template <typename T>
+  explicit Object(const req::ptr<T> &ptr) : m_obj(ptr) {
+    assert(!m_obj || m_obj->hasMultipleRefs());
+  }
+
+  template <typename T>
+  explicit Object(req::ptr<T>&& ptr) : m_obj(std::move(ptr)) {
+    assert(!m_obj || m_obj->getCount() > 0);
+  }
+
+  explicit Object(Class* cls)
+    : m_obj(ObjectData::newInstance(cls), NoIncRef{}) {
+    // References to the object can escape inside newInstance, so we only know
+    // that the ref-count is at least 1 here.
+    assert(!m_obj || m_obj->getCount() > 0);
+  }
 
   // Move ctor
-  Object(Object&& src) : ObjectBase(std::move(src)) { }
+  Object(Object&& src) noexcept : m_obj(std::move(src.m_obj)) {
+    assert(!m_obj || m_obj->getCount() > 0);
+  }
 
   // Regular assign
   Object& operator=(const Object& src) {
-    ObjectBase::operator=(src);
-    return *this;
-  }
-  // Move assign
-  Object& operator=(Object&& src) {
-    ObjectBase::operator=(std::move(src));
+    m_obj = src.m_obj;
+    assert(!m_obj || m_obj->hasMultipleRefs());
     return *this;
   }
 
-  ~Object();
+  template <typename T>
+  Object& operator=(const req::ptr<T>& src) {
+    m_obj = src;
+    assert(!m_obj || m_obj->hasMultipleRefs());
+    return *this;
+  }
+
+  // Move assign
+  Object& operator=(Object&& src) {
+    m_obj = std::move(src.m_obj);
+    assert(!m_obj || m_obj->getCount() > 0);
+    return *this;
+  }
+
+  template <typename T>
+  Object& operator=(req::ptr<T>&& src) {
+    m_obj = std::move(src);
+    assert(!m_obj || m_obj->getCount() > 0);
+    return *this;
+  }
 
   /**
    * Informational
    */
-  bool isNull() const {
-    return m_px == nullptr;
-  }
+  explicit operator bool() const { return (bool)m_obj; }
+
+  bool isNull() const { return !m_obj; }
   bool instanceof(const String& s) const {
-    return m_px && m_px->o_instanceof(s);
+    return m_obj && m_obj->instanceof(s);
   }
   bool instanceof(const Class* cls) const {
-    return m_px && m_px->instanceof(cls);
-  }
-
-  template <class T> T& cast() { return *static_cast<T*>(this); }
-  template <class T> const T& cast() const {
-    return *static_cast<const T*>(this);
+    return m_obj && m_obj->instanceof(cls);
   }
 
   /**
    * getTyped() and is() are intended for use with C++ classes that derive
    * from ObjectData.
+   *
+   * Prefer using the following functions instead of getTyped:
+   * o.getTyped<T>(false, false) -> cast<T>(o)
+   * o.getTyped<T>(true,  false) -> cast_or_null<T>(o)
+   * o.getTyped<T>(false, true) -> dyn_cast<T>(o)
+   * o.getTyped<T>(true,  true) -> dyn_cast_or_null<T>(o)
    */
   template<typename T>
-  T *getTyped(bool nullOkay = false, bool badTypeOkay = false) const {
+  [[deprecated("Please use one of the cast family of functions instead.")]]
+  req::ptr<T> getTyped(bool nullOkay = false, bool badTypeOkay = false) const {
     static_assert(std::is_base_of<ObjectData, T>::value, "");
 
-    ObjectData *cur = m_px;
+    ObjectData *cur = get();
     if (!cur) {
       if (!nullOkay) {
         throw_null_pointer_exception();
@@ -110,28 +147,23 @@ public:
       return nullptr;
     }
 
-    return static_cast<T*>(cur);
+    return req::ptr<T>(static_cast<T*>(cur));
   }
 
   template<typename T>
   bool is() const {
-    return getTyped<T>(true, true) != nullptr;
-  }
-
-  template<typename T>
-  T *cast() const {
-    return getTyped<T>();
+    return m_obj && m_obj->instanceof(T::classof());
   }
 
   /**
    * Type conversions
    */
-  bool    toBoolean() const { return m_px ? m_px->o_toBoolean() : false;}
-  char    toByte   () const { return m_px ? m_px->o_toInt64() : 0;}
-  short   toInt16  () const { return m_px ? m_px->o_toInt64() : 0;}
-  int     toInt32  () const { return m_px ? m_px->o_toInt64() : 0;}
-  int64_t toInt64  () const { return m_px ? m_px->o_toInt64() : 0;}
-  double  toDouble () const { return m_px ? m_px->o_toDouble() : 0;}
+  bool    toBoolean() const { return m_obj ? m_obj->toBoolean() : false; }
+  char    toByte   () const { return toInt64(); }
+  int16_t toInt16  () const { return toInt64(); }
+  int32_t toInt32  () const { return toInt64(); }
+  int64_t toInt64  () const { return m_obj ? m_obj->toInt64() : 0; }
+  double  toDouble () const { return m_obj ? m_obj->toDouble() : 0; }
   String  toString () const;
   Array   toArray  () const;
 
@@ -141,42 +173,58 @@ public:
   /**
    * Comparisons
    */
-  bool same (const Object& v2) const { return m_px == v2.get();}
-  bool equal(const Object& v2) const;
-  bool less (const Object& v2) const;
-  bool more (const Object& v2) const;
+  bool same(const Object& v2) const { return m_obj == v2.m_obj; }
+  bool equal(const Object& v2) const {
+    return m_obj ?
+      (v2.m_obj && m_obj->equal(*v2.m_obj.get())) :
+      !v2.m_obj;
+  }
+  bool less(const Object& v2) const {
+    return m_obj ?
+      (v2.m_obj && m_obj->less(*v2.m_obj.get())) :
+      static_cast<bool>(v2.m_obj);
+  }
+  bool lessEqual(const Object& v2) const { return less(v2) || equal(v2); }
+  bool more(const Object& v2) const {
+    return m_obj && (!v2.m_obj || m_obj->more(*v2.m_obj.get()));
+  }
+  bool moreEqual(const Object& v2) const { return more(v2) || equal(v2); }
 
   Variant o_get(const String& propName, bool error = true,
                 const String& context = null_string) const;
   Variant o_set(
     const String& s, const Variant& v, const String& context = null_string);
 
-  /**
-   * Input/Output
-   */
-  void serialize(VariableSerializer *serializer) const;
-
   void setToDefaultObject();
 
   // Transfer ownership of our reference to this object.
-  ObjectData *detach() {
-    ObjectData *ret = m_px;
-    m_px = nullptr;
-    return ret;
-  }
+  ObjectData *detach() { return m_obj.detach(); }
 
   // Take ownership of a reference without touching the ref count
   static Object attach(ObjectData *object) {
-    Object o;
-    o.m_px = object;
-    return o;
+    assert(!object || object->getCount() > 0);
+    return Object{req::ptr<ObjectData>::attach(object)};
   }
 
 private:
+  template <typename T>
+  friend typename std::enable_if<
+    std::is_base_of<ObjectData,T>::value,
+    ObjectData*
+  >::type deref(const Object& o) { return o.get(); }
+
+  template <typename T>
+  friend typename std::enable_if<
+    std::is_base_of<ObjectData,T>::value,
+    ObjectData*
+  >::type detach(Object&& o) { return o.detach(); }
+
   static void compileTimeAssertions();
 
   const char* classname_cstr() const;
 };
+
+extern const Object null_object;
 
 ///////////////////////////////////////////////////////////////////////////////
 // ObjNR

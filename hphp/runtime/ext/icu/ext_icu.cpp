@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -23,6 +23,7 @@
 #include <unicode/translit.h>
 #include <unicode/uregex.h>
 #include <unicode/ustring.h>
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/ext/icu/LifeEventTokenizer.h"
 #include "hphp/runtime/ext/icu/ICUMatcher.h"
 #include "hphp/runtime/ext/icu/ICUTransliterator.h"
@@ -46,11 +47,8 @@ static Variant HHVM_FUNCTION(icu_match, const String& pattern,
                                         int64_t flags /* = 0 */) {
   UErrorCode status = U_ZERO_ERROR;
 
-  Array matchesArr;
-  if (matches.isReferenced()) {
-    matchesArr = Array::Create();
-  }
-  SCOPE_EXIT { if (matches.isReferenced()) matches = matchesArr; };
+  Array matchesArr = Array::Create();
+  SCOPE_EXIT { matches.assignIfRef(matchesArr); };
 
   // Create hash map key by concatenating pattern and flags.
   StringBuffer bpattern;
@@ -135,7 +133,7 @@ static Variant HHVM_FUNCTION(icu_match, const String& pattern,
 
 class TransliteratorWrapper {
 public:
-  TransliteratorWrapper() {
+  void initialize() {
     UnicodeString basicID("Any-Latin ; NFKD; [:nonspacing mark:] Remove");
     UnicodeString basicIDAccent("Any-Latin ; NFKC");
     UErrorCode status = U_ZERO_ERROR;
@@ -154,6 +152,7 @@ public:
   }
 
   void transliterate(UnicodeString& u_str) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_tl) {
       m_tl->transliterate(u_str);
     } else {
@@ -162,6 +161,7 @@ public:
   }
 
   void transliterate_with_accents(UnicodeString& u_str) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_tl_accent) {
       m_tl_accent->transliterate(u_str);
     } else {
@@ -172,17 +172,18 @@ public:
 private:
   Transliterator* m_tl;
   Transliterator* m_tl_accent;
+  std::mutex m_mutex;
 };
 
-IMPLEMENT_THREAD_LOCAL(TransliteratorWrapper, s_transliterator);
+static TransliteratorWrapper s_transliterator;
 
 static String HHVM_FUNCTION(icu_transliterate, const String& str,
                                                bool remove_accents) {
   UnicodeString u_str = UnicodeString::fromUTF8(str.data());
   if (remove_accents) {
-    s_transliterator->transliterate(u_str);
+    s_transliterator.transliterate(u_str);
   } else {
-    s_transliterator->transliterate_with_accents(u_str);
+    s_transliterator.transliterate_with_accents(u_str);
   }
 
   // Convert UnicodeString back to UTF-8.
@@ -330,6 +331,12 @@ static Array HHVM_FUNCTION(icu_tokenize, const String& text) {
 const StaticString s_UREGEX_OFFSET_CAPTURE("UREGEX_OFFSET_CAPTURE");
 
 void IntlExtension::initICU() {
+  // We need this initialization to be done late
+  // so that ICU's dynamic initializers have had
+  // a chance to run, which is important if we've
+  // linked against a static libICU.
+  s_transliterator.initialize();
+
   HHVM_FE(icu_match);
   HHVM_FE(icu_transliterate);
   HHVM_FE(icu_tokenize);

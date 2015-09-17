@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,7 @@
 #ifndef incl_HPHP_VM_REPO_HELPERS_H_
 #define incl_HPHP_VM_REPO_HELPERS_H_
 
+#include "hphp/runtime/base/attr.h"
 #include "hphp/runtime/base/types.h"
 
 #include "hphp/util/md5.h"
@@ -42,9 +43,9 @@ enum RepoId {
   RepoIdCount   =  2 // Number of database IDs.
 };
 
-class RepoExc : public std::exception {
- public:
-  RepoExc(const char* fmt, ...) ATTRIBUTE_PRINTF(2, 3) {
+struct RepoExc : std::exception {
+  RepoExc(ATTRIBUTE_PRINTF_STRING const char* fmt, ...)
+    ATTRIBUTE_PRINTF(2, 3) {
     va_list(ap);
     va_start(ap, fmt);
     char* msg;
@@ -56,9 +57,8 @@ class RepoExc : public std::exception {
     }
     va_end(ap);
   }
-  ~RepoExc() throw() {}
   const std::string& msg() const { return m_msg; }
-  const char* what() const throw() { return m_msg.c_str(); }
+  const char* what() const noexcept override { return m_msg.c_str(); }
 
  private:
   std::string m_msg;

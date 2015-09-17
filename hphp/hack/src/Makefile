@@ -1,225 +1,245 @@
-# Copyright (c) 2014, Facebook, Inc.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the "hack" directory of this source tree. An additional grant
-# of patent rights can be found in the PATENTS file in the same directory.
+################################################################################
+#                            Variables to override                             #
+################################################################################
 
-##############################################################################
-# Variables
-##############################################################################
-TOP=$(shell pwd)
-TARGET=hack
+EXTRA_INCLUDE_PATHS=
+EXTRA_LIB_PATHS=
+EXTRA_CC_FLAGS=
+
+################################################################################
+#                              OS-dependent stuff                              #
+################################################################################
 
 OS=$(shell uname -s)
-
-#------------------------------------------------------------------------------
-#package dependencies
-#------------------------------------------------------------------------------
-BUILD_DIRS=stubs
-BUILD_CMAS=stubs/lib.cma
-EXTRA_INCLUDEDIRS=
-FILTER_FROM_INCLUDE=
-PROGS=hh_single hh_server hh_client
-
-# If you want to build the JS typechecker, uncomment these lines. Requires
-# js_of_ocaml, and is kind of slow to build, which is why it's off by default.
-#
-# We filter js/ because it contains an incompatible str.ml file
-# that would then confuse ocamldepend
-#BUILD_DIRS+=js
-#FILTER_FROM_INCLUDE=js
-
-#------------------------------------------------------------------------------
-# Main variables
-#------------------------------------------------------------------------------
-SYSLIBS=nums.cma bigarray.cma str.cma unix.cma $(EXTLIBS)
+ROOT=$(shell pwd)
 
 ifeq ($(OS), Linux)
-  INOTIFY=inotify
-  INOTIFYLIB=inotify/inotify.cma
+  INOTIFY=third-party/inotify
   FSNOTIFY=fsnotify_linux
-  FSNOTIFYLIB=fsnotify_linux/lib.cma
+  ELF=elf
+  FRAMEWORKS=
+  SECTCREATE=
 endif
 ifeq ($(OS), Darwin)
-  FSEVENTS=fsevents
-  FSEVENTSLIB=fsevents/fsevents.cma 
+  INOTIFY=fsevents
   FSNOTIFY=fsnotify_darwin
-  FSNOTIFYLIB=fsnotify_darwin/lib.cma
-  SECTCREATE=-cclib "-sectcreate __text hhi ../bin/hhi.tar.gz"
+  ELF=
+  FRAMEWORKS=CoreServices CoreFoundation
+  SECTCREATE=-cclib -sectcreate -cclib __text -cclib hhi -cclib $(ROOT)/../bin/hhi.tar.gz
 endif
 
-LIBS=$(INOTIFYLIB) $(FSEVENTSLIB)\
- $(FSNOTIFYLIB) \
- utils/utils.cma \
- hhi/hhi.cma \
- avl/lib.cma \
- dfind/lib.cma \
- globals/lib.cma \
- heap/heap.cma procs/lib.cma \
- deps/lib.cma parsing/lib.cma search/lib.cma naming/lib.cma typing/lib.cma \
- socket/lib.cma \
- $(BUILD_CMAS) \
- server/lib.cma \
- client/lib.cma
+################################################################################
+#                                 Definitions                                  #
+################################################################################
 
-MAKESUBDIRS=$(INOTIFY) $(FSEVENTS) \
- utils \
- $(FSNOTIFY) \
- avl dfind \
- globals \
- hhi \
- heap procs \
- deps parsing search naming typing \
- server \
- socket \
- client \
- $(BUILD_DIRS)
+MODULES=\
+  client\
+  deps\
+  dfind\
+  emitter\
+  format\
+  globals\
+  h2tp/common\
+  h2tp/mapper\
+  h2tp/test\
+  h2tp/unparser\
+  h2tp\
+  heap\
+  hh_matcher\
+  hh_matcher/test\
+  hhi\
+  naming\
+  parsing\
+  procs\
+  search\
+  server\
+  socket\
+  stubs\
+  third-party/avl\
+  third-party/core\
+  typing\
+  utils\
+  $(FSNOTIFY)\
+  $(INOTIFY)
 
-INCLUDEDIRS=$(filter-out $(FILTER_FROM_INCLUDE),$(MAKESUBDIRS)) \
- $(EXTRA_INCLUDEDIRS)
+NATIVE_OBJECT_FILES=\
+  heap/hh_shared.o\
+  hhi/hhi_elf.o\
+  hhi/hhi_win32res_stubs.o\
+  utils/files.o\
+  utils/get_build_id.gen.o\
+  utils/get_build_id.o\
+  utils/handle_stubs.o\
+  utils/nproc.o\
+  utils/realpath.o\
+  utils/sysinfo.o\
+  $(INOTIFY)/$(notdir $(INOTIFY))_stubs.o
 
-##############################################################################
-# Generic
-##############################################################################
--include $(TOP)/Makefile.common
+OCAML_LIBRARIES=\
+  str\
+  unix\
+  bigarray
 
-##############################################################################
-# Top rules
-##############################################################################
+NATIVE_LIBRARIES=\
+  pthread\
+  $(ELF)
 
-.PHONY:: all all.opt opt top clean distclean bin
+TARGETS=_build/hh_server.native _build/hh_client.native \
+		_build/hh_single_type_check.native _build/hh_emitter.native \
+		_build/hh_format.native _build/h2tp.native _build/test_unparser.native \
+		_build/hh_match.native \
+		_build/code_extent_tests.native \
+		_build/matcher_test.native \
+		_build/patcher_api_test.native \
+		_build/patcher_module_test.native \
+		_build/patcher_test.native
 
-all:: opt
-opt:
-	$(MAKE) rec.opt
-	$(MAKE) hhi_archive
-	$(MAKE) $(PROGS:=.opt)
-	$(MAKE) bin
-bc:
-	$(MAKE) rec
-	$(MAKE) hhi_archive
-	$(MAKE) $(PROGS:=.bc)
-top: $(TARGET).top
+# Find all source files (all files not in _build dir)
+ALL_SRC_FILES=$(call rwildcard,$(patsubst _build,,$(wildcard *)),*.*)
 
+################################################################################
+#                                    Rules                                     #
+################################################################################
 
-hhi_archive:
+INCLUDE_OPTS=$(foreach dir,$(MODULES),-I $(dir))
+LIB_OPTS=$(foreach lib,$(OCAML_LIBRARIES),-lib $(lib))
+NATIVE_LIB_OPTS=$(foreach lib, $(NATIVE_LIBRARIES),-cclib -l$(lib))
+EXTRA_NATIVE_LIB_OPTS=$(foreach lib, $(EXTRA_NATIVE_LIBRARIES),-cclib -l$(lib))
+EXTRA_INCLUDE_OPTS=$(foreach dir, $(EXTRA_INCLUDE_PATHS),-ccopt -I$(dir))
+EXTRA_CC_OPTS=$(foreach opt, $(EXTRA_CC_FLAGS),-ccopt $(opt))
+EXTRA_LIB_OPTS=$(foreach dir, $(EXTRA_LIB_PATHS),-cclib -L$(dir))
+FRAMEWORK_OPTS=$(foreach framework, $(FRAMEWORKS),-cclib -framework -cclib $(framework))
+
+LINKER_FLAGS=$(NATIVE_OBJECT_FILES) $(NATIVE_LIB_OPTS) $(EXTRA_LIB_OPTS) \
+	     $(EXTRA_NATIVE_LIB_OPTS) $(FRAMEWORK_OPTS) $(SECTCREATE)
+# Function to recursively find files, eg: $(call rwildcard,dir/to/look/in/,*.c)
+rwildcard=$(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
+
+all: build-hhi-archive build-hack copy-hack-files
+all-ocp: build-hhi-archive build-hack-with-ocp copy-hack-files-ocp
+
+clean:
+	ocamlbuild -clean
+	find ../bin -mindepth 1 -not -path ../bin/README -delete
+	rm -f utils/get_build_id.gen.c
+
+build-hack: $(TARGETS) build-hhi-archive
+
+build-hack-with-ocp: build-hhi-archive build-hack-stubs-with-ocp
+	[ -d ${ROOT}/../_obuild ] || ( cd ${ROOT}/.. && ocp-build init )
+	ocp-build build
+
+# All targets are built in one time, so no parallelization is necessary
+.NOTPARALLEL: $(TARGETS)
+# As there is no efficient way to calculate the dependencies of
+# the targets, we make them dependent on all files. In doing this
+# we ensure that no rebuild is necessary if nothing has changed
+$(TARGETS): $(ALL_SRC_FILES)
+	# build-hack-native-deps is a dependency of $(TARGETS) but as it is phony
+	# we place it here to avoid unnecessary rebuilds
+	$(MAKE) build-hack-native-deps build-hhi-archive
+	ocamlbuild -no-links -cflag -g $(INCLUDE_OPTS) $(LIB_OPTS) \
+		-lflags "-g $(LINKER_FLAGS)" \
+		$(patsubst _build/%,%,$(TARGETS))
+	# Touching the targets is necessary because the ocaml build
+	# doesn't change the modification dates of the targets if
+	# the new binaries are exactly the same as the old ones
+	touch $(TARGETS)
+
+build-hack-native-deps: build-hack-stubs
+	ocamlbuild -cflags "-g $(EXTRA_INCLUDE_OPTS) $(EXTRA_CC_OPTS)" $(NATIVE_OBJECT_FILES)
+
+# If you modify this rule, do not forget to edit the file
+# `$(ROOT)/scripts/gen_build_id.ml` used on Windows.
+build-hack-stubs:
+	REV="const char* const BuildInfo_kRevision = \"$$(git rev-parse HEAD || hg id -i)\";"; \
+	if [ "$$REV" != "$$(cat utils/get_build_id.gen.c 2>/dev/null)" ]; then echo "$$REV" > utils/get_build_id.gen.c; fi
+
+build-hack-stubs-with-ocp:
+	cd $(ROOT)/.. && \
+        ocaml unix.cma scripts/gen_build_id.ml src/utils/get_build_id.gen.c
+
+build-hhi-archive:
+	mkdir -p ../bin
 	$(MAKE) -C ../hhi
 
-rec:
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i all || exit 1; done
-
-rec.opt:
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i all.opt || exit 1; done
-
-hack.top: $(LIBS) $(OBJS)
-	$(OCAMLMKTOP) -o $@ $(SYSLIBS) threads.cma $^
-
-
-top_single: $(LIBS) $(OBJS) hh_single_type_check.cmo
-	$(OCAMLMKTOP) -custom -o $@ $(SYSLIBS) $^
-
-hh_single.bc: $(LIBS) $(OBJS) hh_single_type_check.cmo
-	$(OCAMLC) -custom -o $@ $(SYSLIBS) $^
-hh_single.opt: $(LIBS:.cma=.cmxa) $(OBJS:.cmo=.cmx) hh_single_type_check.cmx
-	$(OCAMLOPT) -o $@ $(SYSLIBS:.cma=.cmxa)  $^
-
-hh_format.bc: $(LIBS) $(OBJS) hh_format.cmo
-	$(OCAMLC) -custom -o $@ $(SYSLIBS) $^
-hh_format.opt: $(LIBS:.cma=.cmxa) $(OBJS:.cmo=.cmx) hh_format.cmx
-	$(OCAMLOPT) -o $@ $(SYSLIBS:.cma=.cmxa)  $^
-
-hh_server.bc: $(LIBS) $(OBJS) hh_server.cmo
-	$(OCAMLC) $(SECTCREATE) -custom -o $@ $(SYSLIBS) $^
-hh_server.opt: $(LIBS:.cma=.cmxa) $(OBJS:.cmo=.cmx) hh_server.cmx
-	$(OCAMLOPT) $(SECTCREATE) -o $@ $(SYSLIBS:.cma=.cmxa)  $^
-
-hh_client.bc: $(LIBS) $(OBJS) hh_client.cmo
-	$(OCAMLC) -custom -o $@ $(SYSLIBS) $^
-hh_client.opt: $(LIBS:.cma=.cmxa) $(OBJS:.cmo=.cmx) hh_client.cmx
-	$(OCAMLOPT) -o $@ $(SYSLIBS:.cma=.cmxa)  $^
-
-
-hh_server.cmo: hh_server.ml
-	$(OCAMLC) -c $<
-
-hh_server.cmx: hh_server.ml
-	$(OCAMLOPT) -c $<
-
-
-clean::
-	rm -f *.bc *.opt *.top
-
-clean::
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i clean; done
-
-depend::
-	ocamldep $(INCLUDES) *.ml *.mli > .depend
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i depend; done
-
-distclean:: clean
-	set -e; for i in $(MAKESUBDIRS); do $(MAKE) -C $$i $@; done
-	rm -f .depend
-
-##############################################################################
-# Install
-##############################################################################
-
-bin:
+copy-hack-files: build-hack
+	mkdir -p ../bin
 ifeq ($(OS), Linux)
-	objcopy --add-section hhi=../bin/hhi.tar.gz hh_server.opt ../bin/hh_server
+	objcopy --add-section hhi=../bin/hhi.tar.gz _build/hh_server.native ../bin/hh_server
 else
-	cp hh_server.opt ../bin/hh_server
+	cp _build/hh_server.native ../bin/hh_server
 endif
-	cp hh_client.opt ../bin/hh_client
-	cp hh_single.opt ../bin/hh_single_type_check
+	cp _build/hh_client.native ../bin/hh_client
+	cp _build/hh_single_type_check.native ../bin/hh_single_type_check
+	cp _build/hh_emitter.native ../bin/hh_emitter
+	cp _build/hh_format.native ../bin/hh_format
+	cp _build/h2tp/h2tp.native ../bin/h2tp
+	cp _build/hh_match.native ../bin/hh_match
 
-stamp:
-	rm -f utils/get_build_id.gen.c
-	$(MAKE) -C utils get_build_id.gen.c
-
-deploy:
-	$(MAKE) stamp
-	$(MAKE)
-ifneq ($(wildcard facebook/deploy.sh),)
-	./facebook/deploy.sh
+copy-hack-files-ocp: build-hack-with-ocp
+	mkdir -p ../bin
+ifeq ($(OS), Linux)
+	objcopy --add-section hhi=../bin/hhi.tar.gz ../_obuild/hh_server/hh_server.asm ../bin/hh_server
 else
-	@echo
-	@echo "**********************************************************"
-	@echo "../bin/hh_server and ../bin/hh_client ready for deployment"
-	@echo "**********************************************************"
+	cp ../_obuild/hh_server/hh_server.asm ../bin/hh_server
 endif
+	cp ../_obuild/hh_client/hh_client.asm ../bin/hh_client
+	cp ../_obuild/hh_single_type_check/hh_single_type_check.asm ../bin/hh_single_type_check
+	cp ../_obuild/hh_format/hh_format.asm ../bin/hh_format
+	cp ../_obuild/h2tp/h2tp.asm ../bin/h2tp
+	cp ../_obuild/hh_match.asm ../bin/hh_match
 
-##############################################################################
-# Developer rules
-##############################################################################
+copy-match-test-files:
+	mkdir -p ../bin
+	cp _build/hh_matcher/test/code_extent_tests.native \
+		../bin/code_extent_test_driver
+	cp _build/hh_matcher/test/matcher_test.native \
+		../bin/hh_match_test_driver
+	cp _build/hh_matcher/test/patcher_module_test.native \
+		../bin/hh_patch_module_test_driver
+	cp _build/hh_matcher/test/patcher_api_test.native \
+		../bin/hh_patch_api_test_driver
+	cp _build/hh_matcher/test/patcher_test.native \
+		../bin/hh_patch_test_driver
 
-test:
-	# Make sure we have no shift/reduce conflicts
-	ocamlyacc -v parsing/parser.mly 2>&1 | grep -L conflict | grep -q .
-	rm -f parsing/parser.mli parsing/parser.ml
-	# Run tests
-	../test/typecheck/verify_quick_hack ../bin/hh_single_type_check
-	../test/suggest/verify_quick_hack ../bin/hh_single_type_check
+copy-match-test-files-ocp:
+	mkdir -p ../bin
+	cp _obuild/hh_matcher/test/code_extent_tests.asm \
+		../bin/code_extent_test_driver
+	cp _obuild/hh_matcher/test/matcher_test.asm \
+		../bin/hh_match_test_driver
+	cp _obuild/hh_matcher/test/patcher_module_test.asm \
+		../bin/hh_patch_module_test_driver
+	cp _obuild/hh_matcher/test/patcher_api_test.asm \
+		../bin/hh_patch_api_test_driver
+	cp _obuild/hh_matcher/test/patcher_test.asm \
+		../bin/hh_patch_test_driver
 
-wwwtest:
-	../bin/hh_server --check /var/www
+.PHONY: test test-ocp do-test
+test: build-hack copy-hack-files copy-match-test-files
+	${MAKE} do-test
 
-DIRS=$(INCLUDEDIRS)
-ifdef TEST
-debug:
-	make hh_single.bc
-	$(info Debugging $(TEST))
-	ocamldebug $(patsubst %,-I %,$(DIRS)) ./hh_single.bc $(TEST)
-else
-debug:
-	$(info Set the TEST env variable to the test you want to debug)
-	$(info For example: export TEST=../test/typecheck/my_test.php)
-endif
+test-ocp: build-hack-with-ocp copy-hack-files-ocp copy match-test-files-ocp
+	${MAKE} do-test
 
-debug_client:
-	make hh_client.bc
-	ocamldebug $(patsubst %,-I %,$(DIRS)) ./hh_client.bc
-
-# everybody can customize in its own repo his own Makefile.user
--include Makefile.user
+do-test:
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/autocomplete
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/color
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/colour
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/coverage
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/dumpsymbolinfo
+	python3 ../test/verify.py --program ../bin/hh_format ../test/format
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/suggest
+	python3 ../test/verify.py --program ../bin/hh_single_type_check ../test/typecheck
+	python3 ../test/verify.py --program ../bin/hh_format ../test/typecheck \
+		--disabled-extension .no_format \
+		--out-extension .format_out \
+		--expect-extension '' \
+		--flags --root .
+	python3 ../test/verify.py --program ../bin/code_extent_test_driver ../test/hh_matcher/code_extent
+	python3 ../test/verify.py --program ../bin/hh_match_test_driver ../test/hh_matcher/matcher_tests
+	python3 ../test/verify.py --program ../bin/hh_patch_module_test_driver ../test/hh_matcher/patcher_module_tests
+	python3 ../test/verify.py --program ../bin/hh_patch_api_test_driver ../test/hh_matcher/patcher_api_tests
+	python3 ../test/verify.py --program ../bin/hh_patch_test_driver ../test/hh_matcher/patcher_tests
+	python3 ../test/integration/runner.py hh_server hh_client

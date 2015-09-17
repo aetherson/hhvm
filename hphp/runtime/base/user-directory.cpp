@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,7 @@
 #include "hphp/runtime/base/user-directory.h"
 #include "hphp/runtime/base/runtime-error.h"
 #include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/ext/stream/ext_stream.h"
 
 namespace HPHP {
 
@@ -33,6 +34,10 @@ UserDirectory::UserDirectory(Class* cls) : UserFSNode(cls) {
   m_DirClose = lookupMethod(s_dir_closedir.get());
   m_DirRead  = lookupMethod(s_dir_readdir.get());
   m_DirRewind  = lookupMethod(s_dir_rewinddir.get());
+}
+
+void UserDirectory::sweep() {
+  // Don't close like the parent, 'cause that's what zend does
 }
 
 bool UserDirectory::open(const String& path) {

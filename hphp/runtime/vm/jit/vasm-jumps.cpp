@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2013 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -14,29 +14,21 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/vm/jit/vasm-x64.h"
-#include <boost/dynamic_bitset.hpp>
-#include <algorithm>
+#include "hphp/runtime/vm/jit/vasm.h"
 
-TRACE_SET_MOD(hhir);
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-print.h"
+#include "hphp/runtime/vm/jit/vasm-unit.h"
+#include "hphp/runtime/vm/jit/vasm-visit.h"
+
+#include <boost/dynamic_bitset.hpp>
+
+#include <algorithm>
+#include <cstdint>
+
+TRACE_SET_MOD(vasm);
 
 namespace HPHP { namespace jit {
-using namespace X64;
-
-namespace X64 {
-
-PredVector computePreds(Vunit& unit) {
-  PredVector preds(unit.blocks.size());
-  PostorderWalker walker(unit);
-  walker.dfs([&](Vlabel b) {
-    for (auto s: succs(unit.blocks[b])) {
-      preds[s].push_back(b);
-    }
-  });
-  return preds;
-}
-
-}
 
 void optimizeJmps(Vunit& unit) {
   auto isEmpty = [&](Vlabel b, Vinstr::Opcode op) {
@@ -45,10 +37,13 @@ void optimizeJmps(Vunit& unit) {
   };
   bool changed = false;
   bool ever_changed = false;
+  // The number of incoming edges from (reachable) predecessors for each block.
+  // It is maintained as an upper bound of the actual value during the
+  // transformation.
   jit::vector<int> npreds(unit.blocks.size(), 0);
   do {
     if (changed) {
-      fill(npreds.begin(), npreds.end(), 0);
+      std::fill(begin(npreds), end(npreds), 0);
     }
     changed = false;
     PostorderWalker{unit}.dfs([&](Vlabel b) {
@@ -56,49 +51,74 @@ void optimizeJmps(Vunit& unit) {
         npreds[s]++;
       }
     });
-    // give roots an extra predecessor to prevent cloning them.
-    for (auto b : unit.roots) {
-      npreds[b]++;
-    }
+    // give entry an extra predecessor to prevent cloning it.
+    npreds[unit.entry]++;
+
     PostorderWalker{unit}.dfs([&](Vlabel b) {
       auto& block = unit.blocks[b];
       auto& code = block.code;
-      assert(!code.empty());
+      assertx(!code.empty());
       if (code.back().op == Vinstr::jcc) {
         auto ss = succs(block);
         if (ss[0] == ss[1]) {
           // both edges have same target, change to jmp
           code.back() = jmp{ss[0]};
+          --npreds[ss[0]];
+          changed = true;
+        } else {
+          auto jcc_i = code.back().jcc_;
+          if (isEmpty(jcc_i.targets[0], Vinstr::fallback)) {
+            jcc_i = jcc{ccNegate(jcc_i.cc), jcc_i.sf,
+                        {jcc_i.targets[1], jcc_i.targets[0]}};
+          }
+          if (isEmpty(jcc_i.targets[1], Vinstr::fallback)) {
+            // replace jcc with fallbackcc and jmp
+            const auto& fb_i = unit.blocks[jcc_i.targets[1]].code[0].fallback_;
+            const auto t0 = jcc_i.targets[0];
+            const auto jcc_origin = code.back().origin;
+            code.pop_back();
+            code.emplace_back(
+              fallbackcc{jcc_i.cc, jcc_i.sf, fb_i.target,
+                         fb_i.spOff, fb_i.trflags, fb_i.args}
+            );
+            code.back().origin = jcc_origin;
+            code.emplace_back(jmp{t0});
+            code.back().origin = jcc_origin;
+            changed = true;
+          }
+        }
+      }
+
+      for (auto& s : succs(block)) {
+        if (isEmpty(s, Vinstr::jmp)) {
+          // skip over s
+          --npreds[s];
+          s = unit.blocks[s].code.back().jmp_.target;
+          ++npreds[s];
           changed = true;
         }
       }
+
       if (code.back().op == Vinstr::jmp) {
-        auto& s = code.back().jmp_.target;
-        if (isEmpty(s, Vinstr::jmp)) {
-          // skip over s
-          s = unit.blocks[s].code.back().jmp_.target;
-          changed = true;
-        } else if (npreds[s] == 1 || isEmpty(s, Vinstr::jcc)) {
+        auto s = code.back().jmp_.target;
+        if (npreds[s] == 1 || isEmpty(s, Vinstr::jcc)) {
           // overwrite jmp with copy of s
           auto& code2 = unit.blocks[s].code;
           code.pop_back();
           code.insert(code.end(), code2.begin(), code2.end());
-          changed = true;
-        }
-      } else {
-        for (auto& s : succs(block)) {
-          if (isEmpty(s, Vinstr::jmp)) {
-            // skip over s
-            s = unit.blocks[s].code.back().jmp_.target;
-            changed = true;
+          if (--npreds[s]) {
+            for (auto ss : succs(block)) {
+              ++npreds[ss];
+            }
           }
+          changed = true;
         }
       }
     });
     ever_changed |= changed;
   } while (changed);
   if (ever_changed) {
-    printUnit("after vasm-jumps", unit);
+    printUnit(kVasmJumpsLevel, "after vasm-jumps", unit);
   }
 }
 

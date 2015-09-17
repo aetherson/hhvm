@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,7 +18,7 @@
 
 #include "hphp/parser/parser.h"
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/unit-cache.h"
 #include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/base/strings.h"
@@ -53,7 +53,7 @@ FuncEmitter::FuncEmitter(UnitEmitter& ue, int sn, Id id, const StringData* n)
   , m_id(id)
   , name(n)
   , top(false)
-  , returnType(KindOfInvalid)
+  , returnType(folly::none)
   , retUserType(nullptr)
   , isClosureBody(false)
   , isAsync(false)
@@ -61,9 +61,12 @@ FuncEmitter::FuncEmitter(UnitEmitter& ue, int sn, Id id, const StringData* n)
   , isPairGenerator(false)
   , isMemoizeImpl(false)
   , isMemoizeWrapper(false)
+  , hasMemoizeSharedProp(false)
   , containsCalls(false)
   , docComment(nullptr)
   , originalFilename(nullptr)
+  , memoizePropName(nullptr)
+  , memoizeSharedPropIndex(0)
   , m_numLocals(0)
   , m_numUnnamedLocals(0)
   , m_activeUnnamedLocals(0)
@@ -83,7 +86,7 @@ FuncEmitter::FuncEmitter(UnitEmitter& ue, int sn, const StringData* n,
   , m_id(kInvalidId)
   , name(n)
   , top(false)
-  , returnType(KindOfInvalid)
+  , returnType(folly::none)
   , retUserType(nullptr)
   , isClosureBody(false)
   , isAsync(false)
@@ -91,9 +94,12 @@ FuncEmitter::FuncEmitter(UnitEmitter& ue, int sn, const StringData* n,
   , isPairGenerator(false)
   , isMemoizeImpl(false)
   , isMemoizeWrapper(false)
+  , hasMemoizeSharedProp(false)
   , containsCalls(false)
   , docComment(nullptr)
   , originalFilename(nullptr)
+  , memoizePropName(nullptr)
+  , memoizeSharedPropIndex(0)
   , m_numLocals(0)
   , m_numUnnamedLocals(0)
   , m_activeUnnamedLocals(0)
@@ -143,8 +149,25 @@ void FuncEmitter::commit(RepoTxn& txn) const {
   int repoId = m_ue.m_repoId;
   int64_t usn = m_ue.m_sn;
 
-  frp.insertFunc(repoId)
+  frp.insertFunc[repoId]
      .insert(*this, txn, usn, m_sn, m_pce ? m_pce->id() : -1, name, top);
+}
+
+static std::vector<EHEnt> toFixed(const std::vector<EHEntEmitter>& vec) {
+  std::vector<EHEnt> ret;
+  for (auto const& ehe : vec) {
+    EHEnt e;
+    e.m_type = ehe.m_type;
+    e.m_itRef = ehe.m_itRef;
+    e.m_base = ehe.m_base;
+    e.m_past = ehe.m_past;
+    e.m_iterId = ehe.m_iterId;
+    e.m_parentIndex = ehe.m_parentIndex;
+    e.m_fault = ehe.m_fault;
+    e.m_catches = ehe.m_catches;
+    ret.emplace_back(std::move(e));
+  }
+  return ret;
 }
 
 Func* FuncEmitter::create(Unit& unit, PreClass* preClass /* = NULL */) const {
@@ -164,7 +187,11 @@ Func* FuncEmitter::create(Unit& unit, PreClass* preClass /* = NULL */) const {
     }
     attrs = Attr(attrs & ~AttrPersistent);
   }
-  if (RuntimeOption::EvalJitEnableRenameFunction &&
+  if (!RuntimeOption::RepoAuthoritative) {
+    // In non-RepoAuthoritative mode, any function could get a VarEnv because
+    // of evalPHPDebugger.
+    attrs |= AttrMayUseVV;
+  } else if (RuntimeOption::EvalJitEnableRenameFunction &&
       !name->empty() &&
       !Func::isSpecial(name) &&
       !isClosureBody) {
@@ -177,12 +204,37 @@ Func* FuncEmitter::create(Unit& unit, PreClass* preClass /* = NULL */) const {
   if (!containsCalls) { attrs |= AttrPhpLeafFn; }
 
   assert(!m_pce == !preClass);
-  Func* f = m_ue.newFunc(this, unit, preClass, line1, line2, base,
-                         past, name, attrs, top, docComment,
-                         params.size(), isClosureBody);
+  auto f = m_ue.newFunc(this, unit, name, attrs, params.size());
 
-  f->shared()->m_info = m_info;
-  f->shared()->m_returnType = returnType;
+  f->m_isPreFunc = !!preClass;
+
+  bool const needsExtendedSharedData =
+    m_info ||
+    m_builtinFuncPtr ||
+    m_nativeFuncPtr ||
+    (attrs & AttrNative) ||
+    line2 - line1 >= Func::kSmallDeltaLimit ||
+    past - base >= Func::kSmallDeltaLimit;
+
+  f->m_shared.reset(
+    needsExtendedSharedData
+      ? new Func::ExtendedSharedData(preClass, base, past, line1, line2,
+                                     top, docComment)
+      : new Func::SharedData(preClass, base, past,
+                             line1, line2, top, docComment)
+  );
+
+  f->init(params.size());
+
+  if (auto const ex = f->extShared()) {
+    ex->m_hasExtendedSharedData = true;
+    ex->m_builtinFuncPtr = m_builtinFuncPtr;
+    ex->m_nativeFuncPtr = m_nativeFuncPtr;
+    ex->m_info = m_info;
+    ex->m_line2 = line2;
+    ex->m_past = past;
+  }
+
   std::vector<Func::ParamInfo> fParams;
   bool usesDoubles = false, variadic = false;
   for (unsigned i = 0; i < params.size(); ++i) {
@@ -192,20 +244,19 @@ Func* FuncEmitter::create(Unit& unit, PreClass* preClass /* = NULL */) const {
     f->appendParam(params[i].byRef, pi, fParams);
   }
 
+  f->shared()->m_returnType = returnType;
   f->shared()->m_localNames.create(m_localNames);
   f->shared()->m_numLocals = m_numLocals;
   f->shared()->m_numIterators = m_numIterators;
   f->m_maxStackCells = maxStackCells;
   f->shared()->m_staticVars = staticVars;
-  f->shared()->m_ehtab = ehtab;
+  f->shared()->m_ehtab = toFixed(ehtab);
   f->shared()->m_fpitab = fpitab;
   f->shared()->m_isClosureBody = isClosureBody;
   f->shared()->m_isAsync = isAsync;
   f->shared()->m_isGenerator = isGenerator;
   f->shared()->m_isPairGenerator = isPairGenerator;
   f->shared()->m_userAttributes = userAttributes;
-  f->shared()->m_builtinFuncPtr = m_builtinFuncPtr;
-  f->shared()->m_nativeFuncPtr = m_nativeFuncPtr;
   f->shared()->m_retTypeConstraint = retTypeConstraint;
   f->shared()->m_retUserType = retUserType;
   f->shared()->m_originalFilename = originalFilename;
@@ -214,29 +265,36 @@ Func* FuncEmitter::create(Unit& unit, PreClass* preClass /* = NULL */) const {
   f->finishedEmittingParams(fParams);
 
   if (attrs & AttrNative) {
-    auto nif = Native::GetBuiltinFunction(name,
-                                          m_pce ? m_pce->name() : nullptr,
-                                          f->isStatic());
+    auto const ex = f->extShared();
+
+    auto const& info = Native::GetBuiltinFunction(
+      name,
+      m_pce ? m_pce->name() : nullptr,
+      f->isStatic()
+    );
+
+    auto const nif = info.ptr;
     if (nif) {
       Attr dummy = AttrNone;
       int nativeAttrs = parseNativeAttributes(dummy);
       if (nativeAttrs & Native::AttrZendCompat) {
-        f->shared()->m_nativeFuncPtr = nif;
-        f->shared()->m_builtinFuncPtr = zend_wrap_func;
+        ex->m_nativeFuncPtr = nif;
+        ex->m_builtinFuncPtr = zend_wrap_func;
       } else {
         if (parseNativeAttributes(dummy) & Native::AttrActRec) {
-          f->shared()->m_builtinFuncPtr = nif;
-          f->shared()->m_nativeFuncPtr = nullptr;
+          ex->m_builtinFuncPtr = nif;
+          ex->m_nativeFuncPtr = nullptr;
         } else {
-          f->shared()->m_nativeFuncPtr = nif;
-          f->shared()->m_builtinFuncPtr =
+          ex->m_nativeFuncPtr = nif;
+          ex->m_builtinFuncPtr =
             Native::getWrapper(m_pce, usesDoubles, variadic);
         }
       }
     } else {
-      f->shared()->m_builtinFuncPtr = Native::unimplementedWrapper;
+      ex->m_builtinFuncPtr = Native::unimplementedWrapper;
     }
   }
+
   return f;
 }
 
@@ -310,10 +368,10 @@ Id FuncEmitter::allocUnnamedLocal() {
 ///////////////////////////////////////////////////////////////////////////////
 // Unit tables.
 
-EHEnt& FuncEmitter::addEHEnt() {
+EHEntEmitter& FuncEmitter::addEHEnt() {
   assert(!m_ehTabSorted
     || "should only mark the ehtab as sorted after adding all of them");
-  ehtab.push_back(EHEnt());
+  ehtab.push_back(EHEntEmitter());
   ehtab.back().m_parentIndex = 7777;
   return ehtab.back();
 }
@@ -334,10 +392,12 @@ namespace {
  *       e2 is a Fault funclet.
  */
 struct EHEntComp {
-  bool operator()(const EHEnt& e1, const EHEnt& e2) const {
+  bool operator()(const EHEntEmitter& e1, const EHEntEmitter& e2) const {
     if (e1.m_base == e2.m_base) {
       if (e1.m_past == e2.m_past) {
-        return e1.m_type == EHEnt::Type::Catch;
+        static_assert(!static_cast<uint8_t>(EHEnt::Type::Catch),
+            "Catch should be the smallest type");
+        return e1.m_type < e2.m_type;
       }
       return e1.m_past > e2.m_past;
     }
@@ -441,7 +501,9 @@ static const StaticString
   s_nofcallbuiltin("NoFCallBuiltin"),
   s_variadicbyref("VariadicByRef"),
   s_noinjection("NoInjection"),
-  s_zendcompat("ZendCompat");
+  s_zendcompat("ZendCompat"),
+  s_numargs("NumArgs"),
+  s_opcodeimpl("OpCodeImpl");
 
 int FuncEmitter::parseNativeAttributes(Attr& attrs_) const {
   int ret = Native::AttrNone;
@@ -468,6 +530,10 @@ int FuncEmitter::parseNativeAttributes(Attr& attrs_) const {
         // ZendCompat implies ActRec, no FCallBuiltin
         attrs_ |= AttrMayUseVV | AttrNoFCallBuiltin;
         ret |= Native::AttrActRec;
+      } else if (userAttrStrVal.get()->isame(s_numargs.get())) {
+        attrs_ |= AttrNumArgs;
+      } else if (userAttrStrVal.get()->isame(s_opcodeimpl.get())) {
+        ret |= Native::AttrOpCodeImpl;
       }
     }
   }
@@ -480,8 +546,7 @@ void FuncEmitter::setBuiltinFunc(const ClassInfo::MethodInfo* info,
   assert(info);
   m_info = info;
   Attr attrs_ = AttrBuiltin;
-  if (info->attribute & (ClassInfo::RefVariableArguments |
-                         ClassInfo::MixedVariableArguments)) {
+  if (info->attribute & ClassInfo::RefVariableArguments) {
     attrs_ |= AttrVariadicByRef;
   }
   if (info->attribute & ClassInfo::IsReference) {
@@ -551,18 +616,10 @@ void FuncEmitter::setBuiltinFunc(BuiltinFunction bif, BuiltinFunction nif,
 // FuncRepoProxy.
 
 FuncRepoProxy::FuncRepoProxy(Repo& repo)
-  : RepoProxy(repo)
-#define FRP_OP(c, o) \
-  , m_##o##Local(repo, RepoIdLocal), m_##o##Central(repo, RepoIdCentral)
-    FRP_OPS
-#undef FRP_OP
-{
-#define FRP_OP(c, o) \
-  m_##o[RepoIdLocal] = &m_##o##Local; \
-  m_##o[RepoIdCentral] = &m_##o##Central;
-  FRP_OPS
-#undef FRP_OP
-}
+    : RepoProxy(repo),
+      insertFunc{InsertFuncStmt(repo, 0), InsertFuncStmt(repo, 1)},
+      getFuncs{GetFuncsStmt(repo, 0), GetFuncsStmt(repo, 1)}
+{}
 
 FuncRepoProxy::~FuncRepoProxy() {
 }

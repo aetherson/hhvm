@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -33,7 +33,10 @@ namespace HPHP { namespace jit {
  * threads will fail for a short period of time.
  */
 
+struct LeaseHolderBase;
 struct Lease {
+  friend struct LeaseHolderBase;
+
   static const int64_t kStandardHintExpireInterval = 1500; // in microseconds
   pthread_t       m_owner;
   pthread_mutex_t m_lock;
@@ -55,9 +58,6 @@ struct Lease {
     pthread_mutex_destroy(&m_lock);
   }
   bool amOwner() const;
-  // acquire: also returns true if we are already the writer.
-  bool acquire(bool blocking = false);
-  void drop(int64_t hintExpireDelay = 0);
 
   /*
    * A malevolent entity sometimes takes the write lease out from under us
@@ -68,7 +68,11 @@ struct Lease {
     if (debug) { gremlinUnlockImpl(); }
   }
 
+  static bool mayLock(bool f);
 private:
+  // acquire: also returns true if we are already the writer.
+  bool acquire(bool blocking = false);
+  void drop(int64_t hintExpireDelay = 0);
   void gremlinUnlockImpl();
 };
 

@@ -1,7 +1,7 @@
 #ifndef incl_HPHP_ICU_USPOOF_H
 #define incl_HPHP_ICU_USPOOF_H
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/ext/icu/icu.h"
 
 #include <unicode/uspoof.h>
@@ -29,7 +29,7 @@ class SpoofChecker : public IntlError {
   }
   SpoofChecker(const SpoofChecker&) = delete;
   SpoofChecker& operator=(const SpoofChecker& src) {
-    *this = src;
+    IntlError::operator =(src);
     UErrorCode error = U_ZERO_ERROR;
     m_checker = uspoof_clone(src.m_checker, &error);
     if (U_FAILURE(error)) {

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -38,10 +38,18 @@ enum Attr {
   AttrReference            = (1 <<  0), //       |          |    X    //
                                         //       |          |         //
   // Method visibility.  The relative ordering of these is important. //
+  // N.B. the values are overlayed with some of the no-override bits for magic
+  // class methods (next), since they don't apply to classes.
   AttrPublic               = (1 <<  1), //       |    X     |    X    //
   AttrProtected            = (1 <<  2), //       |    X     |    X    //
   AttrPrivate              = (1 <<  3), //       |    X     |    X    //
                                         //       |          |         //
+  // No-override bits for magic class methods.  If set, the class does not
+  // define that magic function, and neither does any derived class.  Note that
+  // the bit for __unset is further down due to Attr-sharing across types.
+  AttrNoOverrideMagicGet   = (1 <<  1), //   X   |          |         //
+  AttrNoOverrideMagicSet   = (1 <<  2), //   X   |          |         //
+  AttrNoOverrideMagicIsset = (1 <<  3), //   X   |          |         //
   // N.B.: AttrEnum and AttrStatic overlap! But they can't be set on the
   // same things.
   // Is this class an enum?
@@ -66,6 +74,8 @@ enum Attr {
                                         //       |          |         //
   // Indicates that this function should be ignored in backtraces.    //
   AttrNoInjection          = (1 <<  9), //       |          |    X    //
+  // Indicates a class has no derived classes that have a magic __unset method.
+  AttrNoOverrideMagicUnset = (1 <<  9), //   X   |          |         //
                                         //       |          |         //
   // Indicates that the function or class is uniquely named among functions or
   // classes across the codebase.  Note that function and class names are in
@@ -84,6 +94,10 @@ enum Attr {
   // FIXME: I have no documentation.    //       |          |         //
   AttrNoExpandTrait        = (1 << 12), //    X  |          |         //
                                         //       |          |         //
+  // Set on functions where the $this class may not be a subclass of the
+  // context (scope) class.
+  AttrHasForeignThis       = (1 << 12), //       |          |    X    //
+                                        //       |          |         //
   // Only valid in WholeProgram mode.  Indicates on a class that the class is
   // not extended, or on a method that no extending class defines the method.
   AttrNoOverride           = (1 << 13), //    X  |          |    X    //
@@ -93,11 +107,12 @@ enum Attr {
                                         //       |          |         //
   // Indicates that a function is a builtin that takes variadic arguments,
   // where the arguments are either by ref or optionally by ref.  It is
-  // equivalent to ClassInfo's (RefVariableArguments | MixedVariableArguments).
+  // equivalent to ClassInfo's (RefVariableArguments).
   AttrVariadicByRef        = (1 << 15), //       |          |    X    //
                                         //       |          |         //
   // Indicates that a function may need to use a VarEnv or varargs (i.e.,
-  // extraArgs) at runtime.             //       |          |         //
+  // extraArgs) at runtime.  If the debugger is enabled, all functions
+  // must be treated as having this flag.
   AttrMayUseVV             = (1 << 16), //       |          |    X    //
                                         //       |          |         //
   // Indicates that the function or class can be loaded once and then persisted
@@ -108,11 +123,16 @@ enum Attr {
   // simply memcpy-ing from the initializer vector.         |         //
   AttrDeepInit             = (1 << 18), //       |    X     |         //
                                         //       |          |         //
+  // This HNI method takes an additional "func_num_args()" value at the
+  // beginning of its signature (after Class*/ObjectData* for methods)
+  AttrNumArgs              = (1 << 18), //       |          |    X    //
+                                        //       |          |         //
   // Set on functions to mark them as hot during PGO profiling.       //
   AttrHot                  = (1 << 19), //       |          |    X    //
                                         //       |          |         //
-  // Set on all builtin functions, whether PHP or C++.      |         //
-  AttrBuiltin              = (1 << 20), //    X  |          |    X    //
+  // Set on all builtin functions, whether PHP or C++. For properties, it
+  // is set on internal properties (e.g. <<__memoize>> caching)
+  AttrBuiltin              = (1 << 20), //    X  |    X     |    X    //
                                         //       |          |         //
   // Set on builtin functions that can be replaced by user implementations.
   AttrAllowOverride        = (1 << 21), //       |          |    X    //
@@ -123,9 +143,6 @@ enum Attr {
                                         //       |          |         //
   // Is this an HNI builtin?            //       |          |         //
   AttrNative               = (1 << 23), //       |          |    X    //
-                                        //       |          |         //
-  // FIXME: I have no documentation.    //       |          |         //
-  AttrHPHPSpecific         = (1 << 25), //       |          |    X    //
                                         //       |          |         //
   // Indicates that this function can be constant-folded if it is called with
   // all constant arguments.            //       |          |         //

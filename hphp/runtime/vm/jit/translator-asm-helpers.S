@@ -3,70 +3,68 @@
  *
  * This helper routine is written in assembly to take care of the details
  * when transferring control between jitted code and the translator.
- *   rdi / x0:  Cell* vm_sp
- *   rsi / x1:  Cell* vm_fp
- *   rdx / x2:  unsigned char* start
- *   rcx / x3:  TReqInfo* infoPtr
- *   r8  / x4:  ActRec* firstAR
- *   r9  / x5:  uint8_t* targetCacheBase
+ *
+ * Note that MSVC uses translator-asm-helpers.asm instead of this.
+ *
+ * The columns are registers of Linux and Mac ABI / Windows ABI / ARM ABI.
+ *   rdi / rcx   / x0:  Cell* vm_sp
+ *   rsi / rdx   / x1:  Cell* vm_fp
+ *   rdx / r8    / x2:  unsigned char* start
+ *   rcx / r9    / x4:  ActRec* firstAR
+ *   r8  / stack / x5:  uint8_t* targetCacheBase
+ *   r9  / stack / x6:  ActRec* calleeAR
+ *
+ * Note that on Windows, ETCH_GET_ARG5/6 borrow r10/r11 respectively
  */
 
-#include "hphp/runtime/vm/jit/reserved-stack.h"
-
-#if defined(__CYGWIN__) || defined(__MINGW__) || defined(_MSC_VER)
-#define CFI(x)         .cfi_##x
-#define CFI2(x, y)     .cfi_##x y
-#define CFI3C(x, y, z) .cfi_##x y##, z
-#define ETCH_ALIGNMENT .align 16
-#define ETCH_SECTION   .section .text.enterTCHelper
-#define ETCH_SIZE      /* Not used with PE/COFF on windows */
-#define ETCH_NAME(x)   x
-#define ETCH_LABEL(x)  .L##x
-#elif defined(__APPLE__)
-#define CFI(x)         /* not used on OSX */
-#define CFI2(x, y)     /* not used on OSX */
-#define CFI3C(x, y, z) /* not used on OSX */
-#define ETCH_ALIGNMENT .align 4 // on OSX this is 2^value
-#define ETCH_SECTION   .text
-#define ETCH_SIZE      /* not used on OSX */
-#define ETCH_NAME(x)   _##x
-#define ETCH_LABEL(x)  .L##_##x
-#else
-#define CFI(x)         .cfi_##x
-#define CFI2(x, y)     .cfi_##x y
-#define CFI3C(x, y, z) .cfi_##x y##, z
-#define ETCH_ALIGNMENT .align 16
-#define ETCH_SECTION   .section .text.enterTCHelper
-#define ETCH_SIZE      .size enterTCHelper, .-enterTCHelper
-#define ETCH_NAME(x)   x
-#define ETCH_LABEL(x)  .L##x
-#endif
+#include "hphp/util/etch-helpers.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 #if defined(__x86_64__)
   .byte 0
-  ETCH_ALIGNMENT
-  ETCH_SECTION
+  ETCH_ALIGN16
+  ETCH_SECTION(enterTCHelper)
   .globl ETCH_NAME(enterTCHelper)
-ETCH_NAME(enterTCHelper:)
+ETCH_NAME(enterTCHelper):
   // Prologue
   CFI(startproc)             // amongst other things, cfa reg is now rsp, and offset is 8
+
+  // On Windows, get the 5th and 6th arguments from the stack.
+  ETCH_GET_ARG5
+  ETCH_GET_ARG6
+
   push %rbp
   CFI2(adjust_cfa_offset, 8) // cfa is now 8 bytes further from rsp than it was before
   CFI3C(offset, rbp, -16)    // Where to find previous value of rbp, relative to cfa
 
   // Set firstAR->m_sfp to point to this frame.
-  mov %rsp, (%r8)
-
-  // Save infoPtr
-  push %rcx
-  CFI2(adjust_cfa_offset, 8)
+  mov %rsp, (ETCH_ARG4)
 
   // Set up special registers used for translated code.
-  mov %rdi, %rbx          // rVmSp
-  mov %r9, %r12           // rVmTl
-  mov %rsi, %rbp          // rVmFp
-  mov 0x30(%rcx), %r15    // rStashedAR saved across service requests
+  mov ETCH_ARG1, %rbx          // rVmSp
+  mov ETCH_ARG5, %r12          // rVmTl
+  mov ETCH_ARG2, %rbp          // rVmFp
+
+  sub $8, %rsp // align native stack
+  CFI2(adjust_cfa_offset, 8)
+
+  /*
+   * If we're entering the TC at a function prologue, make it look like we got
+   * there via a bindcall by pushing return addresses, setting the callee frame
+   * pointer, then jumping to the prologue. We leave the TC with a ret
+   * instruction, so if we enter it with a jmp, that will unbalance the RSB and
+   * cause tons of branch mispredictions in the frames above us. To avoid this,
+   * we get to the prologue by calling a stub that pops the return address
+   * pushed by the call and jumps to the prologue. This pushes a bogus address
+   * on the RSB but the ret to callToExit always mispredicts anyway, and this
+   * keeps the RSB balanced.
+   */
+  test ETCH_ARG6, ETCH_ARG6
+  jz ETCH_LABEL(enterTCHelper$callTC)
+  push ETCH_NAME_REL(enterTCExit)
+  push 0x8(ETCH_ARG6)
+  mov ETCH_ARG6, %rbp
+  call ETCH_LABEL(enterTCHelper$prologue)
 
   /*
    * The translated code we are about to enter does not follow the
@@ -75,68 +73,76 @@ ETCH_NAME(enterTCHelper:)
    * that the return address being pushed will make the native stack
    * 16-byte aligned.
    */
-
-  sub $RESERVED_STACK_TOTAL_SPACE, %rsp
-  CFI2(adjust_cfa_offset, RESERVED_STACK_TOTAL_SPACE)
-
-  /*
-   * If returning from a BIND_CALL request, push the return IP saved
-   * in the ActRec pointed to by r15.  The 0x1 in the cmp instruction
-   * must be kept in sync with REQ_BIND_CALL in abi-x64.h.
-   */
-  cmpl $0x1, 0x0(%rcx)
-  jne ETCH_LABEL(enterTCHelper$jumpToTC)
-  lea ETCH_LABEL(enterTCHelper$serviceReqLabel(%rip)), %rax
-  push %rax
-  push 0x8(%r15)
-  jmp *%rdx
-ETCH_LABEL(enterTCHelper$jumpToTC:)
-  call *%rdx
-ETCH_LABEL(enterTCHelper$serviceReqLabel:)
+ETCH_LABEL(enterTCHelper$callTC):
+  call *ETCH_ARG3
 
   /*
-   * enterTCServiceReq is never called directly; this exists to give the jit
+   * enterTCExit is never called directly; this exists to give the jit
    * access to the address of the expected return address while in the TC.
    */
-  .globl ETCH_NAME(enterTCServiceReq)
-  ETCH_NAME(enterTCServiceReq:)
-  add $RESERVED_STACK_TOTAL_SPACE, %rsp
-  CFI2(adjust_cfa_offset, -RESERVED_STACK_TOTAL_SPACE)
-  // Restore infoPtr into %rbx
-  pop %rbx
+  .globl ETCH_NAME(enterTCExit)
+ETCH_NAME(enterTCExit):
+  /*
+   * Eager vm-reg save. Must match values in rds-header.h
+   */
+  mov %rbx, 0x10(%r12)
+  mov %rbp, 0x20(%r12)
+  add $8, %rsp
   CFI2(adjust_cfa_offset, -8)
-
-  // Copy the values passed from jitted code into *infoPtr
-  mov %rdi, 0x0(%rbx)
-  test %rdi,%rdi
-  jnz ETCH_LABEL(enterTCHelper$copyReqArgs)
-  CFI(remember_state)
-  pop %rbp
-  CFI2(restore, rbp)
-  CFI2(adjust_cfa_offset, -8)
-  ret
-
-ETCH_LABEL(enterTCHelper$copyReqArgs:)
-  CFI(restore_state)
-  mov %rsi, 0x8(%rbx)
-  mov %rdx, 0x10(%rbx)
-  mov %rcx, 0x18(%rbx)
-  mov %r8,  0x20(%rbx)
-  mov %r9,  0x28(%rbx)
-
-  // Service request "callee-saved".  (Returnee-saved?)
-  mov %r15, 0x30(%rbx)
-
-  // copy stub address into infoPtr->stubAddr
-  mov %r10, 0x38(%rbx)
 
   // Epilogue
   pop %rbp
   CFI2(restore, rbp)
   CFI2(adjust_cfa_offset, -8)
   ret
+
+ETCH_LABEL(enterTCHelper$prologue):
+  pop %rax
+  jmp *ETCH_ARG3
+
   CFI(endproc)
-  ETCH_SIZE
+  ETCH_SIZE(enterTCHelper)
+
+  // handleSRHelper: Translated code will jump to this stub to perform all
+  // service requests. It calls out to C++ to handle the request, then jumps
+  // to the returned address (which may be the callToExit stub).
+  ETCH_ALIGN16
+  ETCH_SECTION(handleSRHelper)
+  .globl ETCH_NAME(handleSRHelper)
+ETCH_NAME(handleSRHelper):
+  CFI(startproc)
+
+  // Sync vmsp & vmfp
+  mov %rbx, 0x10(%r12)
+  mov %rbp, 0x20(%r12)
+
+  // Push a ServiceReqInfo struct onto the stack and call handleServiceRequest.
+  push %r8
+  push %rcx
+  push %rdx
+  push %rsi
+  push %r10
+  push %rdi
+  CFI2(adjust_cfa_offset, 0x30)
+
+  // call mcg->handleServiceRequest(%rsp)
+  mov ETCH_NAME(mcg)(%rip), ETCH_ARG1
+  mov %rsp, ETCH_ARG2
+  call MCGenerator_handleServiceRequest
+
+  // Pop the ServiceReqInfo off the stack.
+  add $0x30, %rsp
+  CFI2(adjust_cfa_offset, -0x30)
+
+  // rVmTl was preserved by the callee, but vmsp and vmfp might've changed if
+  // we interpreted anything. Reload them.
+  mov 0x10(%r12), %rbx
+  mov 0x20(%r12), %rbp
+
+  jmp *%rax
+  CFI(endproc)
+  ETCH_SIZE(handleSRHelper)
+
 ///////////////////////////////////////////////////////////////////////////////
 #elif defined(__AARCH64EL__)
   .globl enterTCHelper

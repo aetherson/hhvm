@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -17,7 +17,7 @@
 
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-extension.h"
 #include "hphp/runtime/ext_zend_compat/hhvm/zend-object.h"
-#include "folly/AtomicHashMap.h"
+#include <folly/AtomicHashMap.h>
 #include "hphp/runtime/ext_zend_compat/php-src/Zend/zend_modules.h"
 #include "hphp/runtime/ext_zend_compat/php-src/Zend/zend_API.h"
 #include "hphp/runtime/vm/native.h"
@@ -51,6 +51,10 @@ ZendExtension* ZendExtension::GetByModuleNumber(int module_number) {
   return nullptr;
 }
 
+bool ZendExtension::moduleEnabled() const {
+  return RuntimeOption::EnableZendCompat;
+}
+
 void ZendExtension::moduleInit() {
   if (!RuntimeOption::EnableZendCompat) {
     return;
@@ -68,12 +72,13 @@ void ZendExtension::moduleInit() {
         (ts_allocate_dtor) module->globals_dtor);
   }
   // Register global functions
-  const zend_function_entry * fe = module->functions;
-  while (fe->fname) {
-    assert(fe->handler);
-    Native::registerBuiltinFunction(makeStaticString(fe->fname),
-                                          fe->handler);
-    fe++;
+  if (module->functions) {
+    const zend_function_entry * fe = module->functions;
+    while (fe->fname) {
+      assert(fe->handler);
+      Native::registerBuiltinZendFunction(fe->fname, fe->handler);
+      fe++;
+    }
   }
   // Call MINIT
   if (module->module_startup_func) {

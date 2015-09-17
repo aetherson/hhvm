@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,7 +16,6 @@
 
 #include "hphp/compiler/expression/group_clause.h"
 #include "hphp/compiler/analysis/code_error.h"
-#include "hphp/runtime/base/complex-types.h"
 
 using namespace HPHP;
 
@@ -79,13 +78,6 @@ void GroupClause::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-TypePtr GroupClause::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                bool coerce) {
-  m_coll->inferAndCheck(ar, Type::Some, false);
-  m_key->inferAndCheck(ar, Type::Some, false);
-  return Type::Object;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void GroupClause::outputCodeModel(CodeGenerator &cg) {
@@ -95,7 +87,7 @@ void GroupClause::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("key");
   m_key->outputCodeModel(cg);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 
@@ -108,4 +100,3 @@ void GroupClause::outputPHP(CodeGenerator &cg, AnalysisResultPtr ar) {
   cg_printf(" by ");
   m_key->outputPHP(cg, ar);
 }
-

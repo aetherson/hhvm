@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -34,6 +34,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <boost/utility.hpp>
 
@@ -41,6 +42,12 @@ namespace HPHP {
 
 class CacheData;
 class MmapFile;
+
+enum class VFileType : uint8_t {
+  NotFound = 0,
+  PlainFile,
+  Directory
+};
 
 class CacheManager : private boost::noncopyable {
  public:
@@ -106,13 +113,20 @@ class CacheManager : private boost::noncopyable {
 
   void getEntryNames(std::set<std::string>* names) const;
 
+  VFileType getFileType(const std::string& name) const;
+
+  // Read the contents of a direcotry
+  std::vector<std::string> readDirectory(const std::string& name) const;
+  void dump() const;
+
  private:
+  using CacheMap = std::map<std::string, std::unique_ptr<CacheData>>;
+
   void addDirectories(const std::string& name);
 
   std::unique_ptr<MmapFile> mmap_file_;
   uint64_t entry_counter_;
 
-  typedef struct std::map<std::string, std::unique_ptr<CacheData>> CacheMap;
   CacheMap cache_map_;
 };
 

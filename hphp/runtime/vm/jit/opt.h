@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,26 +16,36 @@
 #ifndef incl_HPHP_HHIR_OPT_H_
 #define incl_HPHP_HHIR_OPT_H_
 
-#include "hphp/runtime/vm/jit/frame-state.h"
 #include "hphp/runtime/vm/jit/types.h"
 
 namespace HPHP { namespace jit {
 
 //////////////////////////////////////////////////////////////////////
 
-class IRBuilder;
-class IRUnit;
-class IRInstruction;
+struct IRBuilder;
+struct IRUnit;
+struct IRInstruction;
+struct FrameStateMgr;
 
 //////////////////////////////////////////////////////////////////////
 
 /*
- * The main optimization passes, in the order they run.
+ * The main optimization passes.
  */
-void optimizeRefcounts(IRUnit&, FrameState&&);
+void optimizeRefcounts2(IRUnit&);
 void optimizePredictions(IRUnit&);
-void optimizeJumps(IRUnit&);
-void eliminateDeadCode(IRUnit&);
+void hoistTypeChecks(IRUnit&);
+void gvn(IRUnit&);
+void optimizeLoads(IRUnit&);
+void optimizeStores(IRUnit&);
+void optimizeLoopInvariantCode(IRUnit&);
+void cleanCfg(IRUnit&);
+
+/*
+ * For debugging, we can run this pass, which inserts various sanity checking
+ * assertion instructions.
+ */
+void insertAsserts(IRUnit&);
 
 /*
  * Run all the optimization passes.

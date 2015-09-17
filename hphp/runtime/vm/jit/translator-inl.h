@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -22,27 +22,25 @@ namespace HPHP { namespace jit {
 ///////////////////////////////////////////////////////////////////////////////
 // Translator accessors.
 
-inline jit::IRTranslator* Translator::irTrans() const {
-  return m_irTrans.get();
-}
-
 inline ProfData* Translator::profData() const {
   return m_profData.get();
-}
-
-inline const RegionDesc* Translator::region() const {
-  return m_region;
 }
 
 inline const SrcDB& Translator::getSrcDB() const {
   return m_srcDB;
 }
 
-inline SrcRec* Translator::getSrcRec(const SrcKey& sk) {
+inline SrcRec* Translator::getSrcRec(SrcKey sk) {
   // XXX: Add a insert-or-find primitive to THM.
   if (SrcRec* r = m_srcDB.find(sk)) return r;
-  assert(s_writeLease.amOwner());
-  return m_srcDB.insert(sk);
+  assertx(s_writeLease.amOwner());
+
+  auto rec = m_srcDB.insert(sk);
+  if (RuntimeOption::EvalEnableReusableTC) {
+    recordFuncSrcRec(sk.func(), rec);
+  }
+
+  return rec;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -68,7 +66,10 @@ inline void Translator::setUseAHot(bool val) {
 // TransDB.
 
 inline bool Translator::isTransDBEnabled() {
-  return debug || RuntimeOption::EvalDumpTC;
+  return debug ||
+         RuntimeOption::EvalDumpTC ||
+         RuntimeOption::EvalDumpIR ||
+         RuntimeOption::EvalDumpRegion;
 }
 
 inline const TransRec* Translator::getTransRec(TCA tca) const {
@@ -99,6 +100,26 @@ inline TransID Translator::getCurrentTransID() const {
 
 inline Lease& Translator::WriteLease() {
   return s_writeLease;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// TransContext.
+
+inline TransContext::TransContext(TransID id, SrcKey sk, FPInvOffset spOff)
+  : transID(id)
+  , initSpOffset(spOff)
+  , func(sk.valid() ? sk.func() : nullptr)
+  , initBcOffset(sk.offset())
+  , prologue(sk.prologue())
+  , resumed(sk.resumed())
+{}
+
+inline SrcKey TransContext::srcKey() const {
+  if (prologue) {
+    assertx(!resumed);
+    return SrcKey { func, initBcOffset, SrcKey::PrologueTag{} };
+  }
+  return SrcKey { func, initBcOffset, resumed };
 }
 
 ///////////////////////////////////////////////////////////////////////////////

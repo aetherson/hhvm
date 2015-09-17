@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,7 @@
 #ifndef incl_HPHP_RPC_REQUEST_HANDLER_H_
 #define incl_HPHP_RPC_REQUEST_HANDLER_H_
 
+#include "hphp/runtime/server/access-log.h"
 #include "hphp/runtime/server/server.h"
 #include "hphp/runtime/base/execution-context.h"
 
@@ -29,6 +30,8 @@ class Transport;
 
 class RPCRequestHandler : public RequestHandler {
 public:
+  static AccessLog &GetAccessLog() { return s_accessLog; }
+
   enum class ReturnEncodeType {
     Json      = 1,
     Serialize = 2,
@@ -44,6 +47,8 @@ public:
   // implementing RequestHandler
   virtual void handleRequest(Transport *transport);
   virtual void abortRequest(Transport *transport);
+
+  static void cleanupState();
 
   /**
    * Force a reset before the next request.
@@ -64,7 +69,6 @@ private:
   time_t m_lastReset;
 
   void initState();
-  void cleanupState();
   bool needReset() const;
   bool executePHPFunction(Transport *transport,
                           SourceRootInfo &sourceRootInfo,
@@ -72,6 +76,13 @@ private:
 
   std::string getSourceFilename(const std::string &path,
                                 SourceRootInfo &sourceRootInfo);
+
+  static DECLARE_THREAD_LOCAL(AccessLog::ThreadData, s_accessLogThreadData);
+  static AccessLog s_accessLog;
+
+  static AccessLog::ThreadData* getAccessLogThreadData() {
+    return s_accessLogThreadData.get();
+  }
 };
 
 ///////////////////////////////////////////////////////////////////////////////

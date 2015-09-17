@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -17,16 +17,18 @@
 
 #include "hphp/runtime/ext/url/ext_url.h"
 #include <set>
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/base/comparisons.h"
 #include "hphp/runtime/base/string-util.h"
 #include "hphp/runtime/base/zend-url.h"
 #include "hphp/runtime/base/string-buffer.h"
 #include "hphp/runtime/ext/curl/ext_curl.h"
-#include "hphp/runtime/ext/ext_string.h"
-#include "hphp/runtime/ext/ext_file.h"
 #include "hphp/runtime/ext/pcre/ext_pcre.h"
 #include "hphp/runtime/base/preg.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 #include "hphp/runtime/ext/std/ext_std_classobj.h"
 #include "hphp/runtime/ext/std/ext_std_options.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/system/constants.h"
 
 namespace HPHP {
@@ -76,14 +78,15 @@ Variant HHVM_FUNCTION(get_headers, const String& url, int format /* = 0 */) {
     response = response.substr(0, pos);
   }
 
-  Array ret = f_explode("\r\n", response).toArray();
+  Array ret = HHVM_FN(explode)("\r\n", response).toArray();
   if (!format) {
     return ret;
   }
 
   Array assoc;
   for (ArrayIter iter(ret); iter; ++iter) {
-    Array tokens = f_explode(": ", iter.second(), 2).toArray();
+    Array tokens =
+      HHVM_FN(explode)(": ", iter.second().toString(), 2).toArray();
     if (tokens.size() == 2) {
       assoc.set(tokens[0], tokens[1]);
     } else {
@@ -112,11 +115,11 @@ static String normalize_variable_name(const String& name) {
 
 Array HHVM_FUNCTION(get_meta_tags, const String& filename,
                                    bool use_include_path /* = false */) {
-  String f = f_file_get_contents(filename);
+  String f = HHVM_FN(file_get_contents)(filename);
 
   Variant matches;
-  HHVM_FN(preg_match_all)("/<meta\\s+name=\"(.*?)\"\\s+content=\"(.*?)\".*?>/s",
-                          f, ref(matches), PREG_SET_ORDER);
+  preg_match_all("/<meta\\s+name=\"(.*?)\"\\s+content=\"(.*?)\".*?>/s",
+                 f, &matches, PREG_SET_ORDER);
 
   Array ret = Array::Create();
   for (ArrayIter iter(matches.toArray()); iter; ++iter) {
@@ -138,6 +141,9 @@ static void url_encode_array(StringBuffer &ret, const Variant& varr,
   if (!seen_arrs.insert(id).second) {
     return; // recursive
   }
+
+  // Allow multiple non-recursive references to the same array/object
+  SCOPE_EXIT { seen_arrs.erase(id); };
 
   Array arr;
   if (varr.is(KindOfObject)) {
@@ -317,10 +323,10 @@ const StaticString s_PHP_URL_FRAGMENT("PHP_URL_FRAGMENT");
 const StaticString s_PHP_QUERY_RFC1738("PHP_QUERY_RFC1738");
 const StaticString s_PHP_QUERY_RFC3986("PHP_QUERY_RFC3986");
 
-class StandardURLExtension : public Extension {
+class StandardURLExtension final : public Extension {
  public:
   StandardURLExtension() : Extension("url") {}
-  virtual void moduleInit() {
+  void moduleInit() override {
     Native::registerConstant<KindOfInt64>(
       s_PHP_URL_SCHEME.get(), k_PHP_URL_SCHEME
     );

@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,8 +8,11 @@
  *
  *)
 
-open Utils
+open Core
 open Typing_defs
+open Utils
+
+module Phase = Typing_phase
 
 (* Details about functions to be added in json output *)
 type func_param_result = {
@@ -26,7 +29,7 @@ type func_details_result = {
 
 (* Results ready to be displayed to the user *)
 type complete_autocomplete_result = {
-    res_pos      : Pos.t;
+    res_pos      : Pos.absolute;
     res_ty       : string;
     res_name     : string;
     expected_ty  : bool;
@@ -36,10 +39,13 @@ type complete_autocomplete_result = {
 (* Results that still need a typing environment to convert ty information
    into strings *)
 type autocomplete_result = {
-    ty   : Typing_defs.ty;
+    ty   : Typing_defs.phase_ty;
     name : string;
     desc : string option
   }
+
+(* The type returned to the client *)
+type result = complete_autocomplete_result list
 
 let ac_env = ref None
 let ac_type = ref None
@@ -47,6 +53,7 @@ let autocomplete_results = ref []
 
 let auto_complete_suffix = "AUTO332"
 let suffix_len = String.length auto_complete_suffix
+let strip_suffix s = String.sub s 0 (String.length s - suffix_len)
 let is_auto_complete x =
   if !autocomplete_results = []
   then begin
@@ -67,7 +74,7 @@ let autocomplete_result_to_json res =
     match details with
      | Some fd -> Hh_json.JAssoc [ "min_arity", Hh_json.JInt fd.min_arity;
              "return_type", Hh_json.JString fd.return_ty;
-             "params", Hh_json.JList (List.map func_param_to_json fd.params);
+             "params", Hh_json.JList (List.map fd.params func_param_to_json);
            ]
      | None -> Hh_json.JNull
   in
@@ -111,12 +118,12 @@ let autocomplete_id id env = autocomplete_token Autocomplete.Acid (Some env) id
 
 let autocomplete_hint = autocomplete_token Autocomplete.Actype None
 
-let autocomplete_new cid env =
+let autocomplete_new cid env _ =
   match cid with
   | Nast.CI sid -> autocomplete_token Autocomplete.Acnew (Some env) sid
   | _ -> ()
 
-let autocomplete_method is_static class_ id env cid =
+let autocomplete_method is_static class_ id env cid ~is_method =
   if is_auto_complete (snd id)
   then begin
     ac_env := Some env;
@@ -125,18 +132,17 @@ let autocomplete_method is_static class_ id env cid =
     let results =
       if is_static
       then SMap.union class_.tc_smethods
-                      (SMap.union class_.tc_consts class_.tc_scvars)
-      else SMap.union class_.tc_methods class_.tc_cvars
+                      (SMap.union class_.tc_consts class_.tc_sprops)
+      else SMap.union class_.tc_methods class_.tc_props
     in
     let results = SMap.filter begin fun _ x ->
-      if class_.tc_members_fully_known then
-        match Typing.is_visible env x.ce_visibility cid with
-          | None -> true
-          | _ -> false
-      else true end results
+      match Typing.is_visible env x.ce_visibility cid with
+        | None -> true
+        | _ -> false
+      end results
     in
     SMap.iter begin fun x class_elt ->
-        add_result x class_elt.ce_type
+        add_result x (Phase.decl class_elt.ce_type)
       end results
   end
 
@@ -144,10 +150,10 @@ let autocomplete_smethod = autocomplete_method true
 
 let autocomplete_cmethod = autocomplete_method false
 
-let autocomplete_lvar_naming id locals =
+let autocomplete_lvar_naming _ id locals =
   if is_auto_complete (snd id)
   then begin
-    Autocomplete.argument_global_type := Some Autocomplete.Acvar;
+    Autocomplete.argument_global_type := Some Autocomplete.Acprop;
     (* Store the position and a map of name to ident so we can add
      * types at this point later *)
     Autocomplete.auto_complete_pos := Some (fst id);
@@ -157,17 +163,21 @@ let autocomplete_lvar_naming id locals =
 let autocomplete_lvar_typing id env =
   if Some (fst id)= !(Autocomplete.auto_complete_pos)
   then begin
+    (* The typechecker might call this hook more than once (loops) so we
+     * need to clear the list of results first or we could have repeat locals *)
+    autocomplete_results := [];
     ac_env := Some env;
     Autocomplete.auto_complete_pos := Some (fst id);
     (* Get the types of all the variables in scope at this point *)
     SMap.iter begin fun x ident ->
       let _, ty = Typing_env.get_local env ident in
-      add_result x ty
+      add_result x (Phase.locl ty)
     end !Autocomplete.auto_complete_vars;
     (* Add $this if we're in a instance method *)
     let ty = Typing_env.get_self env in
     if not (Typing_env.is_static env) && (fst ty) <> Reason.Rnone
-    then add_result "$this" ty
+    then add_result
+      Naming_special_names.SpecialIdents.this (Phase.locl ty)
   end
 
 let should_complete_class completion_type class_kind =
@@ -181,7 +191,7 @@ let should_complete_class completion_type class_kind =
 let should_complete_fun completion_type =
   completion_type=Some Autocomplete.Acid
 
-let get_constructor_ty c env =
+let get_constructor_ty c =
   let pos = c.Typing_defs.tc_pos in
   let reason = Typing_reason.Rwitness pos in
   let return_ty = reason, Typing_defs.Tapply ((pos, c.Typing_defs.tc_name), []) in
@@ -197,17 +207,15 @@ let get_constructor_ty c env =
         end
     | None ->
         (* Nothing defined, so we need to fake the entire constructor *)
-      reason, Typing_defs.Tfun (Typing_env.make_ft env pos [] return_ty)
+      reason, Typing_defs.Tfun (Typing_env.make_ft pos [] return_ty)
 
 let compute_complete_global funs classes =
   let completion_type = !Autocomplete.argument_global_type in
   let gname = Utils.strip_ns !Autocomplete.auto_complete_for_global in
-  let gname =
-    String.sub gname 0 (String.length gname - suffix_len)
-  in
+  let gname = strip_suffix gname in
   let result_count = ref 0 in
   try
-    List.iter begin fun name ->
+    List.iter classes begin fun name ->
       if !result_count > 100 then raise Exit;
       if str_starts_with (strip_ns name) gname
       then match (Typing_env.Classes.get name) with
@@ -216,8 +224,8 @@ let compute_complete_global funs classes =
             incr result_count;
             let s = Utils.strip_ns name in
             (match !ac_env with
-              | Some env when completion_type=Some Autocomplete.Acnew ->
-                  add_result s (get_constructor_ty c env)
+              | Some _env when completion_type=Some Autocomplete.Acnew ->
+                  add_result s (Phase.decl (get_constructor_ty c))
               | _ ->
                   let desc = match c.Typing_defs.tc_kind with
                     | Ast.Cabstract -> "abstract class"
@@ -230,14 +238,45 @@ let compute_complete_global funs classes =
                     Typing_reason.Rwitness c.Typing_defs.tc_pos,
                     Typing_defs.Tapply ((c.Typing_defs.tc_pos, name), [])
                   in
-                  add_result_with_desc s ty desc)
+                  add_result_with_desc s (Phase.decl ty) desc)
         | _ -> ()
-    end classes;
+    end;
     if should_complete_fun completion_type
     then begin
-      List.iter begin fun name ->
+      (* Disgusting hack alert!
+       *
+       * In PHP/Hack, namespaced function lookup falls back into the global
+       * namespace if no function in the current namespace exists. The
+       * typechecker knows everything that exists, and resolves all of this
+       * during naming -- meaning that by the time that we get to typing, not
+       * only has "gname" been fully qualified, but we've lost whatever it
+       * might have looked like originally. This makes it tough to do the full
+       * namespace fallback behavior here -- we'd like to know if whatever
+       * "gname" corresponds to in the source code has a '\' to qualify it, but
+       * since it's already fully qualified here, we can't know.
+       *
+       * Except, we can kinda reverse engineer and figure it out. We have the
+       * positional information, which we can use to figure out how long the
+       * original source code token was, and then figure out what portion of
+       * "gname" that corresponds to, and see if it has a '\'. Since fully
+       * qualifying a name will always prepend, this all works.
+       *)
+      let gname_gns = match !Autocomplete.auto_complete_pos with
+        | None -> None
+        | Some p ->
+            let len = (Pos.length p) - suffix_len in
+            let start = String.length gname - len in
+            if String.contains_from gname start '\\'
+            then None else Some (strip_all_ns gname)
+      in
+      List.iter funs begin fun name ->
         if !result_count > 100 then raise Exit;
-        if str_starts_with (strip_ns name) gname
+        let stripped_name = strip_ns name in
+        let matches_gname = str_starts_with stripped_name gname in
+        let matches_gname_gns = match gname_gns with
+          | None -> false
+          | Some s -> str_starts_with stripped_name s in
+        if matches_gname || matches_gname_gns
         then match (Typing_env.Funs.get name) with
           | Some fun_ ->
             incr result_count;
@@ -245,9 +284,9 @@ let compute_complete_global funs classes =
               Typing_reason.Rwitness fun_.Typing_defs.ft_pos,
               Typing_defs.Tfun fun_
             in
-            add_result (Utils.strip_ns name) ty
+            add_result stripped_name (Phase.decl ty)
           | _ -> ()
-      end funs
+      end
     end
   with Exit -> ()
 
@@ -265,13 +304,11 @@ let process_fun_call fun_args used_args env =
          * happen on the way up because autocomplete pos needs to get set
          * before this is called *)
         let argument_index = ref (-1) in
-        let index = ref 0 in
-        List.iter begin fun arg ->
-          if is_target pos arg then argument_index := !index;
-          incr index
-        end used_args;
+        List.iteri used_args begin fun index arg ->
+          if is_target pos arg then argument_index := index;
+        end;
         begin try
-          let _, arg_ty = List.nth fun_args !argument_index in
+          let _, arg_ty = List.nth_exn fun_args !argument_index in
           ac_type := Some arg_ty
         with
           | Failure _ ->
@@ -307,52 +344,63 @@ let result_compare a b =
   else 1
 
 let get_results funs classes =
-  let completion_type = !Autocomplete.argument_global_type in
-  if completion_type = Some Autocomplete.Acid ||
-     completion_type = Some Autocomplete.Acnew ||
-     completion_type = Some Autocomplete.Actype
-  then compute_complete_global funs classes;
-  let results = !autocomplete_results in
-  let fake_env = Typing_env.empty "" in
-  let results = List.map begin fun x ->
-    let desc_string = match x.desc with
-      | Some s -> s
-      | None -> Typing_print.full_strip_ns fake_env (x.ty)
+  Errors.ignore_ begin fun() ->
+    let completion_type = !Autocomplete.argument_global_type in
+    if completion_type = Some Autocomplete.Acid ||
+       completion_type = Some Autocomplete.Acnew ||
+       completion_type = Some Autocomplete.Actype
+    then compute_complete_global funs classes;
+    let results = !autocomplete_results in
+    let env = match !ac_env with
+      | Some e -> e
+      | None ->
+        let tcopt = TypecheckerOptions.permissive in
+        Typing_env.empty tcopt Relative_path.default
     in
-    let func_details = match x.ty with
-      | (_, Tfun ft) ->
-        let param_to_record ?(is_variadic=false) (name, pty) =
-          {
-            param_name     = (match name with
-                               | Some n -> n
-                               | None -> "");
-            param_ty       = Typing_print.full_strip_ns fake_env pty;
-            param_variadic = is_variadic;
+    let results = List.map results begin fun x ->
+      let env, ty = match x.ty with
+        | DeclTy ty -> Phase.localize_with_self env ty
+        | LoclTy ty -> env, ty
+      in
+      let desc_string = match x.desc with
+        | Some s -> s
+        | None -> Typing_print.full_strip_ns env ty
+      in
+      let func_details = match ty with
+        | (_, Tfun ft) ->
+          let param_to_record ?(is_variadic=false) (name, pty) =
+            {
+              param_name     = (match name with
+                                 | Some n -> n
+                                 | None -> "");
+              param_ty       = Typing_print.full_strip_ns env pty;
+              param_variadic = is_variadic;
+            }
+          in
+          Some {
+            return_ty = Typing_print.full_strip_ns env ft.ft_ret;
+            min_arity = arity_min ft.ft_arity;
+            params    = List.map ft.ft_params param_to_record @
+              (match ft.ft_arity with
+                 | Fellipsis _ -> let empty = (None, (Reason.none, Tany)) in
+                                  [param_to_record ~is_variadic:true empty]
+                 | Fvariadic (_, p) -> [param_to_record ~is_variadic:true p]
+                 | Fstandard _ -> [])
           }
-        in
-        Some {
-          return_ty = Typing_print.full_strip_ns fake_env ft.ft_ret;
-          min_arity = arity_min ft.ft_arity;
-          params    = List.map param_to_record ft.ft_params @
-            (match ft.ft_arity with
-               | Fellipsis _ -> let empty = (None, (Reason.none, Tany)) in
-                                [param_to_record ~is_variadic:true empty]
-               | Fvariadic (_, p) -> [param_to_record ~is_variadic:true p]
-               | Fstandard _ -> [])
-        }
-      | _ -> None
-    in
-    let expected_ty = result_matches_expected_ty x.ty in
-    let pos = Typing_reason.to_pos (fst x.ty) in
-    {
-      res_pos      = pos;
-      res_ty       = desc_string;
-      res_name     = x.name;
-      expected_ty  = expected_ty;
-      func_details = func_details;
-    }
-  end results in
-  List.sort result_compare results
+        | _ -> None
+      in
+      let expected_ty = result_matches_expected_ty ty in
+      let pos = Typing_reason.to_pos (fst ty) in
+      {
+        res_pos      = Pos.to_absolute pos;
+        res_ty       = desc_string;
+        res_name     = x.name;
+        expected_ty  = expected_ty;
+        func_details = func_details;
+      }
+    end in
+    List.sort result_compare results
+end
 
 let reset () =
   Autocomplete.auto_complete_for_global := "";

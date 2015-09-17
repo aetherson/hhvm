@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -73,10 +73,10 @@ visitor<Ret,Funcs...> make_visitor(Funcs&&... funcs) {
 }
 
 template<class Ret, class Var, class... Funcs>
-Ret match(Var&& v, Funcs&&... funcs) {
+Ret match(Var& v, Funcs&&... funcs) {
   return boost::apply_visitor(
     match_detail::make_visitor<Ret>(std::forward<Funcs>(funcs)...),
-    std::forward<Var>(v)
+    v
   );
 }
 

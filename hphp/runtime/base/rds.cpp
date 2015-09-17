@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -22,21 +22,21 @@
 #include <vector>
 
 #include <sys/mman.h>
-#ifndef __CYGWIN__
+#if !defined(__CYGWIN__) && !defined(_MSC_VER)
 #include <execinfo.h>
 #endif
 
-#include "folly/String.h"
-#include "folly/Hash.h"
-#include "folly/Bits.h"
+#include <folly/String.h>
+#include <folly/Hash.h>
+#include <folly/Bits.h>
 
 #include "hphp/util/maphuge.h"
+#include "hphp/util/logger.h"
 
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/rds-header.h"
 #include "hphp/runtime/vm/debug/debug.h"
 
-namespace HPHP { namespace RDS {
+namespace HPHP { namespace rds {
 
 //////////////////////////////////////////////////////////////////////
 
@@ -99,7 +99,7 @@ struct SymbolRep : boost::static_visitor<std::string> {
   std::string operator()(Profile k) const {
     return folly::format(
       "{}:t{}:{}",
-      k.name->data(),
+      k.name,
       k.transId,
       k.bcOff
     ).str();
@@ -344,10 +344,41 @@ void requestExit() {
 
 void flush() {
   if (madvise(tl_base, s_normal_frontier, MADV_DONTNEED) == -1) {
-    fprintf(stderr, "RDS madvise failure: %s\n",
-      folly::errnoStr(errno).c_str());
+    Logger::Warning("RDS madvise failure: %s\n",
+                    folly::errnoStr(errno).c_str());
+  }
+  size_t offset = s_local_frontier & ~0xfff;
+  if (madvise(static_cast<char*>(tl_base) + offset,
+              s_persistent_base - offset, MADV_DONTNEED)) {
+    Logger::Warning("RDS local madvise failure: %s\n",
+                    folly::errnoStr(errno).c_str());
   }
 }
+
+/* RDS Layout:
+ * +-------------+ <-- tl_base
+ * |  Header     |
+ * +-------------+
+ * |             |
+ * |  Normal     | growing higher
+ * |    region   | vvv
+ * |             |
+ * +-------------+ <-- tl_base + s_normal_frontier
+ * | \ \ \ \ \ \ |
+ * +-------------+ <-- tl_base + s_local_frontier
+ * |             |
+ * |  Local      | ^^^
+ * |    region   | growing lower
+ * |             |
+ * +-------------+ <-- tl_base + s_persistent_base
+ * |             |
+ * | Persistent  | growing higher
+ * |     region  | vvv
+ * |             |
+ * +-------------+ <-- tl_base + s_persistent_frontier
+ * | \ \ \ \ \ \ |
+ * +-------------+ higher addresses
+ */
 
 size_t usedBytes() {
   return s_normal_frontier;
@@ -359,6 +390,18 @@ size_t usedLocalBytes() {
 
 size_t usedPersistentBytes() {
   return s_persistent_frontier - s_persistent_base;
+}
+
+folly::Range<const char*> normalSection() {
+  return {(const char*)tl_base, usedBytes()};
+}
+
+folly::Range<const char*> localSection() {
+  return {(const char*)tl_base + s_local_frontier, usedLocalBytes()};
+}
+
+folly::Range<const char*> persistentSection() {
+  return {(const char*)tl_base + s_persistent_base, usedPersistentBytes()};
 }
 
 Array& s_constants() {
@@ -394,7 +437,9 @@ bool testAndSetBit(size_t bit) {
 }
 
 bool isPersistentHandle(Handle handle) {
-  assert(handle >= 0 && handle < RuntimeOption::EvalJitTargetCacheSize);
+  static_assert(std::is_unsigned<Handle>::value,
+                "Handle is supposed to be unsigned");
+  assert(handle < RuntimeOption::EvalJitTargetCacheSize);
   return handle >= (unsigned)s_persistent_base;
 }
 
@@ -413,6 +458,7 @@ static void initPersistentCache() {
 }
 
 void threadInit() {
+  assert(tl_base == nullptr);
   if (!s_tc_fd) {
     initPersistentCache();
   }
@@ -421,8 +467,22 @@ void threadInit() {
                  PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
   always_assert_flog(
     tl_base != MAP_FAILED,
-    "Failed to mmap persistent RDS region"
+    "Failed to mmap persistent RDS region. errno = {}",
+    folly::errnoStr(errno).c_str()
   );
+#if defined(__CYGWIN__) || defined(_MSC_VER)
+  // MapViewOfFileEx() requires "the specified memory region is not already in
+  // use by the calling process" when mapping the shared area below. Otherwise
+  // it will return MAP_FAILED. We first map the full size to make sure the
+  // memory area is available. Then we unmap and map the lower portion of the
+  // RDS at the same address.
+  munmap(tl_base, RuntimeOption::EvalJitTargetCacheSize);
+  void* tl_same = mmap(tl_base, s_persistent_base,
+                       PROT_READ | PROT_WRITE,
+                       MAP_ANON | MAP_PRIVATE | MAP_FIXED,
+                       -1, 0);
+  always_assert(tl_same == tl_base);
+#endif
   numa_bind_to(tl_base, s_persistent_base, s_numaNode);
   if (RuntimeOption::EvalMapTgtCacheHuge) {
     hintHuge(tl_base, RuntimeOption::EvalJitTargetCacheSize);
@@ -437,7 +497,7 @@ void threadInit() {
 
   void* shared_base = (char*)tl_base + s_persistent_base;
   /*
-   * map the upper portion of the RDS to a shared area This is used
+   * Map the upper portion of the RDS to a shared area. This is used
    * for persistent classes and functions, so they are always defined,
    * and always visible to all threads.
    */
@@ -469,7 +529,13 @@ void threadExit() {
       (char*)tl_base + RuntimeOption::EvalJitTargetCacheSize,
       "-rds");
   }
+#if defined(__CYGWIN__) || defined(_MSC_VER)
+  munmap(tl_base, s_persistent_base);
+  munmap((char*)tl_base + s_persistent_base,
+         RuntimeOption::EvalJitTargetCacheSize - s_persistent_base);
+#else
   munmap(tl_base, RuntimeOption::EvalJitTargetCacheSize);
+#endif
 }
 
 void recordRds(Handle h, size_t size,

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -38,7 +38,7 @@ using namespace HPHP;
 
 ConstantExpression::ConstantExpression
 (EXPRESSION_CONSTRUCTOR_PARAMETERS,
- const string &name, bool hadBackslash, const string &docComment)
+ const std::string &name, bool hadBackslash, const std::string &docComment)
   : Expression(EXPRESSION_CONSTRUCTOR_PARAMETER_VALUES(ConstantExpression)),
     m_name(name), m_origName(name), m_hadBackslash(hadBackslash),
     m_docComment(docComment), m_valid(false), m_dynamic(false),
@@ -59,7 +59,7 @@ ExpressionPtr ConstantExpression::clone() {
 
 bool ConstantExpression::isScalar() const {
   if (m_name == "INF" || m_name == "NAN") return true;
-  string lower = toLower(m_name);
+  auto const lower = toLower(m_name);
   return lower == "true" || lower == "false" || lower == "null";
 }
 
@@ -68,12 +68,12 @@ bool ConstantExpression::isLiteralNull() const {
 }
 
 bool ConstantExpression::isNull() const {
-  string lower = toLower(m_name);
+  auto const lower = toLower(m_name);
   return (lower == "null");
 }
 
 bool ConstantExpression::isBoolean() const {
-  string lower = toLower(m_name);
+  auto const lower = toLower(m_name);
   return (lower == "true" || lower == "false");
 }
 
@@ -82,7 +82,7 @@ bool ConstantExpression::isDouble() const {
 }
 
 bool ConstantExpression::getBooleanValue() const {
-  string lower = toLower(m_name);
+  auto const lower = toLower(m_name);
   assert(lower == "true" || lower == "false");
   return lower == "true";
 }
@@ -99,16 +99,6 @@ bool ConstantExpression::getScalarValue(Variant &value) {
     value.unset();
   }
   return true;
-}
-
-unsigned ConstantExpression::getCanonHash() const {
-  int64_t val = hash_string(toLower(m_name).c_str(), m_name.size());
-  return ~unsigned(val) ^ unsigned(val >> 32);
-}
-
-bool ConstantExpression::canonCompare(ExpressionPtr e) const {
-  return Expression::canonCompare(e) &&
-    m_name == static_cast<ConstantExpression*>(e.get())->m_name;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -149,8 +139,6 @@ void ConstantExpression::analyzeProgram(AnalysisResultPtr ar) {
         }
       }
     }
-  } else if (ar->getPhase() == AnalysisResult::AnalyzeFinal && m_dynamic) {
-    getFileScope()->addConstantDependency(ar, m_name);
   }
 }
 
@@ -168,7 +156,7 @@ ExpressionPtr ConstantExpression::preOptimize(AnalysisResultConstPtr ar) {
     }
     if (!sym) break;
     if (!sym->isSystem()) BlockScope::s_constMutex.lock();
-    ExpressionPtr value = dynamic_pointer_cast<Expression>(sym->getValue());
+    auto value = dynamic_pointer_cast<Expression>(sym->getValue());
     if (!sym->isSystem()) BlockScope::s_constMutex.unlock();
 
     if (!value || !value->isScalar()) {
@@ -196,82 +184,11 @@ ExpressionPtr ConstantExpression::preOptimize(AnalysisResultConstPtr ar) {
     }
     ExpressionPtr rep = Clone(value, getScope());
     rep->setComment(getText());
-    rep->setLocation(getLocation());
+    copyLocationTo(rep);
     return replaceValue(rep);
   }
 
   return ExpressionPtr();
-}
-
-TypePtr ConstantExpression::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                       bool coerce) {
-  if (m_context & LValue) return type; // ClassConstantExpression statement
-
-  // special cases: STDIN, STDOUT, STDERR
-  if (m_name == "STDIN" || m_name == "STDOUT" || m_name == "STDERR") {
-    m_valid = true;
-    return Type::Variant;
-  }
-
-  if (m_name == "INF" || m_name == "NAN") {
-    m_valid = true;
-    return Type::Double;
-  }
-
-  string lower = toLower(m_name);
-  TypePtr actualType;
-  ConstructPtr self = shared_from_this();
-  if (lower == "true" || lower == "false") {
-    m_valid = true;
-    actualType = Type::Boolean;
-  } else if (lower == "null") {
-    actualType = Type::Variant;
-    m_valid = true;
-  } else {
-    BlockScopePtr scope;
-    {
-      Lock lock(ar->getMutex());
-      scope = ar->findConstantDeclarer(m_name);
-      if (!scope) {
-        scope = getFileScope();
-        // guarded by ar lock
-        getFileScope()->declareConstant(ar, m_name);
-      }
-    }
-    assert(scope);
-    assert(scope->is(BlockScope::ProgramScope) ||
-           scope->is(BlockScope::FileScope));
-    ConstantTablePtr constants = scope->getConstants();
-
-    ConstructPtr value;
-    bool isDynamic;
-    {
-      Lock lock(scope->getMutex()); // since not class/function scope
-      // read value and dynamic-ness together + check() atomically
-      value = constants->getValue(m_name);
-      isDynamic = constants->isDynamic(m_name);
-      BlockScope *defScope = nullptr;
-      std::vector<std::string> bases;
-      actualType = constants->check(getScope(), m_name, type, coerce,
-                                    ar, self, bases, defScope);
-    }
-
-    if (!m_valid) {
-      if (ar->isSystemConstant(m_name) || value) {
-        m_valid = true;
-      }
-    }
-    if (!m_dynamic && isDynamic) {
-      m_dynamic = true;
-      actualType = Type::Variant;
-    }
-    if (m_dynamic) {
-      getScope()->getVariables()->
-        setAttribute(VariableTable::NeedGlobalPointer);
-    }
-  }
-
-  return actualType;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -281,7 +198,7 @@ void ConstantExpression::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("constantName");
   cg.printValue(m_origName);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

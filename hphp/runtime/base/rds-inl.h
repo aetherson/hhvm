@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,7 +16,7 @@
 #ifndef incl_HPHP_RUNTIME_BASE_RDS_INL_H_
 #define incl_HPHP_RUNTIME_BASE_RDS_INL_H_
 
-namespace HPHP { namespace RDS {
+namespace HPHP { namespace rds {
 
 //////////////////////////////////////////////////////////////////////
 
@@ -76,8 +76,8 @@ void Link<T>::bind(Mode mode) {
 //////////////////////////////////////////////////////////////////////
 
 template<class T, size_t Align>
-Link<T> bind(Symbol key, Mode mode) {
-  return Link<T>(detail::bindImpl(key, mode, sizeof(T), Align));
+Link<T> bind(Symbol key, Mode mode, size_t extraSize) {
+  return Link<T>(detail::bindImpl(key, mode, sizeof(T) + extraSize, Align));
 }
 
 template<class T>

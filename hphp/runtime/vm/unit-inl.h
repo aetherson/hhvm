@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -20,14 +20,15 @@
 
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/type-string.h"
+#include "hphp/runtime/vm/hhbc-codec.h"
 #include "hphp/runtime/vm/litstr-table.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 // SourceLoc.
 
-inline SourceLoc::SourceLoc(const Location& l) {
-  setLoc(&l);
+inline SourceLoc::SourceLoc(const Location::Range& r) {
+  setLoc(&r);
 }
 
 inline void SourceLoc::reset() {
@@ -38,7 +39,7 @@ inline bool SourceLoc::valid() const {
   return line0 != 1 || char0 != 1 || line1 != 1 || char1 != 1;
 }
 
-inline void SourceLoc::setLoc(const Location* l) {
+inline void SourceLoc::setLoc(const Location::Range* l) {
   line0 = l->line0;
   char0 = l->char0;
   line1 = l->line1;
@@ -172,9 +173,9 @@ inline bool Unit::contains(PC pc) const {
   return pc >= m_bc && pc <= m_bc + m_bclen;
 }
 
-inline Op Unit::getOpcode(size_t instrOffset) const {
+inline Op Unit::getOp(Offset instrOffset) const {
   assert(instrOffset < m_bclen);
-  return static_cast<Op>(m_bc[instrOffset]);
+  return peek_op(m_bc + instrOffset);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -220,7 +221,8 @@ inline size_t Unit::numArrays() const {
 }
 
 inline ArrayData* Unit::lookupArrayId(Id id) const {
-  return const_cast<ArrayData*>(m_arrays.at(id));
+  assert(id < m_arrays.size());
+  return const_cast<ArrayData*>(m_arrays[id]);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -249,6 +251,12 @@ inline Func* Unit::firstHoistable() const {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// Type aliases
+inline Unit::TypeAliasRange Unit::typeAliases() const {
+  return TypeAliasRange(m_typeAliases);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // Class lookup.
 
 inline Class* Unit::lookupClass(const NamedEntity* ne) {
@@ -259,7 +267,7 @@ inline Class* Unit::lookupClass(const StringData* name) {
   return lookupClass(NamedEntity::get(name));
 }
 
-inline Class* Unit::lookupUniqueClass(const NamedEntity* ne) {
+inline Class* Unit::lookupClassOrUniqueClass(const NamedEntity* ne) {
   Class* cls = ne->clsList();
   if (LIKELY(cls != nullptr)) {
     if (cls->attrs() & AttrUnique && RuntimeOption::RepoAuthoritative) {
@@ -270,8 +278,8 @@ inline Class* Unit::lookupUniqueClass(const NamedEntity* ne) {
   return nullptr;
 }
 
-inline Class* Unit::lookupUniqueClass(const StringData* name) {
-  return lookupUniqueClass(NamedEntity::get(name));
+inline Class* Unit::lookupClassOrUniqueClass(const StringData* name) {
+  return lookupClassOrUniqueClass(NamedEntity::get(name));
 }
 
 inline Class* Unit::loadClass(const StringData* name) {

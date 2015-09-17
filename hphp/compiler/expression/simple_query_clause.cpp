@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,7 +16,6 @@
 
 #include "hphp/compiler/expression/simple_query_clause.h"
 #include "hphp/compiler/analysis/code_error.h"
-#include "hphp/runtime/base/complex-types.h"
 
 using namespace HPHP;
 
@@ -71,12 +70,6 @@ void SimpleQueryClause::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-TypePtr SimpleQueryClause::inferTypes(AnalysisResultPtr ar,
-  TypePtr type, bool coerce) {
-  m_expression->inferAndCheck(ar, Type::Some, false);
-  return Type::Object;
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void SimpleQueryClause::outputCodeModel(CodeGenerator &cg) {
@@ -100,7 +93,7 @@ void SimpleQueryClause::outputCodeModel(CodeGenerator &cg) {
       cg.printPropertyHeader("clauses");
       cg.printExpressionVector(m_expression);
       cg.printPropertyHeader("sourceLocation");
-      cg.printLocation(this->getLocation());
+      cg.printLocation(this);
       cg.printObjectFooter();
       return;
     case Expression::KindOfWhereClause:
@@ -117,7 +110,7 @@ void SimpleQueryClause::outputCodeModel(CodeGenerator &cg) {
   }
   m_expression->outputCodeModel(cg);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 
@@ -148,4 +141,3 @@ void SimpleQueryClause::outputPHP(
   }
   m_expression->outputPHP(cg, ar);
 }
-

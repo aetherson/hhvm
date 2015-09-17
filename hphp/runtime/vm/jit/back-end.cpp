@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -14,8 +14,9 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/base/arch.h"
 #include "hphp/runtime/vm/jit/back-end.h"
+
+#include "hphp/runtime/base/arch.h"
 #include "hphp/runtime/vm/jit/back-end-x64.h"
 #include "hphp/runtime/vm/jit/back-end-arm.h"
 
@@ -24,14 +25,11 @@ namespace HPHP { namespace jit {
 std::unique_ptr<BackEnd> newBackEnd() {
   switch (arch()) {
   case Arch::X64:
-    return X64::newBackEnd();
+    return x64::newBackEnd();
   case Arch::ARM:
-    return ARM::newBackEnd();
+    return arm::newBackEnd();
   }
   not_reached();
-}
-
-BackEnd::BackEnd() {
 }
 
 BackEnd::~BackEnd() {

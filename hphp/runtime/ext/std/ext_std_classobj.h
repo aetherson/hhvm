@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -54,6 +54,8 @@ Array HHVM_FUNCTION(get_object_vars, const Object& object);
 Variant HHVM_FUNCTION(call_user_method_array, const String& method_name,
                                               VRefParam obj,
                                               const Variant& paramarr);
+
+void getMethodNames(Class* cls, Class* ctx, Array& result);
 
 ///////////////////////////////////////////////////////////////////////////////
 }

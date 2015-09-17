@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -12,10 +12,13 @@ module C = ClientCommand
 module LC = ClientLogCommand
 
 let log_command_of_command = function
-  | C.CCheck env -> LC.LCCheck (env.ClientEnv.root, env.ClientEnv.from)
+  | C.CCheck env ->
+      let mode = ClientEnv.mode_to_string env.ClientEnv.mode in
+      LC.LCCheck (env.ClientEnv.root, env.ClientEnv.from, mode)
   | C.CStart env -> LC.LCStart env.ClientStart.root
   | C.CStop env -> LC.LCStop env.ClientStop.root
-  | C.CRestart env -> LC.LCRestart env.ClientRestart.root
-  | C.CStatus env -> LC.LCStatus env.ClientStatus.root
-  | C.CBuild env -> LC.LCBuild env.ServerMsg.root
-  | C.CProlog env -> LC.LCProlog env.ClientProlog.root
+  | C.CRestart env -> LC.LCRestart env.ClientStart.root
+  | C.CBuild env ->
+     LC.LCBuild (env.ClientBuild.root,
+                 ClientBuild.build_kind_of env.ClientBuild.build_opts,
+                 env.ClientBuild.build_opts.ServerBuild.id)

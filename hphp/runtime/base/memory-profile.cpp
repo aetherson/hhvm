@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -126,17 +126,20 @@ size_t MemoryProfile::getSizeOfTV(const TypedValue* tv) {
   if (!RuntimeOption::HHProfServerEnabled) return 0;
 
   switch (tv->m_type) {
-  case KindOfString:
-    return getSizeOfPtr(tv->m_data.pstr);
-  case KindOfArray:
-    return getSizeOfArray(tv->m_data.parr);
-  case KindOfObject:
-    return getSizeOfObject(tv->m_data.pobj);
-  case KindOfRef:
-    return getSizeOfPtr(tv->m_data.pref);
-  default:
-    return 0;
+    DT_UNCOUNTED_CASE:
+    case KindOfResource:
+    case KindOfClass:
+      return 0;
+    case KindOfString:
+      return getSizeOfPtr(tv->m_data.pstr);
+    case KindOfArray:
+      return getSizeOfArray(tv->m_data.parr);
+    case KindOfObject:
+      return getSizeOfObject(tv->m_data.pobj);
+    case KindOfRef:
+      return getSizeOfPtr(tv->m_data.pref);
   }
+  not_reached();
 }
 
 // static

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,17 +16,23 @@
 #include "hphp/util/network.h"
 
 #include <netinet/in.h>
-#include <arpa/nameser.h>
 #include <arpa/inet.h>
+
+#ifndef _MSC_VER
+#include <arpa/nameser.h>
 #include <resolv.h>
 #include <sys/utsname.h>
+#endif
 
-#include "folly/String.h"
+#include <folly/String.h>
+#include <folly/IPAddress.h>
 
 #include "hphp/util/lock.h"
 #include "hphp/util/process.h"
 
 namespace HPHP {
+
+#ifndef _MSC_VER
 ///////////////////////////////////////////////////////////////////////////////
 // without calling res_init(), any call to getaddrinfo() may leak memory:
 //  http://sources.redhat.com/ml/libc-hacker/2004-02/msg00049.html
@@ -43,15 +49,10 @@ public:
   }
 };
 static ResolverLibInitializer _resolver_lib_initializer;
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 // thread-safe network functions
-
-std::string safe_inet_ntoa(struct in_addr &in) {
-  char buf[256];
-  memset(buf, 0, sizeof(buf));
-  inet_ntop(AF_INET, &in, buf, sizeof(buf)-1);
-  return buf;
-}
 
 bool safe_gethostbyname(const char *address, HostEnt &result) {
 #if defined(__APPLE__) || defined(__CYGWIN__) || defined(__MINGW__) || \
@@ -66,9 +67,6 @@ bool safe_gethostbyname(const char *address, HostEnt &result) {
   }
 
   result.hostbuf = *hp;
-#ifdef __APPLE__
-  freehostent(hp);
-#endif
   return true;
 #else
   struct hostent *hp;
@@ -86,19 +84,60 @@ bool safe_gethostbyname(const char *address, HostEnt &result) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+std::string GetPrimaryIPImpl(int af) {
+  const static std::string s_empty;
+  struct addrinfo hints;
+  struct addrinfo *res = nullptr;
+  int error;
 
-std::string GetPrimaryIP() {
+  SCOPE_EXIT {
+    if (res) {
+      freeaddrinfo(res);
+    }
+  };
+
+#ifdef _MSC_VER
+  char* nodename = nullptr;
+  char nodenamebuf[65];
+  if (gethostname(nodenamebuf, 65) < 0)
+    nodename = "localhost";
+  else
+    nodename = nodenamebuf;
+#else
   struct utsname buf;
   uname((struct utsname *)&buf);
+  const char* nodename = buf.nodename;
+#endif
 
-  HostEnt result;
-  if (!safe_gethostbyname(buf.nodename, result)) {
-    return buf.nodename;
+  memset(&hints, 0, sizeof(struct addrinfo));
+  hints.ai_family = af;
+
+  error = getaddrinfo(nodename, nullptr, &hints, &res);
+  if (error) {
+    return s_empty;
   }
 
-  struct in_addr in;
-  memcpy(&in.s_addr, *(result.hostbuf.h_addr_list), sizeof(in.s_addr));
-  return safe_inet_ntoa(in);
+  try {
+    return folly::IPAddress(res->ai_addr).toFullyQualified();
+  } catch (folly::IPAddressFormatException &e) {
+    return s_empty;
+  }
+}
+
+std::string GetPrimaryIPv4() {
+  return GetPrimaryIPImpl(AF_INET);
+}
+
+std::string GetPrimaryIPv6() {
+  return GetPrimaryIPImpl(AF_INET6);
+}
+
+std::string GetPrimaryIP() {
+  auto ipaddress = GetPrimaryIPv4();
+  if (ipaddress.empty()) {
+    ipaddress = GetPrimaryIPv6();
+  }
+  return ipaddress;
 }
 
 static std::string normalizeIPv6Address(const std::string& address) {
@@ -128,12 +167,16 @@ HostURL::HostURL(const std::string &hosturl, int port) :
     spos = 0;
   }
 
+  // strip off /EXTRA from prot://addr:port/EXTRA
+  auto extraPos = hosturl.find('/', spos);
+  auto validLen = extraPos != std::string::npos ? extraPos : hosturl.size();
+
   // IPv6 address?
   auto bpos = hosturl.find('[');
   if (bpos != std::string::npos) {
     // Extract out the IPAddress from [..]
     // Look for the ending position of ']'
-    auto epos = hosturl.rfind(']');
+    auto epos = hosturl.rfind(']', validLen - 1);
     if (epos == std::string::npos) {
       // This isn't a valid IPv6 address, so bail.
       m_valid = false;
@@ -157,13 +200,20 @@ HostURL::HostURL(const std::string &hosturl, int port) :
     auto cpos = hosturl.find(':', epos);
     if (cpos != std::string::npos) {
       try {
-        m_port = folly::to<uint16_t>(hosturl.substr(cpos + 1));
+        auto portLen = validLen - cpos - 1;
+        m_port = folly::to<uint16_t>(hosturl.substr(cpos + 1, portLen));
         m_hosturl += hosturl.substr(cpos);
       } catch (...) {
         m_port = 0;
       }
+    } else if (extraPos != std::string::npos) {
+      m_hosturl += hosturl.substr(extraPos);
     }
     m_ipv6 = true;
+  } else if (m_scheme == "unix" || m_scheme == "udg") {
+    // unix socket
+    m_host = hosturl.substr(spos);
+    m_hosturl += m_host;
   } else {
     // IPv4 or hostname
     auto cpos = hosturl.find(':', spos);
@@ -171,14 +221,15 @@ HostURL::HostURL(const std::string &hosturl, int port) :
       m_host = hosturl.substr(spos, cpos - spos);
       m_hosturl += m_host;
       try {
-        m_port = folly::to<uint16_t>(hosturl.substr(cpos + 1));
+        auto portLen = validLen - cpos - 1;
+        m_port = folly::to<uint16_t>(hosturl.substr(cpos + 1, portLen));
         m_hosturl += hosturl.substr(cpos);
       } catch (...) {
         m_port = 0;
       }
     } else {
-      m_host = hosturl.substr(spos);
-      m_hosturl += m_host;
+      m_host = hosturl.substr(spos, validLen - spos);
+      m_hosturl += hosturl.substr(spos);
     }
     m_ipv6 = false;
   }

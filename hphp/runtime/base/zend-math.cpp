@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1998-2010 Zend Technologies Ltd. (http://www.zend.com) |
    +----------------------------------------------------------------------+
    | This source file is subject to version 2.00 of the Zend license,     |
@@ -113,7 +113,7 @@ double php_math_round(double value, int places,
   }
 
   int precision_places = 14 - php_intlog10abs(value);
-  float f1 = php_intpow10(abs(places));
+  double f1 = php_intpow10(abs(places));
 
   /* If the decimal precision guaranteed by FP arithmetic is higher than
    * the requested places BUT is small enough to make sure a non-zero value

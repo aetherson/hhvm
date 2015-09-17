@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,7 @@
 #ifndef incl_HPHP_HOST_HEALTH_MONITOR_TYPES_H_
 #define incl_HPHP_HOST_HEALTH_MONITOR_TYPES_H_
 
+#include "hphp/runtime/base/runtime-option.h"
 #include "hphp/util/hdf.h"
 
 namespace HPHP {
@@ -41,6 +42,9 @@ enum class HealthLevel {
 struct IHealthMonitorMetric {
   virtual ~IHealthMonitorMetric() { } // make compiler happy
   virtual HealthLevel evaluate() = 0;
+  virtual bool enabled() = 0;
+  virtual void setConfig(const IniSettingMap&, const Hdf&,
+                         const std::string& name) = 0;
 };
 
 /*

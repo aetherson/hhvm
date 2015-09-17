@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -21,7 +21,7 @@
 #include <cassert>
 #include <atomic>
 
-#include "folly/Portability.h"
+#include <folly/Portability.h>
 
 #include "hphp/util/exception.h"
 
@@ -46,16 +46,9 @@
 #  include "malloc.h"
 # endif
 #else
-# undef ALLOCM_ZERO
-# undef ALLOCM_NO_MOVE
+# undef MALLOCX_LG_ALIGN
+# undef MALLOCX_ZERO
 # include <jemalloc/jemalloc.h>
-# ifndef ALLOCM_ARENA
-#  define ALLOCM_ARENA(a) 0
-# endif
-# if JEMALLOC_VERSION_MAJOR > 3 || \
-     (JEMALLOC_VERSION_MAJOR == 3 && JEMALLOC_VERSION_MINOR >= 5)
-#  define USE_JEMALLOC_MALLOCX
-# endif
 #endif
 
 #include "hphp/util/maphuge.h"
@@ -80,6 +73,19 @@ extern "C" {
 #endif
 }
 
+enum class NotNull {};
+
+/*
+ * The placement-new provided by the standard library is required by the
+ * C++ specification to perform a null check because it is marked with noexcept
+ * or throw() depending on the compiler version. This override of placement
+ * new doesn't use either of these, so it is allowed to omit the null check.
+ */
+inline void* operator new(size_t, NotNull, void* location) {
+  assert(location);
+  return location;
+}
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -91,11 +97,9 @@ const bool use_jemalloc =
 #endif
   ;
 
-class OutOfMemoryException : public Exception {
-public:
+struct OutOfMemoryException : Exception {
   explicit OutOfMemoryException(size_t size)
     : Exception("Unable to allocate %zu bytes of memory", size) {}
-  virtual ~OutOfMemoryException() throw() {}
   EXCEPTION_COMMON_IMPL(OutOfMemoryException);
 };
 
@@ -104,6 +108,27 @@ public:
 #ifdef USE_JEMALLOC
 extern unsigned low_arena;
 extern std::atomic<int> low_huge_pages;
+
+inline int low_mallocx_flags() {
+  // Allocate from low_arena, and bypass the implicit tcache to assure that the
+  // result actually comes from low_arena.
+#ifdef MALLOCX_TCACHE_NONE
+  return MALLOCX_ARENA(low_arena)|MALLOCX_TCACHE_NONE;
+#else
+  return MALLOCX_ARENA(low_arena);
+#endif
+}
+
+inline int low_dallocx_flags() {
+#ifdef MALLOCX_TCACHE_NONE
+  // Bypass the implicit tcache for this deallocation.
+  return MALLOCX_TCACHE_NONE;
+#else
+  // Prior to the introduction of MALLOCX_TCACHE_NONE, explicitly specifying
+  // MALLOCX_ARENA(a) caused jemalloc to bypass tcache.
+  return MALLOCX_ARENA(low_arena);
+#endif
+}
 #endif
 
 inline void* low_malloc(size_t size) {
@@ -118,10 +143,8 @@ inline void* low_malloc(size_t size) {
 inline void low_free(void* ptr) {
 #ifndef USE_JEMALLOC
   free(ptr);
-#elif defined(USE_JEMALLOC_MALLOCX)
-  dallocx(ptr, MALLOCX_ARENA(low_arena));
 #else
-  dallocm(ptr, ALLOCM_ARENA(low_arena));
+  if (ptr) dallocx(ptr, low_dallocx_flags());
 #endif
 }
 

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,12 +15,14 @@
 */
 #include "hphp/runtime/debugger/cmd/cmd_interrupt.h"
 
-#include <boost/lexical_cast.hpp>
 #include <vector>
 
+#include <folly/Conv.h>
+
+#include "hphp/runtime/base/array-init.h"
+#include "hphp/runtime/debugger/debugger_client.h"
 #include "hphp/runtime/debugger/cmd/cmd_break.h"
 #include "hphp/runtime/debugger/cmd/cmd_print.h"
-#include "hphp/runtime/base/array-init.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
@@ -51,7 +53,7 @@ void CmdInterrupt::sendImpl(DebuggerThriftBuffer &thrift) {
     if (e.isNull()) {
       thrift.write("");
     } else if (e.isObject()) {
-      thrift.write(e.toObject()->o_getClassName());
+      thrift.write(e.toObject()->getClassName());
     } else {
       String ex(BreakPointInfo::ErrorClassName);
       thrift.write(ex);
@@ -306,7 +308,7 @@ std::string CmdInterrupt::getFileLine() const {
     if (m_site->getFile()) {
       ret = m_site->getFile();
     }
-    ret += ":" + boost::lexical_cast<std::string>(m_site->getLine0());
+    ret += ":" + folly::to<std::string>(m_site->getLine0());
   }
   return ret;
 }

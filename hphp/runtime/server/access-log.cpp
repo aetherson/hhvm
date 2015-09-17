@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -33,8 +33,8 @@
 #include "hphp/util/process.h"
 #include "hphp/util/atomic.h"
 #include "hphp/util/compatibility.h"
+#include "hphp/util/hardware-counter.h"
 #include "hphp/util/timer.h"
-#include "hphp/runtime/base/hardware-counter.h"
 
 using std::endl;
 
@@ -44,7 +44,7 @@ namespace HPHP {
 
 AccessLog::~AccessLog() {
   signal(SIGCHLD, SIG_DFL);
-  for (uint i = 0; i < m_output.size(); ++i) {
+  for (uint32_t i = 0; i < m_output.size(); ++i) {
     if (m_output[i].log) {
       if (m_files[i].file[0] == '|') {
         pclose(m_output[i].log);
@@ -63,6 +63,19 @@ void AccessLog::init(const std::string &defaultFormat,
   m_initialized = true;
   m_defaultFormat = defaultFormat;
   m_files = files;
+  openFiles(username);
+}
+
+void AccessLog::init(const std::string &defaultFormat,
+                     std::map<std::string, AccessLogFileData> &files,
+                     const std::string &username) {
+  Lock l(m_lock);
+  if (m_initialized) return;
+  m_initialized = true;
+  m_defaultFormat = defaultFormat;
+  for (auto it = files.begin(); it != files.end(); ++it) {
+    m_files.push_back(it->second);
+  }
   openFiles(username);
 }
 
@@ -125,7 +138,7 @@ void AccessLog::log(Transport *transport, const VirtualHost *vhost) {
     threadData->flusher.recordWriteAndMaybeDropCaches(threadLog, bytes);
   }
   if (Logger::UseCronolog) {
-    for (uint i = 0; i < m_cronOutput.size(); ++i) {
+    for (uint32_t i = 0; i < m_cronOutput.size(); ++i) {
       Cronolog &cronOutput = *m_cronOutput[i];
       FILE *outFile = cronOutput.getOutputFile();
       if (!outFile) continue;
@@ -134,7 +147,7 @@ void AccessLog::log(Transport *transport, const VirtualHost *vhost) {
       cronOutput.flusher.recordWriteAndMaybeDropCaches(outFile, bytes);
     }
   } else {
-    for (uint i = 0; i < m_output.size(); ++i) {
+    for (uint32_t i = 0; i < m_output.size(); ++i) {
       LogFileData& output = m_output[i];
       FILE *outFile = output.log;
       if (!outFile) continue;
@@ -296,7 +309,12 @@ bool AccessLog::genField(std::ostringstream &out, const char* &format,
     }
     break;
   case 'h':
-    out << transport->getRemoteHost();
+    {
+       std::string host = transport->getRemoteHost();
+       if(host.empty())
+         host = transport->getRemoteAddr();
+       out << host;
+    }
     break;
   case 'i':
     if (arg.empty()) return false;
@@ -337,20 +355,8 @@ bool AccessLog::genField(std::ostringstream &out, const char* &format,
     break;
   case 'r':
     {
-      const char *method = nullptr;
-      switch (transport->getMethod()) {
-      case Transport::Method::GET: method = "GET"; break;
-      case Transport::Method::POST:
-        if (transport->getExtendedMethod() == nullptr) {
-          method = "POST";
-        } else {
-          method = transport->getExtendedMethod();
-        }
-        break;
-      case Transport::Method::HEAD: method = "HEAD"; break;
-      default: break;
-      }
-      if (!method) return false;
+      const char *method = transport->getMethodName();
+      if (!method || !method[0]) return false;
       out << method << " ";
 
       const char *url = transport->getUrl();

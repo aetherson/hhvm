@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -18,18 +18,19 @@
 #ifndef incl_HPHP_EXT_APACHE_H_
 #define incl_HPHP_EXT_APACHE_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/util/health-monitor-types.h"
 
 namespace HPHP {
 
-class ApacheExtension : public Extension {
+class ApacheExtension final : public Extension {
  public:
   ApacheExtension();
   virtual ~ApacheExtension();
-  virtual void moduleInit();
-  virtual void moduleLoad(const IniSetting::Map& ini, Hdf config);
+  void moduleInit() override;
+  void moduleLoad(const IniSetting::Map& ini, Hdf config) override;
   static bool Enable;
+  bool moduleEnabled() const override { return Enable; }
 
   static void UpdateHealthLevel(HealthLevel newStatus) {
     m_healthLevel = newStatus;

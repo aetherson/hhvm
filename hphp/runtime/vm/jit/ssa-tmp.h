@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -35,17 +35,17 @@ public:
   void              setType(Type t) { m_type = t; }
   std::string       toString() const;
 
-  // Convenience wrapper for type().isConst(...). See type.h for details.
+  // Convenience wrapper for type().hasConstVal(...). See type.h for details.
   template<typename... Args>
-  bool isConst(Args&&... args) const {
-    return type().isConst(std::forward<Args>(args)...);
+  bool hasConstVal(Args&&... args) const {
+    return type().hasConstVal(std::forward<Args>(args)...);
   }
 
   /*
    * For SSATmps with a compile-time constant value, the following
    * functions allow accessing it.
    *
-   * Pre: inst() && isConst()
+   * Pre: inst() && hasConstVal()
    */
   bool               boolVal() const      { return type().boolVal(); }
   int64_t            intVal() const       { return type().intVal(); }
@@ -55,18 +55,18 @@ public:
   const ArrayData*   arrVal() const       { return type().arrVal(); }
   const Func*        funcVal() const      { return type().funcVal(); }
   const Class*       clsVal() const       { return type().clsVal(); }
-  RDS::Handle        rdsHandleVal() const { return type().rdsHandleVal(); }
+  ConstCctx          cctxVal() const      { return type().cctxVal(); }
+  rds::Handle        rdsHandleVal() const { return type().rdsHandleVal(); }
   TCA                tcaVal() const       { return type().tcaVal(); }
   Variant            variantVal() const;
 
   /*
-   * Returns: Type::subtypeOf(type(), tag).
+   * @returns: type() <= tag
    *
-   * This should be used for most checks on the types of IRInstruction
-   * sources.
+   * This should be used for most checks on the types of IRInstruction sources.
    */
   bool isA(Type tag) const {
-    return type().subtypeOf(tag);
+    return type() <= tag;
   }
 
   /*

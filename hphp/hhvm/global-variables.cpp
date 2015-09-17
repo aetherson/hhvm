@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -14,16 +14,18 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
+#include "hphp/runtime/base/externals.h"
+#include "hphp/runtime/base/mixed-array-defs.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
-static __thread GlobalVariables* g_variables;
+static __thread GlobalsArray* g_variables;
 static __thread EnvConstants* g_envConstants;
 
-GlobalVariables* get_global_variables() {
+GlobalsArray* get_global_variables() {
   assert(g_variables);
   return g_variables;
 }
@@ -48,9 +50,10 @@ void EnvConstants::requestExit() {
   g_envConstants = nullptr;
 }
 
-GlobalNameValueTableWrapper::GlobalNameValueTableWrapper(
-  NameValueTable* tab) : NameValueTableWrapper(tab) {
-
+GlobalsArray::GlobalsArray(NameValueTable* tab)
+  : ArrayData(kGlobalsKind)
+  , m_tab(tab)
+{
   Variant arr(staticEmptyArray());
 #define X(s,v) tab->set(makeStaticString(#s), v.asTypedValue());
 
@@ -68,9 +71,9 @@ GlobalNameValueTableWrapper::GlobalNameValueTableWrapper(
 #undef X
 
   g_variables = this;
+  assert(hasExactlyOneRef());
 }
 
 //////////////////////////////////////////////////////////////////////
 
 }
-

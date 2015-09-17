@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -14,7 +14,7 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/compiler/analysis/emitter.h"
+#include "hphp/compiler/option.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/execution-context.h"
 #include "hphp/runtime/base/program-functions.h"
@@ -32,7 +32,7 @@
 #include "hphp/system/systemlib.h"
 #include "hphp/util/logger.h"
 
-#include <folly/experimental/Singleton.h>
+#include <folly/Singleton.h>
 
 #include <libgen.h> // For dirname(3).
 #include <string>
@@ -53,6 +53,7 @@ SYSTEMLIB_CLASSES(SYSTEM_CLASS_STRING)
 #undef pinitSentinel
 #undef STRINGIZE_CLASS_NAME
 
+void tweak_variant_dtors();
 void ProcessInit() {
   // Create the global mcg object
   jit::mcg = new jit::MCGenerator();
@@ -72,9 +73,9 @@ void ProcessInit() {
   RuntimeOption::EvalAllowHhas = true;
   Option::WholeProgram = false;
 
-  RDS::requestInit();
-  string hhas;
-  string slib = get_systemlib(&hhas);
+  rds::requestInit();
+  std::string hhas;
+  auto const slib = get_systemlib(&hhas);
 
   if (slib.empty()) {
     // Die a horrible death.
@@ -173,6 +174,8 @@ void ProcessInit() {
   RuntimeOption::EvalDumpBytecode = db;
   RuntimeOption::EvalAllowHhas = ah;
   Option::WholeProgram = wp;
+
+  tweak_variant_dtors();
 
   folly::SingletonVault::singleton()->registrationComplete();
 }

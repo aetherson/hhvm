@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -22,8 +22,9 @@ open Utils
  * mapped here in ifuns to a freshly created unique integer identifier.
  *)
 type env = {
+  itcopt    : TypecheckerOptions.t;
   iclasses  : ((Pos.t * Ident.t) SMap.t) * (String.t SMap.t);
-  ifuns     : (Pos.t * Ident.t) SMap.t;
+  ifuns     : ((Pos.t * Ident.t) SMap.t) * (String.t SMap.t);
   itypedefs : (Pos.t * Ident.t) SMap.t;
   iconsts   : (Pos.t * Ident.t) SMap.t;
 }
@@ -32,7 +33,7 @@ type env = {
 val canon_key: String.t -> String.t
 
 (* The empty naming environment *)
-val empty: env
+val empty: TypecheckerOptions.t -> env
 
 (* Function building the original naming environment.
  * This pass "declares" all the global names. The only checks done
@@ -48,11 +49,25 @@ val make_env:
       typedefs:Ast.id list ->
       consts:Ast.id list -> env
 
+(* Access the typechecker options from the env *)
+val typechecker_options: env -> TypecheckerOptions.t
+
 (* Solves the local names within a function *)
 val fun_: env -> Ast.fun_ -> Nast.fun_
 
+(* Uses a default empty environment to extract the use list
+  of a lambda expression. This exists only for the sake of
+  the dehackificator and is not meant for general use. *)
+val uselist_lambda: Ast.fun_ -> string list
+
 (* Solves the local names of a class *)
 val class_: env -> Ast.class_ -> Nast.class_
+
+(* Solves the local names in a function body *)
+val func_body: env -> Nast.fun_ -> Nast.func_named_body
+
+(* Solves the local names in class method bodies *)
+val class_meth_bodies: env -> Nast.class_ -> Nast.class_
 
 (* Solves the local names in an typedef *)
 val typedef: env -> Ast.typedef -> Nast.typedef
@@ -71,21 +86,7 @@ val remove_decls: env -> decl_set -> env
 
 val get_classes: env -> string list
 
-(* Contains the set of test functions built-in PHP
- * Relevant to typing (is_int, is_null etc ...)
-*)
-val predef_tests: SSet.t
-
-(* Bunch of predefined functions *)
-val is_int:    string
-val is_bool:   string
-val is_array:  string
-val is_float:  string
-val is_string: string
-val is_null:   string
-val is_resource:  string
-
 val ndecl_file:
-  string -> FileInfo.t ->
-  Errors.t * SSet.t * env ->
-  Errors.t * SSet.t * env
+  Relative_path.t -> FileInfo.t ->
+  Errors.t * Relative_path.Set.t * env ->
+  Errors.t * Relative_path.Set.t * env

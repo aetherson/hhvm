@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -12,5 +12,5 @@
  * and refresh the environment and update the many shared heaps
  *)
 val init:
-  ServerEnv.genv -> ServerEnv.env -> string MultiWorker.nextlist ->
+  ServerEnv.genv -> ServerEnv.env -> Relative_path.t MultiWorker.nextlist ->
   ServerEnv.env

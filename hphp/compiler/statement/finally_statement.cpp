@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -88,10 +88,6 @@ void FinallyStatement::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-void FinallyStatement::inferTypes(AnalysisResultPtr ar) {
-  if (m_stmt) m_stmt->inferTypes(ar);
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void FinallyStatement::outputCodeModel(CodeGenerator &cg) {
@@ -99,7 +95,7 @@ void FinallyStatement::outputCodeModel(CodeGenerator &cg) {
   cg.printPropertyHeader("block");
   cg.printAsEnclosedBlock(m_stmt);
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

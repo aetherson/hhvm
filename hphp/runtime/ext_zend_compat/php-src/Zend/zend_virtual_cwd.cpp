@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2013 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -19,7 +19,8 @@
 #include "hphp/runtime/ext_zend_compat/php-src/TSRM/TSRM.h"
 
 #include "hphp/runtime/base/execution-context.h"
-#include "hphp/runtime/ext/ext_file.h"
+#include "hphp/runtime/base/file.h"
+#include "hphp/runtime/ext/std/ext_std_file.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>

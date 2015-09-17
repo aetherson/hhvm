@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,33 +15,34 @@
 */
 
 #include "hphp/runtime/debugger/cmd/cmd_print.h"
+
 #include "hphp/runtime/base/datetime.h"
 #include "hphp/runtime/base/string-util.h"
+#include "hphp/runtime/debugger/debugger_client.h"
 #include "hphp/runtime/vm/debugger-hook.h"
-#include "hphp/runtime/base/array-init.h"
 
 namespace HPHP { namespace Eval {
 ///////////////////////////////////////////////////////////////////////////////
 
 TRACE_SET_MOD(debugger);
 
-const char *CmdPrint::Formats[] = {
+const char* formats[] = {
   "r", "v", "x", "hex", "oct", "dec", "unsigned", "time", nullptr
 };
 
-std::string CmdPrint::FormatResult(const char *format, const Variant& ret) {
+std::string CmdPrint::FormatResult(const char* format, const Variant& ret) {
   if (format == nullptr) {
-    String sret = DebuggerClient::FormatVariable(ret, -1);
+    String sret = DebuggerClient::FormatVariable(ret);
     return std::string(sret.data(), sret.size());
   }
 
   if (strcmp(format, "r") == 0) {
-    String sret = DebuggerClient::FormatVariable(ret, -1, 'r');
+    String sret = DebuggerClient::FormatVariable(ret, 'r');
     return std::string(sret.data(), sret.size());
   }
 
   if (strcmp(format, "v") == 0) {
-    String sret = DebuggerClient::FormatVariable(ret, -1, 'v');
+    String sret = DebuggerClient::FormatVariable(ret, 'v');
     return std::string(sret.data(), sret.size());
   }
 
@@ -93,7 +94,7 @@ std::string CmdPrint::FormatResult(const char *format, const Variant& ret) {
     assert(false);
   }
 
-  String sret = DebuggerClient::FormatVariable(ret, -1);
+  String sret = DebuggerClient::FormatVariable(ret);
   if (strcmp(format, "hex") == 0 || strcmp(format, "x") == 0 ||
       strcmp(format, "oct") == 0) {
     StringBuffer sb;
@@ -116,7 +117,7 @@ std::string CmdPrint::FormatResult(const char *format, const Variant& ret) {
   if (strcmp(format, "time") == 0) {
     DateTime dt;
     int64_t ts = -1;
-    if (dt.fromString(ret.toString(), SmartResource<TimeZone>())) {
+    if (dt.fromString(ret.toString(), req::ptr<TimeZone>())) {
       bool err;
       ts = dt.toTimeStamp(err);
     }
@@ -178,12 +179,12 @@ void CmdPrint::list(DebuggerClient &client) {
   client.addCompletion(DebuggerClient::AutoCompleteCode);
 
   if (client.argCount() == 0) {
-    client.addCompletion(Formats);
+    client.addCompletion(formats);
     client.addCompletion("always");
     client.addCompletion("list");
     client.addCompletion("clear");
   } else if (client.argCount() == 1 && client.arg(1, "always")) {
-    client.addCompletion(Formats);
+    client.addCompletion(formats);
   }
 }
 
@@ -284,13 +285,6 @@ Variant CmdPrint::processWatch(DebuggerClient &client, const char *format,
   return res->m_ret;
 }
 
-void CmdPrint::handleReply(DebuggerClient &client) {
-  if (!m_output.empty()) {
-    client.output(m_output);
-  }
-  client.output(m_ret.toString());
-}
-
 void CmdPrint::onClient(DebuggerClient &client) {
   if (DebuggerCommand::displayedHelp(client)) return;
   if (client.argCount() == 0) {
@@ -317,7 +311,7 @@ void CmdPrint::onClient(DebuggerClient &client) {
   }
 
   const char *format = nullptr;
-  for (const char **fmt = Formats; *fmt; fmt++) {
+  for (const char **fmt = formats; *fmt; fmt++) {
     if (client.arg(index, *fmt)) {
       format = *fmt;
       index++;
@@ -345,8 +339,9 @@ void CmdPrint::onClient(DebuggerClient &client) {
 // NB: unlike most other commands, the client expects that more interrupts
 // can occur while we're doing the server-side work for a print.
 bool CmdPrint::onServer(DebuggerProxy &proxy) {
-  PCFilter* locSave = g_context->m_flowFilter;
-  g_context->m_flowFilter = new PCFilter();
+  PCFilter locSave;
+  auto& rid = ThreadInfo::s_threadInfo->m_reqInjectionData;
+  locSave.swap(rid.m_flowFilter);
   g_context->debuggerSettings.bypassCheck = m_bypassAccessCheck;
   {
     EvalBreakControl eval(m_noBreak);
@@ -359,8 +354,7 @@ bool CmdPrint::onServer(DebuggerProxy &proxy) {
                         DebuggerProxy::ExecutePHPFlagsNone));
   }
   g_context->debuggerSettings.bypassCheck = false;
-  delete g_context->m_flowFilter;
-  g_context->m_flowFilter = locSave;
+  locSave.swap(rid.m_flowFilter);
   return proxy.sendToClient(this);
 }
 

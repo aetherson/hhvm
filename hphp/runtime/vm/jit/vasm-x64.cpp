@@ -14,323 +14,278 @@
    +----------------------------------------------------------------------+
 */
 
-#include "hphp/runtime/vm/jit/vasm-x64.h"
-#include "hphp/runtime/vm/jit/code-gen-helpers-x64.h"
-#include "hphp/runtime/vm/jit/mc-generator.h"
-#include "hphp/runtime/vm/jit/service-requests-inline.h"
+#include "hphp/runtime/vm/jit/vasm-emit.h"
+
+#include "hphp/runtime/base/arch.h"
+#include "hphp/runtime/vm/jit/abi-x64.h"
 #include "hphp/runtime/vm/jit/back-end-x64.h"
+#include "hphp/runtime/vm/jit/block.h"
+#include "hphp/runtime/vm/jit/code-gen-helpers.h"
+#include "hphp/runtime/vm/jit/func-guard-x64.h"
+#include "hphp/runtime/vm/jit/mc-generator.h"
 #include "hphp/runtime/vm/jit/print.h"
 #include "hphp/runtime/vm/jit/prof-data.h"
+#include "hphp/runtime/vm/jit/service-requests.h"
+#include "hphp/runtime/vm/jit/smashable-instr-x64.h"
+#include "hphp/runtime/vm/jit/target-cache.h"
 #include "hphp/runtime/vm/jit/timer.h"
+#include "hphp/runtime/vm/jit/vasm.h"
+#include "hphp/runtime/vm/jit/vasm-instr.h"
+#include "hphp/runtime/vm/jit/vasm-internal.h"
+#include "hphp/runtime/vm/jit/vasm-print.h"
+#include "hphp/runtime/vm/jit/vasm-unit.h"
+#include "hphp/runtime/vm/jit/vasm-util.h"
+#include "hphp/runtime/vm/jit/vasm-visit.h"
 
-TRACE_SET_MOD(hhir);
+#include <algorithm>
+#include <tuple>
 
-namespace HPHP { namespace jit { namespace X64 {
+TRACE_SET_MOD(vasm);
+
+namespace HPHP { namespace jit {
+///////////////////////////////////////////////////////////////////////////////
+
 using namespace reg;
+using namespace x64;
 
-const char* vinst_names[] = {
-#define O(name, imms, uses, defs) #name,
-  X64_OPCODES
-#undef O
-};
-
-bool isBlockEnd(Vinstr& inst) {
-  switch (inst.op) {
-    case Vinstr::bindaddr:
-    case Vinstr::bindjcc1:
-    case Vinstr::bindjmp:
-    case Vinstr::end:
-    case Vinstr::fallback:
-    case Vinstr::jcc:
-    case Vinstr::jmp:
-    case Vinstr::jmpr:
-    case Vinstr::jmpm:
-    case Vinstr::phijmp:
-    case Vinstr::resume:
-    case Vinstr::ud2:
-    case Vinstr::unwind:
-    case Vinstr::retransopt:
-    case Vinstr::ret:
-      return true;
-    default:
-      return false;
-  }
-}
-
-Vlabel Vunit::makeBlock(AreaIndex area) {
-  auto i = blocks.size();
-  blocks.emplace_back(area);
-  return Vlabel{i};
-}
-
-Vreg Vunit::makeConst(uint64_t v) {
-  auto it = cpool.find(v);
-  if (it != cpool.end()) return it->second;
-  auto r = makeReg();
-  cpool[v] = r;
-  return r;
-}
-
-Vreg Vunit::makeConst(double d) {
-  union { double d; uint64_t i; } u;
-  u.d = d;
-  return makeConst(u.i);
-}
-
-Vtuple Vunit::makeTuple(const VregList& regs) {
-  auto i = tuples.size();
-  tuples.emplace_back(regs);
-  return Vtuple{i};
-}
-
-Vout& Vout::operator<<(Vinstr inst) {
-  assert(!closed());
-  inst.sk = m_sk;
-  m_unit.blocks[m_block].code.push_back(inst);
-  return *this;
-}
-
-Vout Vout::makeBlock() {
-  return {m_meta, m_unit, m_unit.makeBlock(m_area), m_area, m_sk};
-}
-
-Vout Vout::makeEntry() {
-  auto label = m_unit.makeBlock(m_area);
-  m_unit.roots.push_back(label); // save entry label
-  return {m_meta, m_unit, label, m_area, m_sk};
-}
-
-// implicit cast to label for initializing branch instructions
-Vout::operator Vlabel() const {
-  assert(empty());
-  return m_block;
-}
-
-bool Vout::empty() const {
-  return m_unit.blocks[m_block].code.empty();
-}
-
-bool Vout::closed() const {
-  return !empty() && isBlockEnd(m_unit.blocks[m_block].code.back());
-}
+namespace x64 { struct ImmFolder; }
 
 namespace {
-struct Vgen {
-  Vgen(Vunit& u, jit::vector<Vasm::Area>& areas, Vmeta* meta)
-    : unit(u)
-    , backend(mcg->backEnd())
-    , areas(areas)
-    , meta(meta)
-    , addrs(u.blocks.size(), nullptr)
-  {}
-  void emit(jit::vector<Vlabel>&);
+///////////////////////////////////////////////////////////////////////////////
 
-private:
+struct Vgen {
+  explicit Vgen(Venv& env)
+    : text(env.text)
+    , assem(*env.cb)
+    , a(&assem)
+    , current(env.current)
+    , next(env.next)
+    , jmps(env.jmps)
+    , jccs(env.jccs)
+    , catches(env.catches)
+  {}
+
+  static void patch(Venv& env);
+  static void pad(CodeBlock& cb);
+
+  /////////////////////////////////////////////////////////////////////////////
+
+  template<class Inst> void emit(const Inst& i) {
+    always_assert_flog(false, "unimplemented instruction: {} in B{}\n",
+                       vinst_names[Vinstr(i).op], size_t(current));
+  }
+
   // intrinsics
-  void emit(bindaddr& i);
-  void emit(bindcall& i);
-  void emit(bindexit& i);
-  void emit(bindjcc1& i);
-  void emit(bindjcc2& i);
-  void emit(bindjmp& i);
-  void emit(callstub& i);
-  void emit(contenter& i);
-  void emit(copy i);
-  void emit(copy2& i);
-  void emit(copyargs& i) { always_assert(false); }
-  void emit(end& i) {}
-  void emit(ldimm& i);
-  void emit(fallback& i);
-  void emit(fallbackcc i);
-  void emit(incstat& i) { emitIncStat(a->code(), i.stat, i.n, i.force); }
-  void emit(kpcall& i);
-  void emit(ldpoint& i);
-  void emit(load& i);
-  void emit(mccall& i);
-  void emit(mcprep& i);
-  void emit(nocatch& i);
-  void emit(nop& i) { a->nop(); }
-  void emit(phidef& i) { always_assert(false); }
-  void emit(phijmp& i) { always_assert(false); }
-  void emit(point& i) { meta->points[i.p] = a->frontier(); }
-  void emit(resume& i) { emitServiceReq(a->code(), REQ_RESUME); }
-  void emit(retransopt& i);
-  void emit(store& i);
-  void emit(syncpoint i);
-  void emit(unwind& i);
+  void emit(const bindcall& i);
+  void emit(const copy& i);
+  void emit(const copy2& i);
+  void emit(const debugtrap& i) { a->int3(); }
+  void emit(const fallthru& i) {}
+  void emit(const ldimmb& i);
+  void emit(const ldimml& i);
+  void emit(const ldimmq& i);
+  void emit(const ldimmqs& i);
+  void emit(const load& i);
+  void emit(const store& i);
+
+  // calls/rets
+  void emit(const callarray& i);
+  void emit(const callfaststub& i);
+  void emit(const contenter& i);
+  void emit(const leavetc&) { a->ret(); }
+  void emit(const mcprep& i);
+  void emit(const mccall& i);
+  void emit(const vret& i);
+
+  // boundaries
+  void emit(const landingpad& i) {}
+  void emit(const nothrow& i);
+  void emit(const syncpoint& i);
+  void emit(const unwind& i);
 
   // instructions
-  void emit(andb& i) { commute(i); a->andb(i.s0, i.d); }
-  void emit(andbi& i) { binary(i); a->andb(i.s0, i.d); }
-  void emit(andbim& i) { a->andb(i.s, i.m); }
-  void emit(andl& i) { commute(i); a->andl(i.s0, i.d); }
-  void emit(andli& i) { binary(i); a->andl(i.s0, i.d); }
-  void emit(andq& i) { commute(i); a->andq(i.s0, i.d); }
-  void emit(andqi& i) { binary(i); a->andq(i.s0, i.d); }
-  void emit(addlm& i) { a->addl(i.s0, i.m); }
-  void emit(addq& i) { commute(i); a->addq(i.s0, i.d); }
-  void emit(addqi& i) { binary(i); a->addq(i.s0, i.d); }
-  void emit(addsd& i) { commute(i); a->addsd(i.s0, i.d); }
-  void emit(call i);
-  void emit(callm& i) { a->call(i.target); }
-  void emit(callr& i) { a->call(i.target); }
-  void emit(cloadq& i);
-  void emit(cmovq i);
-  void emit(cmpb& i) { a->cmpb(i.s0, i.s1); }
-  void emit(cmpbi& i) { a->cmpb(i.s0, i.s1); }
-  void emit(cmpbim& i) { a->cmpb(i.s0, i.s1); }
-  void emit(cmpl& i) { a->cmpl(i.s0, i.s1); }
-  void emit(cmpli& i) { a->cmpl(i.s0, i.s1); }
-  void emit(cmplim& i) { a->cmpl(i.s0, i.s1); }
-  void emit(cmplm& i) { a->cmpl(i.s0, i.s1); }
-  void emit(cmpq& i) { a->cmpq(i.s0, i.s1); }
-  void emit(cmpqi& i) { a->cmpq(i.s0, i.s1); }
-  void emit(cmpqim& i) { a->cmpq(i.s0, i.s1); }
-  void emit(cmpqm& i) { a->cmpq(i.s0, i.s1); }
-  void emit(cmpsd& i) { noncommute(i); a->cmpsd(i.s0, i.d, i.pred); }
-  void emit(cqo& i) { a->cqo(); }
-  void emit(cvttsd2siq& i) { a->cvttsd2siq(i.s, i.d); }
-  void emit(cvtsi2sd& i);
-  void emit(cvtsi2sdm& i);
-  void emit(decl& i) { unary(i); a->decl(i.d); }
-  void emit(declm& i) { a->decl(i.m); }
-  void emit(decq& i) { unary(i); a->decq(i.d); }
-  void emit(decqm& i) { a->decq(i.m); }
-  void emit(divsd& i) { noncommute(i); a->divsd(i.s0, i.d); }
-  void emit(imul& i) { commute(i); a->imul(i.s0, i.d); }
-  void emit(incwm& i) { a->incw(i.m); }
-  void emit(idiv& i) { a->idiv(i.s); }
-  void emit(incl& i) { unary(i); a->incl(i.d); }
-  void emit(inclm& i) { a->incl(i.m); }
-  void emit(incq& i) { unary(i); a->incq(i.d); }
-  void emit(incqm& i) { a->incq(i.m); }
-  void emit(incqmlock& i) { a->lock(); a->incq(i.m); }
-  void emit(jcc& i);
-  void emit(jmp i);
-  void emit(jmpr& i) { a->jmp(i.target); }
-  void emit(jmpm& i) { a->jmp(i.target); }
-  void emit(lea& i);
-  void emit(leap& i) { a->lea(i.s, i.d); }
-  void emit(loaddqu& i) { a->movdqu(i.s, i.d); }
-  void emit(loadl& i) { a->loadl(i.s, i.d); }
-  void emit(loadq& i);
-  void emit(loadqp& i) { a->loadq(i.s, i.d); }
-  void emit(loadsd& i) { a->movsd(i.s, i.d); }
-  void emit(loadzbl& i) { a->loadzbl(i.s, i.d); }
-  void emit(movb& i) { a->movb(i.s, i.d); }
-  void emit(movbi& i) { a->movb(i.s, i.d); }
-  void emit(movdqa& i) { a->movdqa(i.s, i.d); }
-  void emit(movl& i) { a->movl(i.s, i.d); }
-  void emit(movq& i) { a->movq(i.s, i.d); }
-  void emit(movqrx& i) { a->movq_rx(i.s, i.d); }
-  void emit(movqxr& i) { a->movq_xr(i.s, i.d); }
-  void emit(movzbl& i) { a->movzbl(i.s, i.d); }
-  void emit(movsbl& i) { a->movsbl(i.s, i.d); }
-  void emit(mulsd& i) { commute(i); a->mulsd(i.s0, i.d); }
-  void emit(neg& i) { unary(i); a->neg(i.d); }
-  void emit(not& i) { unary(i); a->not(i.d); }
-  void emit(orq& i) { commute(i); a->orq(i.s0, i.d); }
-  void emit(orqi& i) { binary(i); a->orq(i.s0, i.d); }
-  void emit(orqim& i) { a->orq(i.s0, i.m); }
-  void emit(pop& i) { a->pop(i.d); }
-  void emit(popm& i) { a->pop(i.m); }
-  void emit(psllq& i) { binary(i); a->psllq(i.s0, i.d); }
-  void emit(psrlq& i) { binary(i); a->psrlq(i.s0, i.d); }
-  void emit(push& i) { a->push(i.s); }
-  void emit(pushl& i) { a->pushl(i.s); }
-  void emit(pushm& i) { a->push(i.s); }
-  void emit(roundsd& i) { unary(i); a->roundsd(i.dir, i.s, i.d); }
-  void emit(ret& i) { a->ret(); }
-  void emit(rorqi& i) { binary(i); a->rorq(i.s0, i.d); }
-  void emit(sarq& i) { unary(i); a->sarq(i.d); }
-  void emit(sarqi& i) { binary(i); a->sarq(i.s0, i.d); }
-  void emit(sbbl& i) { noncommute(i); a->sbbl(i.s0, i.d); }
-  void emit(setcc& i) { a->setcc(i.cc, i.d); }
-  void emit(shlli& i) { binary(i); a->shll(i.s0, i.d); }
-  void emit(shlq& i) { unary(i); a->shlq(i.d); }
-  void emit(shlqi& i) { binary(i); a->shlq(i.s0, i.d); }
-  void emit(shrli& i) { binary(i); a->shrl(i.s0, i.d); }
-  void emit(shrqi& i) { binary(i); a->shrq(i.s0, i.d); }
-  void emit(sqrtsd& i) { a->sqrtsd(i.s, i.d); }
-  void emit(storedqu& i) { a->movdqu(i.s, i.m); }
-  void emit(storeb& i) { a->storeb(i.s, i.m); }
-  void emit(storebim& i) { a->storeb(i.s, i.m); }
-  void emit(storel& i) { a->storel(i.s, i.m); }
-  void emit(storelim& i) { a->storel(i.s, i.m); }
-  void emit(storeq& i) { a->storeq(i.s, i.m); }
-  void emit(storeqim& i) { a->storeq(i.s, i.m); }
-  void emit(storesd& i) { a->movsd(i.s, i.m); }
-  void emit(storew& i) { a->storew(i.s, i.m); }
-  void emit(storewim& i) { a->storew(i.s, i.m); }
-  void emit(subl& i) { noncommute(i); a->subl(i.s0, i.d); }
-  void emit(subli& i) { binary(i); a->subl(i.s0, i.d); }
-  void emit(subq& i) { noncommute(i); a->subq(i.s0, i.d); }
-  void emit(subqi& i) { binary(i); a->subq(i.s0, i.d); }
-  void emit(subsd& i) { noncommute(i); a->subsd(i.s0, i.d); }
-  void emit(testb& i) { a->testb(i.s0, i.s1); }
-  void emit(testbi& i) { a->testb(i.s0, i.s1); }
-  void emit(testbim& i) { a->testb(i.s0, i.s1); }
-  void emit(testl& i) { a->testl(i.s0, i.s1); }
-  void emit(testli& i) { a->testl(i.s0, i.s1); }
-  void emit(testlim& i) { a->testl(i.s0, i.s1); }
-  void emit(testq& i) { a->testq(i.s0, i.s1); }
-  void emit(testqm& i) { a->testq(i.s0, i.s1); }
-  void emit(testqim& i) { a->testq(i.s0, i.s1); }
-  void emit(ucomisd& i) { a->ucomisd(i.s0, i.s1); }
-  void emit(ud2& i) { a->ud2(); }
-  void emit(unpcklpd& i) { noncommute(i); a->unpcklpd(i.s0, i.d); }
-  void emit(xorb& i) { commute(i); a->xorb(i.s0, i.d); }
-  void emit(xorbi& i) { binary(i); a->xorb(i.s0, i.d); }
-  void emit(xorq& i) { commute(i); a->xorq(i.s0, i.d); }
-  void emit(xorqi& i) { binary(i); a->xorq(i.s0, i.d); }
+  void emit(andb i) { commuteSF(i); a->andb(i.s0, i.d); }
+  void emit(andbi i) { binary(i); a->andb(i.s0, i.d); }
+  void emit(const andbim& i) { a->andb(i.s, i.m); }
+  void emit(andl i) { commuteSF(i); a->andl(i.s0, i.d); }
+  void emit(andli i) { binary(i); a->andl(i.s0, i.d); }
+  void emit(andq i) { commuteSF(i); a->andq(i.s0, i.d); }
+  void emit(andqi i) { binary(i); a->andq(i.s0, i.d); }
+  void emit(addli i) { binary(i); a->addl(i.s0, i.d); }
+  void emit(const addlm& i) { a->addl(i.s0, i.m); }
+  void emit(addq i) { commuteSF(i); a->addq(i.s0, i.d); }
+  void emit(addqi i) { binary(i); a->addq(i.s0, i.d); }
+  void emit(const addqim& i);
+  void emit(addsd i) { commute(i); a->addsd(i.s0, i.d); }
+  void emit(const call& i);
+  void emit(const callm& i) { a->call(i.target); }
+  void emit(const callr& i) { a->call(i.target); }
+  void emit(const cloadq& i);
+  void emit(const cmovq& i);
+  void emit(const cmpb& i) { a->cmpb(i.s0, i.s1); }
+  void emit(const cmpbi& i) { a->cmpb(i.s0, i.s1); }
+  void emit(const cmpbim& i) { a->cmpb(i.s0, i.s1); }
+  void emit(const cmpwim& i) { a->cmpw(i.s0, i.s1); }
+  void emit(const cmpl& i) { a->cmpl(i.s0, i.s1); }
+  void emit(const cmpli& i) { a->cmpl(i.s0, i.s1); }
+  void emit(const cmplim& i) { a->cmpl(i.s0, i.s1); }
+  void emit(const cmplm& i) { a->cmpl(i.s0, i.s1); }
+  void emit(const cmpq& i) { a->cmpq(i.s0, i.s1); }
+  void emit(const cmpqi& i) { a->cmpq(i.s0, i.s1); }
+  void emit(const cmpqim& i) { a->cmpq(i.s0, i.s1); }
+  void emit(const cmpqm& i) { a->cmpq(i.s0, i.s1); }
+  void emit(cmpsd i) { noncommute(i); a->cmpsd(i.s0, i.d, i.pred); }
+  void emit(const cqo& i) { a->cqo(); }
+  void emit(const cvttsd2siq& i) { a->cvttsd2siq(i.s, i.d); }
+  void emit(const cvtsi2sd& i);
+  void emit(const cvtsi2sdm& i);
+  void emit(decl i) { unary(i); a->decl(i.d); }
+  void emit(const declm& i) { a->decl(i.m); }
+  void emit(decq i) { unary(i); a->decq(i.d); }
+  void emit(const decqm& i) { a->decq(i.m); }
+  void emit(divsd i) { noncommute(i); a->divsd(i.s0, i.d); }
+  void emit(imul i) { commuteSF(i); a->imul(i.s0, i.d); }
+  void emit(const idiv& i) { a->idiv(i.s); }
+  void emit(incl i) { unary(i); a->incl(i.d); }
+  void emit(const inclm& i) { a->incl(i.m); }
+  void emit(incq i) { unary(i); a->incq(i.d); }
+  void emit(const incqm& i) { a->incq(i.m); }
+  void emit(const incqmlock& i) { a->lock(); a->incq(i.m); }
+  void emit(const incwm& i) { a->incw(i.m); }
+  void emit(const jcc& i);
+  void emit(const jcci& i);
+  void emit(const jmp& i);
+  void emit(const jmpr& i) { a->jmp(i.target); }
+  void emit(const jmpm& i) { a->jmp(i.target); }
+  void emit(const jmpi& i) { a->jmp(i.target); }
+  void emit(const lea& i);
+  void emit(const leap& i) { a->lea(i.s, i.d); }
+  void emit(const loadups& i) { a->movups(i.s, i.d); }
+  void emit(const loadtqb& i) { a->loadb(i.s, i.d); }
+  void emit(const loadb& i) { a->loadb(i.s, i.d); }
+  void emit(const loadl& i) { a->loadl(i.s, i.d); }
+  void emit(const loadqp& i) { a->loadq(i.s, i.d); }
+  void emit(const loadsd& i) { a->movsd(i.s, i.d); }
+  void emit(const loadzbl& i) { a->loadzbl(i.s, i.d); }
+  void emit(const loadzbq& i) { a->loadzbl(i.s, Reg32(i.d)); }
+  void emit(const loadzlq& i) { a->loadl(i.s, Reg32(i.d)); }
+  void emit(const movb& i) { a->movb(i.s, i.d); }
+  void emit(const movl& i) { a->movl(i.s, i.d); }
+  void emit(const movzbl& i) { a->movzbl(i.s, i.d); }
+  void emit(const movzbq& i) { a->movzbl(i.s, Reg32(i.d)); }
+  void emit(mulsd i) { commute(i); a->mulsd(i.s0, i.d); }
+  void emit(neg i) { unary(i); a->neg(i.d); }
+  void emit(const nop& i) { a->nop(); }
+  void emit(not i) { unary(i); a->not(i.d); }
+  void emit(notb i) { unary(i); a->notb(i.d); }
+  void emit(const orwim& i) { a->orw(i.s0, i.m); }
+  void emit(orq i) { commuteSF(i); a->orq(i.s0, i.d); }
+  void emit(orqi i) { binary(i); a->orq(i.s0, i.d); }
+  void emit(const orqim& i) { a->orq(i.s0, i.m); }
+  void emit(const pop& i) { a->pop(i.d); }
+  void emit(const popm& i) { a->pop(i.d); }
+  void emit(psllq i) { binary(i); a->psllq(i.s0, i.d); }
+  void emit(psrlq i) { binary(i); a->psrlq(i.s0, i.d); }
+  void emit(const push& i) { a->push(i.s); }
+  void emit(const pushm& i) { a->push(i.s); }
+  void emit(const roundsd& i) { a->roundsd(i.dir, i.s, i.d); }
+  void emit(const ret& i) { a->ret(); }
+  void emit(const sarq& i) { unary(i); a->sarq(i.d); }
+  void emit(sarqi i) { binary(i); a->sarq(i.s0, i.d); }
+  void emit(const setcc& i) { a->setcc(i.cc, i.d); }
+  void emit(shlli i) { binary(i); a->shll(i.s0, i.d); }
+  void emit(shlq i) { unary(i); a->shlq(i.d); }
+  void emit(shlqi i) { binary(i); a->shlq(i.s0, i.d); }
+  void emit(shrli i) { binary(i); a->shrl(i.s0, i.d); }
+  void emit(shrqi i) { binary(i); a->shrq(i.s0, i.d); }
+  void emit(const sqrtsd& i) { a->sqrtsd(i.s, i.d); }
+  void emit(const storeups& i) { a->movups(i.s, i.m); }
+  void emit(const storeb& i) { a->storeb(i.s, i.m); }
+  void emit(const storebi& i);
+  void emit(const storel& i) { a->storel(i.s, i.m); }
+  void emit(const storeli& i) { a->storel(i.s, i.m); }
+  void emit(const storeqi& i) { a->storeq(i.s, i.m); }
+  void emit(const storesd& i) { a->movsd(i.s, i.m); }
+  void emit(const storew& i) { a->storew(i.s, i.m); }
+  void emit(const storewi& i) { a->storew(i.s, i.m); }
+  void emit(subbi i) { binary(i); a->subb(i.s0, i.d); }
+  void emit(subl i) { noncommute(i); a->subl(i.s0, i.d); }
+  void emit(subli i) { binary(i); a->subl(i.s0, i.d); }
+  void emit(subq i) { noncommute(i); a->subq(i.s0, i.d); }
+  void emit(subqi i) { binary(i); a->subq(i.s0, i.d); }
+  void emit(subsd i) { noncommute(i); a->subsd(i.s0, i.d); }
+  void emit(const testb& i) { a->testb(i.s0, i.s1); }
+  void emit(const testbi& i) { a->testb(i.s0, i.s1); }
+  void emit(const testbim& i) { a->testb(i.s0, i.s1); }
+  void emit(const testwim& i);
+  void emit(const testl& i) { a->testl(i.s0, i.s1); }
+  void emit(const testli& i) { a->testl(i.s0, i.s1); }
+  void emit(const testlim& i);
+  void emit(const testq& i) { a->testq(i.s0, i.s1); }
+  void emit(const testqi& i);
+  void emit(const testqm& i) { a->testq(i.s0, i.s1); }
+  void emit(const testqim& i);
+  void emit(const ucomisd& i) { a->ucomisd(i.s0, i.s1); }
+  void emit(const ud2& i) { a->ud2(); }
+  void emit(unpcklpd i) { noncommute(i); a->unpcklpd(i.s0, i.d); }
+  void emit(xorb i) { commuteSF(i); a->xorb(i.s0, i.d); }
+  void emit(xorbi i) { binary(i); a->xorb(i.s0, i.d); }
+  void emit(xorl i) { commuteSF(i); a->xorl(i.s0, i.d); }
+  void emit(xorq i) { commuteSF(i); a->xorq(i.s0, i.d); }
+  void emit(xorqi i) { binary(i); a->xorq(i.s0, i.d); }
 
+private:
   // helpers
   void prep(Reg8 s, Reg8 d) { if (s != d) a->movb(s, d); }
   void prep(Reg32 s, Reg32 d) { if (s != d) a->movl(s, d); }
   void prep(Reg64 s, Reg64 d) { if (s != d) a->movq(s, d); }
   void prep(RegXMM s, RegXMM d) { if (s != d) a->movdqa(s, d); }
-  CodeAddress start(Vlabel b) {
-    auto area = unit.blocks[b].area;
-    return areas[(int)area].start;
-  }
-  bool check(Vblock& block);
-  CodeBlock& main() { return area(AreaIndex::Main).code; }
-  CodeBlock& cold() { return area(AreaIndex::Cold).code; }
-  CodeBlock& frozen() { return area(AreaIndex::Frozen).code; }
+
   template<class Inst> void unary(Inst& i) { prep(i.s, i.d); }
   template<class Inst> void binary(Inst& i) { prep(i.s1, i.d); }
+  template<class Inst> void commuteSF(Inst&);
   template<class Inst> void commute(Inst&);
   template<class Inst> void noncommute(Inst&);
 
-private:
-  Vasm::Area& area(AreaIndex i) {
-    assert((unsigned)i < areas.size());
-    return areas[(unsigned)i];
-  }
+  CodeBlock& frozen() { return text.frozen().code; }
 
 private:
-  struct LabelPatch { CodeAddress instr; Vlabel target; };
-  struct PointPatch { CodeAddress instr; Vpoint pos; };
-  Vunit& unit;
-  BackEnd& backend;
-  jit::vector<Vasm::Area>& areas;
-  Vmeta* meta;
+  Vtext& text;
+  X64Assembler assem;
   X64Assembler* a;
-  Vlabel next{0}; // in linear order
-  jit::vector<CodeAddress> addrs;
-  jit::vector<LabelPatch> jccs, jmps, calls, catches;
-  jit::vector<PointPatch> ldpoints;
-  jit::hash_map<uint64_t,uint64_t*> cpool;
+
+  const Vlabel current;
+  const Vlabel next;
+  jit::vector<Venv::LabelPatch>& jmps;
+  jit::vector<Venv::LabelPatch>& jccs;
+  jit::vector<Venv::LabelPatch>& catches;
 };
 
-// prepare a binary op that is not commutative.  s0 must be a different
-// register than s1 so we don't clobber it.
+///////////////////////////////////////////////////////////////////////////////
+
+/*
+ * Prepare a binary op that is not commutative.
+ *
+ * s0 must be a different register than s1 so we don't clobber it.
+ */
 template<class Inst> void Vgen::noncommute(Inst& i) {
-  assert(i.s1 == i.d || i.s0 != i.d); // do not clobber s0
+  assertx(i.s1 == i.d || i.s0 != i.d); // do not clobber s0
   binary(i);
 }
 
-// prepare a binary op that is commutative. Swap operands if the dest is s0.
+/*
+ * Prepare a binary op that is commutative.
+ *
+ * Swap operands if the dest is s0.
+ */
+template<class Inst> void Vgen::commuteSF(Inst& i) {
+  if (i.s1 != i.d && i.s0 == i.d) {
+    i = Inst{i.s1, i.s0, i.d, i.sf};
+  } else {
+    binary(i);
+  }
+}
+
 template<class Inst> void Vgen::commute(Inst& i) {
   if (i.s1 != i.d && i.s0 == i.d) {
     i = Inst{i.s1, i.s0, i.d};
@@ -339,57 +294,53 @@ template<class Inst> void Vgen::commute(Inst& i) {
   }
 }
 
-void Vgen::emit(call i) {
-  if (a->jmpDeltaFits(i.target) && !Stats::enabled()) {
-    a->call(i.target);
-  } else {
-    // can't do a near call; store address in data section.
-    // call by loading the address using rip-relative addressing.  This
-    // assumes the data section is near the current code section.  Since
-    // this sequence is directly in-line, rip-relative like this is
-    // more compact than loading a 64-bit immediate.
-    auto addr = mcg->allocLiteral((uint64_t)i.target);
-    a->call(rip[(intptr_t)addr]);
-    assert(((int32_t*)a->frontier())[-1] + a->frontier() == (TCA)addr);
+/*
+ * Helper for emitting instructions whose Vptr operand specifies a segment.
+ */
+X64Assembler& prefix(X64Assembler& a, const Vptr& ptr) {
+  if (ptr.seg == Vptr::Segment::FS) {
+    a.fs();
+  } else if (ptr.seg == Vptr::Segment::GS) {
+    a.gs();
   }
+  return a;
 }
 
-void Vgen::emit(cloadq& i) {
-  a->cload_reg64_disp_reg64(i.cc, i.s.base, i.s.disp, i.d);
-}
+///////////////////////////////////////////////////////////////////////////////
 
-// add s0 s1 d => mov s1->d; d += s0
-// cmov cc s d => if cc { mov s->d }
-void Vgen::emit(cmovq i) {
-  if (i.f != i.d && i.t == i.d) {
-    // negate the condition and swap t/f operands so we dont clobber i.t
-    i = {ccNegate(i.cc), i.t, i.f, i.d};
-  } else {
-    prep(i.f, i.d);
+void Vgen::patch(Venv& env) {
+  for (auto& p : env.jmps) {
+    assertx(env.addrs[p.target]);
+    X64Assembler::patchJmp(p.instr, env.addrs[p.target]);
   }
-  a->cmov_reg64_reg64(i.cc, i.t, i.d);
+  for (auto& p : env.jccs) {
+    assertx(env.addrs[p.target]);
+    X64Assembler::patchJcc(p.instr, env.addrs[p.target]);
+  }
+  assertx(env.bccs.empty());
 }
 
-void Vgen::emit(contenter& i) {
-  Label Stub, End;
-  Reg64 fp = i.fp, target = i.target;
-  a->jmp8(End);
-
-  asm_label(*a, Stub);
-  a->pop(fp[AROFF(m_savedRip)]);
-  a->jmp(target);
-
-  asm_label(*a, End);
-  a->call(Stub);
-  // m_savedRip will point here.
+void Vgen::pad(CodeBlock& cb) {
+  X64Assembler a { cb };
+  while (a.available() >= 2) a.ud2();
+  if (a.available() > 0) a.int3();
+  assertx(a.available() == 0);
 }
 
-void Vgen::emit(copy i) {
+///////////////////////////////////////////////////////////////////////////////
+
+void Vgen::emit(const bindcall& i) {
+  emitSmashableCall(a->code(), i.stub);
+  emit(unwind{{i.targets[0], i.targets[1]}});
+}
+
+void Vgen::emit(const copy& i) {
   if (i.s == i.d) return;
   if (i.s.isGP()) {
     if (i.d.isGP()) {                 // GP => GP
       a->movq(i.s, i.d);
     } else {                             // GP => XMM
+      assertx(i.d.isSIMD());
       // This generates a movq x86 instruction, which zero extends
       // the 64-bit value in srcReg into a 128-bit XMM register
       a->movq_rx(i.s, i.d);
@@ -398,6 +349,7 @@ void Vgen::emit(copy i) {
     if (i.d.isGP()) {                 // XMM => GP
       a->movq_xr(i.s, i.d);
     } else {                             // XMM => XMM
+      assertx(i.d.isSIMD());
       // This copies all 128 bits in XMM,
       // thus avoiding partial register stalls
       a->movdqa(i.s, i.d);
@@ -405,10 +357,10 @@ void Vgen::emit(copy i) {
   }
 }
 
-void Vgen::emit(copy2& i) {
-  assert(i.s0.isValid() && i.s1.isValid() && i.d0.isValid() && i.d1.isValid());
+void Vgen::emit(const copy2& i) {
+  assertx(i.s0.isValid() && i.s1.isValid() && i.d0.isValid() && i.d1.isValid());
   auto s0 = i.s0, s1 = i.s1, d0 = i.d0, d1 = i.d1;
-  assert(d0 != d1);
+  assertx(d0 != d1);
   if (d0 == s1) {
     if (d1 == s0) {
       a->xchgq(d0, d1);
@@ -424,281 +376,207 @@ void Vgen::emit(copy2& i) {
   }
 }
 
-void Vgen::emit(bindaddr& i) {
-  mcg->setJmpTransID((TCA)i.dest);
-  *i.dest = emitEphemeralServiceReq(a->code(),
-                           mcg->getFreeStub(a->code(), &mcg->cgFixups()),
-                           REQ_BIND_ADDR,
-                           i.dest,
-                           i.sk.toAtomicInt(),
-                           TransFlags{}.packed);
-  mcg->cgFixups().m_codePointers.insert(i.dest);
-}
-
-void Vgen::emit(bindcall& i) {
-  emitBindCall(a->code(), cold(), frozen(), i.sk, i.callee, i.argc);
-}
-
-void Vgen::emit(bindexit& i) {
-  emitBindSideExit(a->code(), frozen(), i.cc, i.target, i.trflags);
-}
-
-void Vgen::emit(bindjcc1& i) {
-  backend.prepareForTestAndSmash(a->code(), 0,
-                                 TestAndSmashFlags::kAlignJccAndJmp);
-  auto const patchAddr = a->frontier();
-  auto const jccStub =
-    emitEphemeralServiceReq(frozen(),
-                            mcg->getFreeStub(frozen(), &mcg->cgFixups()),
-                            REQ_BIND_JMPCC_FIRST,
-                            RipRelative(patchAddr),
-                            i.targets[1],
-                            i.targets[0],
-                            i.cc,
-                            ccServiceReqArgInfo(i.cc));
-
-  mcg->setJmpTransID(a->frontier());
-  a->jcc(i.cc, jccStub);
-  mcg->setJmpTransID(a->frontier());
-  a->jmp(jccStub);
-}
-
-void Vgen::emit(bindjcc2& i) {
-  backend.prepareForSmash(a->code(), kJmpccLen);
-  auto def = emitEphemeralServiceReq(frozen(),
-                                     mcg->getFreeStub(frozen(),
-                                                      &mcg->cgFixups()),
-                                     REQ_BIND_JMPCC_SECOND,
-                                     RipRelative(a->frontier()),
-                                     i.target, i.cc);
-  mcg->setJmpTransID(a->frontier());
-  a->jcc(i.cc, def);
-}
-
-void Vgen::emit(bindjmp& i) {
-  emitBindJmp(a->code(), frozen(), i.target, i.trflags);
-}
-
-void Vgen::emit(callstub& i) {
-  emit(call{i.target});
-  emit(syncpoint{i.fix});
-}
-
-void Vgen::emit(fallback& i) {
-  emit(fallbackcc{CC_None, i.dest, i.trflags});
-}
-
-void Vgen::emit(fallbackcc i) {
-  auto const destSR = mcg->tx().getSrcRec(i.dest);
-  if (!i.trflags.packed) {
-    destSR->emitFallbackJump(a->code(), i.cc);
+void emit_simd_imm(X64Assembler* a, int64_t val, Vreg d) {
+  if (val == 0) {
+    a->pxor(d, d); // does not modify flags
   } else {
-    destSR->emitFallbackJumpCustom(a->code(), frozen(), i.dest, i.trflags);
+    auto addr = mcg->allocLiteral(val);
+    a->movsd(rip[(intptr_t)addr], d);
   }
 }
 
-void Vgen::emit(kpcall& i) {
-  backend.prepareForSmash(a->code(), kCallLen);
-  mcg->tx().profData()->addPrologueMainCaller(i.callee, i.prologIndex,
-                                              a->frontier());
-  always_assert(backend.isSmashable(a->frontier(), kCallLen));
-  a->call(i.target);
+void Vgen::emit(const ldimmb& i) {
+  // ldimmb is for Vconst::Byte, which is treated as unsigned uint8_t
+  auto val = i.s.ub();
+  if (i.d.isGP()) {
+    Vreg8 d8 = i.d;
+    a->movb(static_cast<int8_t>(val), d8);
+  } else {
+    emit_simd_imm(a, val, i.d);
+  }
 }
 
-void Vgen::emit(ldimm& i) {
+void Vgen::emit(const ldimml& i) {
+  // ldimml is for Vconst::Long, which is treated as unsigned uint32_t
+  auto val = i.s.l();
+  if (i.d.isGP()) {
+    Vreg32 d32 = i.d;
+    a->movl(val, d32);
+  } else {
+    emit_simd_imm(a, uint32_t(val), i.d);
+  }
+}
+
+void Vgen::emit(const ldimmq& i) {
   auto val = i.s.q();
   if (i.d.isGP()) {
     if (val == 0) {
-      Reg64 d = i.d;
-      if (i.saveflags) {
-        a->movl(0, r32(d));
-      } else {
-        a->xorl(r32(d), r32(d));
-      }
+      Vreg32 d32 = i.d;
+      a->movl(0, d32); // because emitImmReg tries the xor optimization
     } else {
       a->emitImmReg(i.s, i.d);
     }
-  } else if (i.s.q() == 0) {
-    a->pxor(i.d, i.d); // does not modify flags
   } else {
-    auto addr = mcg->allocLiteral(i.s.q());
-    a->movsd(rip[(intptr_t)addr], i.d);
+    emit_simd_imm(a, val, i.d);
   }
 }
 
-void Vgen::emit(ldpoint& i) {
-  ldpoints.push_back({a->frontier(), i.s});
-  a->lea(rip[0], i.d);
+void Vgen::emit(const ldimmqs& i) {
+  emitSmashableMovq(a->code(), i.s.q(), i.d);
 }
 
-void Vgen::emit(load& i) {
-  if (i.s.seg == Vptr::FS) a->fs();
+void Vgen::emit(const load& i) {
+  prefix(*a, i.s);
   auto mref = i.s.mr();
   if (i.d.isGP()) {
     a->loadq(mref, i.d);
   } else {
+    assertx(i.d.isSIMD());
     a->movsd(mref, i.d);
   }
 }
 
-void Vgen::emit(mccall& i) {
-  backend.prepareForSmash(a->code(), kCallLen);
-  a->call(i.target);
-}
-
-// emit smashable mov as part of method cache callsite
-void Vgen::emit(mcprep& i) {
-  /*
-   * For the first time through, set the cache to hold the address
-   * of the movq (*2 + 1), so we can find the movq from the handler.
-   *
-   * We set the low bit for two reasons: the Class* will never be a valid
-   * Class*, so we'll always miss the inline check before it's smashed, and
-   * handlePrimeCacheMiss can tell it's not been smashed yet
-   */
-  backend.prepareForSmash(a->code(), MethodCache::kMovLen);
-  auto movAddr = a->frontier();
-  auto movAddrUInt = reinterpret_cast<uintptr_t>(movAddr);
-  a->movq(0x8000000000000000u, i.d);
-  auto after = reinterpret_cast<uintptr_t*>(a->frontier());
-  after[-1] = (movAddrUInt << 1) | 1;
-  mcg->cgFixups().m_addressImmediates.insert(
-    reinterpret_cast<TCA>(~movAddrUInt));
-}
-
-void Vgen::emit(retransopt& i) {
-  emitServiceReq(a->code(), REQ_RETRANSLATE_OPT,
-                 i.sk.toAtomicInt(), i.id);
-}
-
-void Vgen::emit(store& i) {
+void Vgen::emit(const store& i) {
   if (i.s.isGP()) {
     a->storeq(i.s, i.d);
   } else {
+    assertx(i.s.isSIMD());
     a->movsd(i.s, i.d);
   }
 }
 
-void Vgen::emit(syncpoint i) {
-  FTRACE(5, "IR recordSyncPoint: {} {} {}\n", a->frontier(),
-         i.fix.m_pcOffset, i.fix.m_spOffset);
-  mcg->recordSyncPoint(a->frontier(), i.fix.m_pcOffset,
-                       i.fix.m_spOffset);
+///////////////////////////////////////////////////////////////////////////////
+
+void Vgen::emit(const callarray& i) {
+  emit(call{i.target, i.args});
 }
 
-void Vgen::emit(nocatch& i) {
-  // register a null catch trace at this position.
+void Vgen::emit(const callfaststub& i) {
+  emit(call{i.target, i.args});
+  emit(syncpoint{i.fix});
+}
+
+void Vgen::emit(const contenter& i) {
+  Label Stub, End;
+  Reg64 fp = i.fp, target = i.target;
+  a->jmp8(End);
+
+  asm_label(*a, Stub);
+  a->pop(fp[AROFF(m_savedRip)]);
+  a->jmp(target);
+
+  asm_label(*a, End);
+  a->call(Stub);
+  // m_savedRip will point here.
+  emit(unwind{{i.targets[0], i.targets[1]}});
+}
+
+void Vgen::emit(const mcprep& i) {
+  /*
+   * Initially, we set the cache to hold (addr << 1) | 1 (where `addr' is the
+   * address of the movq) so that we can find the movq from the handler.
+   *
+   * We set the low bit for two reasons: the Class* will never be a valid
+   * Class*, so we'll always miss the inline check before it's smashed, and
+   * handlePrimeCacheInit can tell it's not been smashed yet
+   */
+  auto const mov_addr = emitSmashableMovq(a->code(), 0, r64(i.d));
+  auto const imm = reinterpret_cast<uint64_t>(mov_addr);
+  smashMovq(mov_addr, (imm << 1) | 1);
+
+  mcg->cgFixups().m_addressImmediates.insert(reinterpret_cast<TCA>(~imm));
+}
+
+void Vgen::emit(const mccall& i) {
+  emitSmashableCall(a->code(), i.target);
+}
+
+void Vgen::emit(const vret& i) {
+  a->push(i.retAddr);
+  a->loadq(i.prevFP, i.d);
+  a->ret();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+void Vgen::emit(const nothrow& i) {
   mcg->registerCatchBlock(a->frontier(), nullptr);
 }
 
-void Vgen::emit(unwind& i) {
-  // Unwind instructions terminate blocks with calls that can throw, and have
-  // the edges to catch (unwinder) blocks and fall-through blocks.
+void Vgen::emit(const syncpoint& i) {
+  FTRACE(5, "IR recordSyncPoint: {} {} {}\n", a->frontier(),
+         i.fix.pcOffset, i.fix.spOffset);
+  mcg->recordSyncPoint(a->frontier(), i.fix);
+}
+
+void Vgen::emit(const unwind& i) {
   catches.push_back({a->frontier(), i.targets[1]});
   emit(jmp{i.targets[0]});
 }
 
-// overall emitter
-void Vgen::emit(jit::vector<Vlabel>& labels) {
-  std::vector<TransBCMapping>* bcmap = nullptr;
-  if (mcg->tx().isTransDBEnabled() || RuntimeOption::EvalJitUseVtuneAPI) {
-    bcmap = &mcg->cgFixups().m_bcMap;
-  }
-  jit::vector<jit::vector<TcaRange>> block_ranges(areas.size());
-  for (auto& r : block_ranges) r.resize(unit.blocks.size());
-  for (int i = 0, n = labels.size(); i < n; ++i) {
-    assert(check(unit.blocks[labels[i]]));
-    auto b = labels[i];
-    auto& block = unit.blocks[b];
-    X64Assembler as { area(block.area).code };
-    a = &as;
-    addrs[b] = a->frontier();
-    for (int j = 0; j < areas.size(); j++) {
-      block_ranges[j][b] = TcaRange{areas[j].code.frontier(), nullptr};
-    }
-    {
-      // Compute the next block we will emit into the current area.
-      auto cur_start = start(labels[i]);
-      auto j = i + 1;
-      while (j < labels.size() && cur_start != start(labels[j])) {
-        j++;
-      }
-      next = j < labels.size() ? labels[j] : Vlabel(unit.blocks.size());
-    }
-    for (auto& inst : block.code) {
-      if (bcmap && inst.sk.valid() && (bcmap->empty() ||
-          bcmap->back().md5 != inst.sk.unit()->md5() ||
-          bcmap->back().bcStart != inst.sk.offset())) {
-        bcmap->push_back(TransBCMapping{
-          inst.sk.unit()->md5(),
-          inst.sk.offset(),
-          main().frontier(),
-          cold().frontier(),
-          frozen().frontier()
-        });
-      }
-      switch (inst.op) {
-#define O(name, imms, uses, defs)\
-        case Vinstr::name: emit(inst.name##_); break;
-        X64_OPCODES
-#undef O
-      }
-    }
-    for (int j = 0; j < areas.size(); j++) {
-      auto start = block_ranges[j][b].start();
-      block_ranges[j][b] = TcaRange{start, areas[j].code.frontier()};
-    }
-  }
-  for (auto& p : jccs) {
-    assert(addrs[p.target]);
-    X64Assembler::patchJcc(p.instr, addrs[p.target]);
-  }
-  for (auto& p : jmps) {
-    assert(addrs[p.target]);
-    X64Assembler::patchJmp(p.instr, addrs[p.target]);
-  }
-  for (auto& p : calls) {
-    assert(addrs[p.target]);
-    X64Assembler::patchCall(p.instr, addrs[p.target]);
-  }
-  for (auto& p : catches) {
-    mcg->registerCatchBlock(p.instr, addrs[p.target]);
-  }
-  for (auto& p : ldpoints) {
-    auto after_lea = p.instr + 7;
-    auto d = meta->points[p.pos] - after_lea;
-    assert(deltaFits(d, sz::dword));
-    ((int32_t*)after_lea)[-1] = d;
-  }
-  if (dumpIREnabled(kCodeGenLevel+1)) {
-    std::ostringstream str;
-    for (auto b : labels) {
-      str << "B" << size_t(b) << "\n";
-      for (int j = 0; j < areas.size(); j++) {
-        if (!block_ranges[j][b].empty()) {
-          disasmRange(str, block_ranges[j][b]);
-          str << "\n";
-        }
-      }
-    }
-    HPHP::Trace::traceRelease("%s\n", str.str().c_str());
+///////////////////////////////////////////////////////////////////////////////
+
+void Vgen::emit(const addqim& i) {
+  prefix(*a, i.m).addq(i.s0, i.m.mr());
+}
+
+void Vgen::emit(const call& i) {
+  if (a->jmpDeltaFits(i.target)) {
+    a->call(i.target);
+  } else {
+    // can't do a near call; store address in data section.
+    // call by loading the address using rip-relative addressing.  This
+    // assumes the data section is near the current code section.  Since
+    // this sequence is directly in-line, rip-relative like this is
+    // more compact than loading a 64-bit immediate.
+    auto addr = mcg->allocLiteral((uint64_t)i.target);
+    a->call(rip[(intptr_t)addr]);
   }
 }
 
-void Vgen::emit(cvtsi2sd& i) {
+void Vgen::emit(const cloadq& i) {
+  auto m = i.t;
+  always_assert(!m.index.isValid()); // not supported, but could be later.
+  if (i.f != i.d) {
+    if (i.d == m.base) {
+      // We can't move f over d or we'll clobber the Vptr we need to load from.
+      // Since cload does the load unconditionally anyway, we can just load and
+      // cmov.
+      a->loadq(i.t, i.d);
+      a->cmov_reg64_reg64(ccNegate(i.cc), i.f, i.d);
+      return;
+    }
+    a->movq(i.f, i.d);
+  }
+  a->cload_reg64_disp_reg64(i.cc, m.base, m.disp, i.d);
+}
+
+// add s0 s1 d => mov s1->d; d += s0
+// cmov cc s d => if cc { mov s->d }
+void Vgen::emit(const cmovq& i) {
+  if (i.f != i.d && i.t == i.d) {
+    // negate the condition and swap t/f operands so we dont clobber i.t
+    return emit(cmovq{ccNegate(i.cc), i.sf, i.t, i.f, i.d});
+  } else {
+    prep(i.f, i.d);
+  }
+  a->cmov_reg64_reg64(i.cc, i.t, i.d);
+}
+
+void Vgen::emit(const cvtsi2sd& i) {
   a->pxor(i.d, i.d);
   a->cvtsi2sd(i.s, i.d);
 }
 
-void Vgen::emit(cvtsi2sdm& i) {
+void Vgen::emit(const cvtsi2sdm& i) {
   a->pxor(i.d, i.d);
   a->cvtsi2sd(i.s, i.d);
 }
 
-void Vgen::emit(jcc& i) {
+void Vgen::emit(const jcc& i) {
   if (i.targets[1] != i.targets[0]) {
     if (next == i.targets[1]) {
-      i = jcc{ccNegate(i.cc), {i.targets[1], i.targets[0]}};
+      return emit(jcc{ccNegate(i.cc), i.sf, {i.targets[1], i.targets[0]}});
     }
     auto taken = i.targets[1];
     jccs.push_back({a->frontier(), taken});
@@ -707,13 +585,18 @@ void Vgen::emit(jcc& i) {
   emit(jmp{i.targets[0]});
 }
 
-void Vgen::emit(jmp i) {
+void Vgen::emit(const jcci& i) {
+  a->jcc(i.cc, i.taken);
+  emit(jmp{i.target});
+}
+
+void Vgen::emit(const jmp& i) {
   if (next == i.target) return;
   jmps.push_back({a->frontier(), i.target});
   a->jmp(a->frontier());
 }
 
-void Vgen::emit(lea& i) {
+void Vgen::emit(const lea& i) {
   // could do this in a simplify pass
   if (i.s.disp == 0 && i.s.base.isValid() && !i.s.index.isValid()) {
     emit(copy{i.s.base, i.d});
@@ -722,97 +605,367 @@ void Vgen::emit(lea& i) {
   }
 }
 
-void Vgen::emit(loadq& i) {
-  if (i.s.seg == Vptr::FS) a->fs();
-  a->loadq(i.s.mr(), i.d);
+void Vgen::emit(const storebi& i) {
+  prefix(*a, i.m).storeb(i.s, i.m.mr());
 }
 
-// check that each block has exactly one terminal instruction at the end.
-bool Vgen::check(Vblock& block) {
-  assert(!block.code.empty());
-  auto n = block.code.size();
-  for (size_t i = 0; i < n - 1; ++i) {
-    assert(!isBlockEnd(block.code[i]));
+void Vgen::emit(const testwim& i) {
+  // If there's only 1 byte of meaningful bits in the mask, we can adjust the
+  // pointer offset and use testbim instead.
+  int off = 0;
+  uint16_t newMask = i.s0.w();
+  while (newMask > 0xff && !(newMask & 0xff)) {
+    off++;
+    newMask >>= 8;
   }
-  assert(isBlockEnd(block.code[n - 1]));
-  return true;
-}
-}
 
-Vout& Vasm::add(CodeBlock& cb, AreaIndex area) {
-  assert(size_t(area) == m_areas.size());
-  auto b = m_unit.makeBlock(area);
-  if (size_t(b) == 0) m_unit.roots.push_back(b);
-  Vout v{m_meta, m_unit, b, area};
-  m_areas.push_back(Area{v, cb, cb.frontier()});
-  return m_areas.back().out;
-}
-
-// copy of layoutBlocks in layout.cpp
-jit::vector<Vlabel> layoutBlocks(Vunit& m_unit) {
-  auto blocks = sortBlocks(m_unit);
-  // partition into main/cold/frozen areas without changing relative order,
-  // and the end{} block will be last.
-  auto coldIt = std::stable_partition(blocks.begin(), blocks.end(),
-    [&](Vlabel b) {
-      return m_unit.blocks[b].area == AreaIndex::Main &&
-             m_unit.blocks[b].code.back().op != Vinstr::end;
-    });
-  std::stable_partition(coldIt, blocks.end(),
-    [&](Vlabel b) {
-      return m_unit.blocks[b].area == AreaIndex::Cold &&
-             m_unit.blocks[b].code.back().op != Vinstr::end;
-    });
-  return blocks;
-}
-
-void Vasm::finish(const Abi& abi) {
-  if (m_unit.hasVrs()) {
-    Timer _t(Timer::vasm_xls);
-    allocateRegisters(m_unit, abi);
+  if (newMask > 0xff) {
+    a->testw(i.s0, i.s1);
+  } else {
+    emit(testbim{int8_t(newMask), i.s1 + off, i.sf});
   }
-  if (m_unit.blocks.size() > 1) {
-    Timer _t(Timer::vasm_jumps);
-    optimizeJmps(m_unit);
-  }
-  Timer _t(Timer::vasm_gen);
-  auto blocks = layoutBlocks(m_unit);
-  Vgen(m_unit, m_areas, m_meta).emit(blocks);
 }
 
-Vauto::~Vauto() {
-  for (auto& b : unit().blocks) {
-    if (!b.code.empty()) {
-      // found at least one nonempty block. finish up.
-      if (!main().closed()) main() << end{};
-      assert(m_areas.size() < 2 || cold().empty() || cold().closed());
-      assert(m_areas.size() < 3 || frozen().empty() || frozen().closed());
-      printUnit("after vasm-auto", unit());
-      finish(vasm_abi);
-      return;
+void Vgen::emit(const testlim& i) {
+  a->testl(i.s0, i.s1);
+}
+
+void Vgen::emit(const testqi& i) {
+  auto const imm = i.s0.q();
+  if (magFits(imm, sz::byte)) {
+    a->testb(i.s0, rbyte(i.s1));
+  } else {
+    a->testq(i.s0, i.s1);
+  }
+}
+
+void Vgen::emit(const testqim& i) {
+  // The immediate is 32 bits, sign-extended to 64. If the sign bit isn't set,
+  // we can get the same results by emitting a testlim.
+  if (i.s0.l() < 0) {
+    a->testq(i.s0, i.s1);
+  } else {
+    emit(testlim{i.s0, i.s1, i.sf});
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+void lowerSrem(Vunit& unit, Vlabel b, size_t iInst) {
+  auto const& inst = unit.blocks[b].code[iInst];
+  auto const& srem = inst.srem_;
+  auto scratch = unit.makeScratchBlock();
+  SCOPE_EXIT { unit.freeScratchBlock(scratch); };
+  Vout v(unit, scratch, inst.origin);
+  v << copy{srem.s0, rax};
+  v << cqo{};                      // sign-extend rax => rdx:rax
+  v << idiv{srem.s1, v.makeReg()}; // rdx:rax/divisor => quot:rax, rem:rdx
+  v << copy{rdx, srem.d};
+
+  vector_splice(unit.blocks[b].code, iInst, 1, unit.blocks[scratch].code);
+}
+
+template<typename FromOp, typename ToOp>
+void lowerShift(Vunit& unit, Vlabel b, size_t iInst) {
+  auto const& inst = unit.blocks[b].code[iInst];
+  auto const& shift = inst.get<FromOp>();
+  auto scratch = unit.makeScratchBlock();
+  SCOPE_EXIT { unit.freeScratchBlock(scratch); };
+  Vout v(unit, scratch, inst.origin);
+  v << copy{shift.s0, rcx};
+  v << ToOp{shift.s1, shift.d, shift.sf};
+
+  vector_splice(unit.blocks[b].code, iInst, 1, unit.blocks[scratch].code);
+}
+
+void lowerAbsdbl(Vunit& unit, Vlabel b, size_t iInst) {
+  auto const& inst = unit.blocks[b].code[iInst];
+  auto const& absdbl = inst.absdbl_;
+  auto scratch = unit.makeScratchBlock();
+  SCOPE_EXIT { unit.freeScratchBlock(scratch); };
+  Vout v(unit, scratch, inst.origin);
+
+  // clear the high bit
+  auto tmp = v.makeReg();
+  v << psllq{1, absdbl.s, tmp};
+  v << psrlq{1, tmp, absdbl.d};
+
+  vector_splice(unit.blocks[b].code, iInst, 1, unit.blocks[scratch].code);
+}
+
+void lowerVcall(Vunit& unit, Vlabel b, size_t iInst) {
+  auto& blocks = unit.blocks;
+  auto& inst = blocks[b].code[iInst];
+  auto const is_vcall = inst.op == Vinstr::vcall;
+  auto const vcall = inst.vcall_;
+  auto const vinvoke = inst.vinvoke_;
+
+  // Extract all the relevant information from the appropriate instruction.
+  auto const is_smashable = !is_vcall && vinvoke.smashable;
+  auto const call = is_vcall ? vcall.call : vinvoke.call;
+  auto const& vargs = unit.vcallArgs[is_vcall ? vcall.args : vinvoke.args];
+  auto const& stkArgs = vargs.stkArgs;
+  auto const dests = unit.tuples[is_vcall ? vcall.d : vinvoke.d];
+  auto const fixup = is_vcall ? vcall.fixup : vinvoke.fixup;
+  auto const destType = is_vcall ? vcall.destType : vinvoke.destType;
+
+  auto scratch = unit.makeScratchBlock();
+  SCOPE_EXIT { unit.freeScratchBlock(scratch); };
+  Vout v(unit, scratch, inst.origin);
+
+  int32_t const adjust = (stkArgs.size() & 0x1) ? sizeof(uintptr_t) : 0;
+  if (adjust) v << subqi{adjust, reg::rsp, reg::rsp, v.makeReg()};
+
+  // Push stack arguments, in reverse order.
+  for (int i = stkArgs.size() - 1; i >= 0; --i) v << push{stkArgs[i]};
+
+  // Get the arguments in the proper registers.
+  RegSet argRegs;
+  auto doArgs = [&] (const VregList& srcs, PhysReg (*r)(size_t)) {
+    VregList argDests;
+    for (size_t i = 0, n = srcs.size(); i < n; ++i) {
+      auto const reg = r(i);
+      argDests.push_back(reg);
+      argRegs |= reg;
     }
-  }
-}
 
-std::string format(Vreg r) {
-  if (r.isPhys()) {
-    if (r.isGP()) {
-      Reg64 r64 = r;
-      return regname(r64);
-    } else {
-      RegXMM rxmm = r;
-      return regname(rxmm);
+    if (argDests.size()) {
+      v << copyargs{v.makeTuple(srcs),
+                    v.makeTuple(std::move(argDests))};
     }
+  };
+  doArgs(vargs.args, rarg);
+  doArgs(vargs.simdArgs, rarg_simd);
+
+  // Emit the call.
+  if (is_smashable) v << mccall{(TCA)call.address(), argRegs};
+  else              emitCall(v, call, argRegs);
+
+  // Handle fixup and unwind information.
+  if (fixup.isValid()) v << syncpoint{fixup};
+
+  if (!is_vcall) {
+    auto& targets = vinvoke.targets;
+    v << unwind{{targets[0], targets[1]}};
+
+    // Insert an lea fixup for any stack args at the beginning of the catch
+    // block.
+    if (auto rspOffset = ((stkArgs.size() + 1) & ~1) * sizeof(uintptr_t)) {
+      auto& taken = unit.blocks[targets[1]].code;
+      assertx(taken.front().op == Vinstr::landingpad ||
+             taken.front().op == Vinstr::jmp);
+      Vinstr v{lea{reg::rsp[rspOffset], reg::rsp}};
+      v.origin = taken.front().origin;
+      if (taken.front().op == Vinstr::jmp) {
+        taken.insert(taken.begin(), v);
+      } else {
+        taken.insert(taken.begin() + 1, v);
+      }
+    }
+
+    // Write out the code so far to the end of b. Remaining code will be
+    // emitted to the next block.
+    vector_splice(blocks[b].code, iInst, 1, blocks[scratch].code);
+  } else if (vcall.nothrow) {
+    v << nothrow{};
   }
-  std::ostringstream str;
-  str << "%" << size_t(r);
-  return str.str();
+
+  // Copy the call result to the destination register(s)
+  switch (destType) {
+    case DestType::TV: {
+      // rax contains m_type and m_aux but we're expecting just the type in
+      // the lower bits, so shift the type result register.
+      static_assert(offsetof(TypedValue, m_data) == 0, "");
+      static_assert(offsetof(TypedValue, m_type) == 8, "");
+      if (dests.size() == 2) {
+        v << copy2{reg::rax, reg::rdx, dests[0], dests[1]};
+      } else {
+        // We have cases where we statically know the type but need the value
+        // from native call. Even if the type does not really need a register
+        // (e.g., InitNull), a Vreg is still allocated in assignRegs(), so the
+        // following assertion holds.
+        assertx(dests.size() == 1);
+        v << copy{reg::rax, dests[0]};
+      }
+      break;
+    }
+    case DestType::SIMD: {
+      // rax contains m_type and m_aux but we're expecting just the type in
+      // the lower bits, so shift the type result register.
+      static_assert(offsetof(TypedValue, m_data) == 0, "");
+      static_assert(offsetof(TypedValue, m_type) == 8, "");
+      assertx(dests.size() == 1);
+      pack2(v, reg::rax, reg::rdx, dests[0]);
+      break;
+    }
+    case DestType::SSA:
+    case DestType::Byte:
+      // copy the single-register result to dests[0]
+      assertx(dests.size() == 1);
+      assertx(dests[0].isValid());
+      v << copy{reg::rax, dests[0]};
+      break;
+    case DestType::None:
+      assertx(dests.empty());
+      break;
+    case DestType::Dbl:
+      // copy the single-register result to dests[0]
+      assertx(dests.size() == 1);
+      assertx(dests[0].isValid());
+      v << copy{reg::xmm0, dests[0]};
+      break;
+  }
+
+  if (stkArgs.size() > 0) {
+    v << addqi{safe_cast<int32_t>(stkArgs.size() * sizeof(uintptr_t)
+                                  + adjust),
+               reg::rsp,
+               reg::rsp,
+               v.makeReg()};
+  }
+
+  // Insert new instructions to the appropriate block
+  if (is_vcall) {
+    vector_splice(blocks[b].code, iInst, 1, blocks[scratch].code);
+  } else {
+    vector_splice(blocks[vinvoke.targets[0]].code, 0, 0,
+                  blocks[scratch].code);
+  }
 }
 
-Vtuple findDefs(const Vunit& unit, Vlabel b) {
-  assert(!unit.blocks[b].code.empty() &&
-         unit.blocks[b].code.front().op == Vinstr::phidef);
-  return unit.blocks[b].code.front().phidef_.defs;
+void lower_vcallarray(Vunit& unit, Vlabel b) {
+  auto& code = unit.blocks[b].code;
+  // vcallarray can only appear at the end of a block.
+  auto const inst = code.back().get<vcallarray>();
+  auto const origin = code.back().origin;
+
+  auto argRegs = inst.args;
+  auto const& srcs = unit.tuples[inst.extraArgs];
+  jit::vector<Vreg> dsts;
+  for (int i = 0; i < srcs.size(); ++i) {
+    dsts.emplace_back(rarg(i));
+    argRegs |= rarg(i);
+  }
+
+  code.back() = copyargs{unit.makeTuple(srcs), unit.makeTuple(std::move(dsts))};
+  code.emplace_back(callarray{inst.target, argRegs});
+  code.back().origin = origin;
+  code.emplace_back(unwind{{inst.targets[0], inst.targets[1]}});
+  code.back().origin = origin;
 }
 
-}}}
+/*
+ * Lower a few abstractions to facilitate straightforward x64 codegen.
+ */
+void lowerForX64(Vunit& unit, const Abi& abi) {
+  Timer _t(Timer::vasm_lower);
+
+  // This pass relies on having no critical edges in the unit.
+  splitCriticalEdges(unit);
+
+  // Scratch block can change blocks allocation, hence cannot use regular
+  // iterators.
+  auto& blocks = unit.blocks;
+
+  PostorderWalker{unit}.dfs([&](Vlabel ib) {
+    assertx(!blocks[ib].code.empty());
+    auto& back = blocks[ib].code.back();
+    if (back.op == Vinstr::vcallarray) {
+      lower_vcallarray(unit, Vlabel{ib});
+    }
+
+    for (size_t ii = 0; ii < blocks[ib].code.size(); ++ii) {
+      auto& inst = blocks[ib].code[ii];
+      switch (inst.op) {
+        case Vinstr::vcall:
+        case Vinstr::vinvoke:
+          lowerVcall(unit, Vlabel{ib}, ii);
+          break;
+
+        case Vinstr::srem:
+          lowerSrem(unit, Vlabel{ib}, ii);
+          break;
+
+        case Vinstr::sar:
+          lowerShift<sar, sarq>(unit, Vlabel{ib}, ii);
+          break;
+
+        case Vinstr::shl:
+          lowerShift<shl, shlq>(unit, Vlabel{ib}, ii);
+          break;
+
+        case Vinstr::absdbl:
+          lowerAbsdbl(unit, Vlabel{ib}, ii);
+          break;
+
+        case Vinstr::defvmsp:
+          inst = copy{rvmsp(), inst.defvmsp_.d};
+          break;
+
+        case Vinstr::syncvmsp:
+          inst = copy{inst.syncvmsp_.s, rvmsp()};
+          break;
+
+        case Vinstr::movtqb:
+          inst = copy{inst.movtqb_.s, inst.movtqb_.d};
+          break;
+
+        case Vinstr::movtql:
+          inst = copy{inst.movtql_.s, inst.movtql_.d};
+          break;
+
+        case Vinstr::countbytecode:
+          inst = incqm{inst.countbytecode_.base[g_bytecodesVasm.handle()],
+                       inst.countbytecode_.sf};
+          break;
+
+        default:
+          break;
+      }
+    }
+  });
+
+  printUnit(kVasmLowerLevel, "after lower for X64", unit);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+}
+
+void optimizeX64(Vunit& unit, const Abi& abi) {
+  Timer timer(Timer::vasm_optimize);
+
+  removeTrivialNops(unit);
+  optimizePhis(unit);
+  fuseBranches(unit);
+  optimizeJmps(unit);
+  optimizeExits(unit);
+
+  lowerForX64(unit, abi);
+
+  simplify(unit);
+
+  if (!unit.constToReg.empty()) {
+    foldImms<x64::ImmFolder>(unit);
+  }
+  {
+    Timer timer(Timer::vasm_copy);
+    optimizeCopies(unit, abi);
+  }
+  if (unit.needsRegAlloc()) {
+    Timer timer(Timer::vasm_xls);
+    removeDeadCode(unit);
+    allocateRegisters(unit, abi);
+  }
+  if (unit.blocks.size() > 1) {
+    Timer timer(Timer::vasm_jumps);
+    optimizeJmps(unit);
+  }
+}
+
+void emitX64(const Vunit& unit, Vtext& text, AsmInfo* asmInfo) {
+  Timer timer(Timer::vasm_gen);
+  vasm_emit<Vgen>(unit, text, asmInfo);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+}}

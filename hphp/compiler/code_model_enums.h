@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -61,6 +61,7 @@ namespace HPHP {
     PHP_SHIFT_RIGHT = 38,
     PHP_XOR_ASSIGN = 39,
     PHP_XOR = 40,
+    PHP_SPACESHIP = 41,
   };
 
   /** The kinds of operations that IUnaryOpExpressions can perform. */
@@ -104,6 +105,7 @@ namespace HPHP {
     PHP_CLASS = 1,
     PHP_INTERFACE = 2,
     PHP_TRAIT = 3,
+    PHP_ENUM = 4,
   };
 
   /** The sort order to use when grouping query results */

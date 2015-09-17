@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,8 +16,14 @@
 
 #include "hphp/util/vdso.h"
 
+#ifdef FACEBOOK
+#include "common/time/ClockGettimeNS.h"
+#endif
+
+#ifndef _MSC_VER
 #define _GNU_SOURCE 1
 #include <dlfcn.h>
+#endif
 
 #include <cstring>
 
@@ -27,6 +33,7 @@ namespace HPHP {
 static Vdso s_vdso;
 
 Vdso::Vdso() : m_handle(nullptr), m_clock_gettime_ns(nullptr) {
+#ifndef _MSC_VER
   m_handle = dlopen("linux-vdso.so.1", RTLD_LAZY | RTLD_LOCAL | RTLD_NOLOAD);
   if (!m_handle) {
     return;
@@ -36,12 +43,15 @@ Vdso::Vdso() : m_handle(nullptr), m_clock_gettime_ns(nullptr) {
     (int64_t (*)(clockid_t))dlsym(m_handle, "__vdso_clock_gettime_ns");
   m_clock_gettime =
     (int (*)(clockid_t, timespec *))dlsym(m_handle, "__vdso_clock_gettime");
+#endif
 }
 
 Vdso::~Vdso() {
+#ifndef _MSC_VER
   if (m_handle) {
     dlclose(m_handle);
   }
+#endif
 }
 
 int64_t Vdso::ClockGetTimeNS(int clk_id) {
@@ -53,6 +63,13 @@ int Vdso::ClockGetTime(int clk_id, timespec *ts) {
 }
 
 ALWAYS_INLINE int64_t Vdso::clockGetTimeNS(int clk_id) {
+#ifdef FACEBOOK
+  uint64_t time;
+
+  if (clk_id == CLOCK_THREAD_CPUTIME_ID &&
+      !fb_perf_get_thread_cputime_ns(&time))
+    return time;
+#endif
   if (m_clock_gettime_ns) {
     return m_clock_gettime_ns(clk_id);
   }
@@ -60,6 +77,17 @@ ALWAYS_INLINE int64_t Vdso::clockGetTimeNS(int clk_id) {
 }
 
 ALWAYS_INLINE int Vdso::clockGetTime(int clk_id, timespec *ts) {
+#ifdef FACEBOOK
+  uint64_t time;
+  constexpr uint64_t sec_to_ns = 1000000000;
+
+  if (clk_id == CLOCK_THREAD_CPUTIME_ID &&
+      !fb_perf_get_thread_cputime_ns(&time)) {
+    ts->tv_sec = time / sec_to_ns;
+    ts->tv_nsec = time % sec_to_ns;
+    return 0;
+  }
+#endif
   if (m_clock_gettime) {
     memset(ts, 0, sizeof(*ts));
     return m_clock_gettime(clk_id, ts);

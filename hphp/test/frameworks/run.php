@@ -1,4 +1,3 @@
-#!/usr/bin/env php
 <?hh
 /*
  * This script allows us to more easily test the key OSS PHP frameworks
@@ -175,6 +174,18 @@ function fork_buckets(Traversable $data, (function(array):int) $callback): int {
   return $thread_ret_val;
 }
 
+function list_tests(Vector $frameworks): void {
+  if ($frameworks->isEmpty()) {
+    error_and_exit("No frameworks available on which to list tests");
+  }
+
+  foreach($frameworks as $framework) {
+    foreach($framework->getTests() as $test) {
+      print fbmake_test_name($framework, $test).PHP_EOL;
+    }
+  }
+}
+
 function run_tests(Vector $frameworks): void {
   if ($frameworks->isEmpty()) {
     error_and_exit("No frameworks available on which to run tests");
@@ -219,7 +230,16 @@ function run_tests(Vector $frameworks): void {
     // vector; otherwise, we are just going to add the framework to run
     // serially and use its global phpunit test run command to run the entire
     // suite (just like a normal phpunit run outside this framework).
-    if ($framework->isParallel() && !Options::$as_phpunit) {
+    $filter_tests = Options::$filter_tests;
+    if ($filter_tests !== null) {
+      foreach($framework->getTests() as $test) {
+        $testname = fbmake_test_name($framework, $test);
+        if ($filter_tests->contains($testname)) {
+          $st = new Runner($framework, $test);
+          $all_tests->add($st);
+        }
+      }
+    } elseif ($framework->isParallel() && !Options::$as_phpunit) {
       foreach($framework->getTests() as $test) {
         $st = new Runner($framework, $test);
         $all_tests->add($st);
@@ -342,12 +362,15 @@ function run_test_bucket(array $test_bucket): int {
 }
 
 function get_unit_testing_infra_dependencies(): void {
-  // Install composer.phar. If it exists, but it is nearing that
-  // 30 day old mark, resintall it anyway.
-  if (!(file_exists(__DIR__."/composer.phar")) ||
-      (time() - filectime(__DIR__."/composer.phar")) >= 29*24*60*60) {
+  // Even if we have vendor/, try and grab composer in case we're missing
+  // we're running a framework that isn't already installed.
+  if (
+    (!Options::$local_source_only) &&
+    (!(file_exists(__DIR__."/composer.phar")) ||
+      (time() - filectime(__DIR__."/composer.phar")) >= 29*24*60*60)
+  ) {
     human("Getting composer.phar....\n");
-    unlink(__DIR__."/composer.phar");
+    delete_file(__DIR__."/composer.phar");
     $comp_url = "http://getcomposer.org/composer.phar";
     $get_composer_command = "curl ".$comp_url." -o ".
       __DIR__."/composer.phar 2>&1";
@@ -358,19 +381,57 @@ function get_unit_testing_infra_dependencies(): void {
     }
   }
 
+
+  // Use both in case composer.json has been changed, but the lock file
+  // hasn't been updated yet.
+  $checksum = md5(file_get_contents(__DIR__.'/composer.json'));
+  $checksum .= '-';
+  $checksum .= md5(file_get_contents(__DIR__.'/composer.lock'));
+  $stamp_file = __DIR__.'/vendor/'.$checksum.'.stamp';
+  if (file_exists($stamp_file)) {
+    return;
+  }
+
+  $cache_dir = Options::$cache_directory;
+  $cache_file = $cache_dir.'/vendor-'.$checksum.'.tar.bz2';
+  if (!file_exists($stamp_file)) {
+    invariant(
+      file_exists($cache_file) || !Options::$local_source_only,
+      '--local-source-only specified, but no vendor cache (expected: %s)',
+      $cache_file
+    );
+    if ($cache_dir && file_exists($cache_file)) {
+      human("Extracting vendor cache, eg PHPUnit...\n");
+      $pd = new PharData($cache_file);
+      $pd->extractTo(__DIR__);
+      invariant(file_exists($stamp_file), 'Failed to extract vendor cache');
+      invariant(
+        file_exists(__DIR__.'/vendor/bin/phpunit'),
+        'PHPUnit executable not in vendor cache',
+      );
+      return;
+    }
+  }
+
+  // We don't have a cached vendor/, but as --local-source-only wasn't
+  // specified, we can try to download it.
+  invariant(
+    !Options::$local_source_only,
+    'trying to re-run composer, but --local-source-only specified',
+  );
+
   // Quick hack to make sure we get the latest phpunit binary from composer
   $md5_file = __DIR__."/composer.json.md5";
-  $json_file_contents = file_get_contents(__DIR__."/composer.json");
   $vendor_dir = __DIR__."/vendor";
   $lock_file = __DIR__."/composer.lock";
   if (!file_exists($md5_file) ||
-      file_get_contents($md5_file) !== md5($json_file_contents)) {
+      file_get_contents($md5_file) !== $checksum) {
     human("\nUpdated composer.json found. Updating phpunit binary.\n");
     if (file_exists($vendor_dir)) {
       remove_dir_recursive($vendor_dir);
     }
-    unlink($lock_file);
-    file_put_contents($md5_file, md5($json_file_contents));
+    delete_file($lock_file);
+    file_put_contents($md5_file, $checksum);
   }
 
   // Install phpunit from composer.json located in __DIR__
@@ -390,6 +451,13 @@ function get_unit_testing_infra_dependencies(): void {
     }
   }
 
+  touch($stamp_file);
+  if ($cache_dir) {
+    run_install(
+      'tar jcf '.escapeshellarg($cache_file).' vendor/',
+      __DIR__
+    );
+  }
 }
 
 function print_diffs(Framework $framework): void {
@@ -614,27 +682,38 @@ function oss_test_option_map(): OptionInfoMap {
     'isolate'             => Pair {'',   "Try to make tests that have ".
                                          "external dependencies automatically ".
                                          "fail"},
-    'toran-proxy:'        => Pair {'',   "URL of Toran Proxy to use for ".
-                                         "dependencies"},
+    'cache-directory:'    => Pair {'',   'Directory to store source tarballs'},
+    'local-source-only'   => Pair {'',   'Fail if git or composer calls are '.
+                                         'needed'},
+    'list-tests'          => Pair {'',   'List tests that would be run'},
+    'run-specified:'      => Pair {'',   'Run only the specified tests by '.
+                                         'name, separated by a comma. Test '.
+                                         'names are returned by '.
+                                         '--list-tests. If the name is '.
+                                         'prepended with an @, load the '.
+                                         'test names from file instead.'},
   };
 }
 
-function main(array $argv): void {
+function main(array &$argv): void {
   $options = parse_options(oss_test_option_map());
   if ($options->containsKey('help')) {
     help();
     return;
   }
-  // Parse all the options passed to run.php and come out with a list of
-  // frameworks passed into test (or --all or --allexcept)
-  $passed_frameworks = Options::parse($options, $argv);
+
+  // Parse all the options passed to run.php
+  Options::parse($options);
+  $passed_frameworks = new Vector($argv);
   $available_frameworks = new Set(array_keys(Options::$framework_info));
   include_all_php(__DIR__."/framework_class_overrides");
   $framework_class_overrides = get_subclasses_of("Framework")->toSet();
   $frameworks = prepare($available_frameworks, $framework_class_overrides,
                         $passed_frameworks);
 
-  if (Options::$run_tests) {
+  if (Options::$list_tests) {
+    list_tests($frameworks);
+  } elseif (Options::$run_tests) {
     run_tests($frameworks);
   }
 }

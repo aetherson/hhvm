@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,11 +15,11 @@
 */
 
 #include <boost/dynamic_bitset.hpp>
-#include <boost/next_prior.hpp>
 #include <algorithm>
+#include <iterator>
 #include <set>
 
-#include "folly/gen/Base.h"
+#include <folly/gen/Base.h>
 
 #include "hphp/runtime/vm/unit-util.h"
 
@@ -37,14 +37,14 @@ const StaticString s_invoke("__invoke");
 
 //////////////////////////////////////////////////////////////////////
 
-bool checkBlock(const php::Block& b) {
+bool DEBUG_ONLY checkBlock(const php::Block& b) {
   assert(!b.hhbcs.empty());
 
   // No instructions in the middle of a block should have taken edges,
   // or be an unconditional Jmp.
   for (auto it = begin(b.hhbcs); it != end(b.hhbcs); ++it) {
     assert(it->op != Op::Jmp && "unconditional Jmp mid-block");
-    if (boost::next(it) == end(b.hhbcs)) break;
+    if (std::next(it) == end(b.hhbcs)) break;
     forEachTakenEdge(*it, [&] (php::Block& b) {
       assert(!"Instruction in middle of block had a jump target");
     });
@@ -59,7 +59,7 @@ bool checkBlock(const php::Block& b) {
   return true;
 }
 
-bool checkParams(const php::Func& f) {
+bool DEBUG_ONLY checkParams(const php::Func& f) {
   assert(f.params.size() <= f.locals.size());
   for (uint32_t i = 0; i < f.locals.size(); ++i) {
     assert(f.locals[i]->id == i);
@@ -163,7 +163,7 @@ void checkExnTreeMore(borrowed_ptr<const ExnNode> node) {
   for (auto& c : node->children) checkExnTreeMore(borrow(c));
 }
 
-bool checkExnTree(const php::Func& f) {
+bool DEBUG_ONLY checkExnTree(const php::Func& f) {
   boost::dynamic_bitset<> seenIds;
   for (auto& n : f.exnNodes) checkExnTreeBasic(seenIds, borrow(n), nullptr);
 
@@ -176,7 +176,7 @@ bool checkExnTree(const php::Func& f) {
   return true;
 }
 
-bool checkName(SString name) {
+bool DEBUG_ONLY checkName(SString name) {
   return isNSNormalized(name);
 }
 

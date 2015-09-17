@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,27 +17,26 @@
 
 #include <vector>
 #include <array>
-#include <boost/lexical_cast.hpp>
 #include <tbb/concurrent_hash_map.h>
 
 #include "hphp/util/exception.h"
 #include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/empty-array.h"
 #include "hphp/runtime/base/packed-array.h"
+#include "hphp/runtime/base/struct-array.h"
 #include "hphp/runtime/base/array-common.h"
 #include "hphp/runtime/base/array-iterator.h"
 #include "hphp/runtime/base/type-conversions.h"
 #include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/variable-serializer.h"
 #include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/base/macros.h"
 #include "hphp/runtime/base/apc-local-array.h"
 #include "hphp/runtime/base/comparisons.h"
-#include "hphp/runtime/vm/name-value-table-wrapper.h"
+#include "hphp/runtime/vm/globals-array.h"
 #include "hphp/runtime/base/proxy-array.h"
 #include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/base/mixed-array.h"
+#include "hphp/zend/zend-string.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -47,29 +46,43 @@ static_assert(
   "Performance is sensitive to sizeof(ArrayData)."
   " Make sure you changed it with good reason and then update this assert.");
 
-typedef tbb::concurrent_hash_map<std::string, ArrayData*> ArrayDataMap;
+using ArrayDataMap = tbb::concurrent_hash_map<ArrayData::ScalarArrayKey,
+                                              ArrayData*,
+                                              ArrayData::ScalarHash>;
 static ArrayDataMap s_arrayDataMap;
+
+ArrayData::ScalarArrayKey ArrayData::GetScalarArrayKey(const char* str,
+                                                       size_t sz) {
+  return MD5(string_md5(str, sz).c_str());
+}
+
+ArrayData::ScalarArrayKey ArrayData::GetScalarArrayKey(ArrayData* arr) {
+  VariableSerializer vs(VariableSerializer::Type::Serialize);
+  auto s = vs.serializeValue(VarNR(arr), false /* limit */);
+  return GetScalarArrayKey(s.data(), s.size());
+}
 
 ArrayData* ArrayData::GetScalarArray(ArrayData* arr) {
   if (arr->empty()) return staticEmptyArray();
-  auto key = f_serialize(arr).toCppString();
+  auto key = GetScalarArrayKey(arr);
   return GetScalarArray(arr, key);
 }
 
-ArrayData* ArrayData::GetScalarArray(ArrayData* arr, const std::string& key) {
+ArrayData* ArrayData::GetScalarArray(ArrayData* arr,
+                                     const ScalarArrayKey& key) {
   if (arr->empty()) return staticEmptyArray();
-  assert(key == f_serialize(arr).toCppString());
+  assert(key == GetScalarArrayKey(arr));
 
   ArrayDataMap::accessor acc;
   if (s_arrayDataMap.insert(acc, key)) {
     ArrayData* ad;
 
     if (arr->isVectorData() && !arr->isPacked()) {
-      ad = PackedArray::NonSmartConvert(arr);
+      ad = PackedArray::ConvertStatic(arr);
     } else {
-      ad = arr->nonSmartCopy();
+      ad = arr->copyStatic();
     }
-    ad->setStatic();
+    assert(ad->isStatic());
     ad->onSetEvalScalar();
     acc->second = ad;
   }
@@ -94,49 +107,11 @@ static ArrayData* ZAppendThrow(ArrayData* ad, RefData* v, int64_t* key_ptr) {
 
 #define DISPATCH(entry)                         \
   { PackedArray::entry,                         \
+    StructArray::entry,                         \
     MixedArray::entry,                          \
-    MixedArray::entry,                          \
-    MixedArray::entry,                          \
-    PackedArray::entry,                         \
     EmptyArray::entry,                          \
     APCLocalArray::entry,                       \
-    NameValueTableWrapper::entry,               \
-    ProxyArray::entry                           \
-  },
-
-#define DISPATCH_INTMAP_SPECIALIZED(entry)      \
-  { PackedArray::entry,                         \
-    MixedArray::entry,                          \
-    MixedArray::entry,                          \
-    MixedArray::entry##Impl<ArrayData::kIntMapKind>, \
-    PackedArray::entry,                         \
-    EmptyArray::entry,                          \
-    APCLocalArray::entry,                       \
-    NameValueTableWrapper::entry,               \
-    ProxyArray::entry                           \
-  },
-
-#define DISPATCH_STRMAP_SPECIALIZED(entry)      \
-  { PackedArray::entry,                         \
-    MixedArray::entry,                          \
-    MixedArray::entry##Impl<ArrayData::kStrMapKind>, \
-    MixedArray::entry,                          \
-    PackedArray::entry,                         \
-    EmptyArray::entry,                          \
-    APCLocalArray::entry,                       \
-    NameValueTableWrapper::entry,               \
-    ProxyArray::entry                           \
-  },
-
-#define DISPATCH_MAP_ARRAY_SPECIALIZED(entry)   \
-  { PackedArray::entry,                         \
-    MixedArray::entry,                          \
-    MixedArray::entry##Impl<ArrayData::kStrMapKind>, \
-    MixedArray::entry##Impl<ArrayData::kIntMapKind>, \
-    PackedArray::entry,                         \
-    EmptyArray::entry,                          \
-    APCLocalArray::entry,                       \
-    NameValueTableWrapper::entry,               \
+    GlobalsArray::entry,                        \
     ProxyArray::entry                           \
   },
 
@@ -165,15 +140,13 @@ static ArrayData* ZAppendThrow(ArrayData* ad, RefData* v, int64_t* key_ptr) {
  *   array doesn't have to copy if it was asked to remove an element
  *   that doesn't exist.
  *
- *   When a function with these semantics returns a new array, the new
- *   array is not yet incref'd (for historical reasons relating to our
- *   smart pointers).  Correctly using functions with these semantics
- *   usually involves checking whether the return value is the same
- *   pointer to be able to conditionally incref it.  TODO(#2926276):
- *   we want to change this to make callsites cheaper.
+ *   When a function with these semantics returns a new array, the new array is
+ *   already incref'd. In a few cases, an existing array (different than the
+ *   source array) may be returned. In this case, the array will already be
+ *   incref'd.
  */
 
-extern const ArrayFunctions g_array_funcs = {
+extern const ArrayFunctions g_array_funcs_unmodified = {
   /*
    * void Release(ArrayData*)
    *
@@ -188,27 +161,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   Lookup a value in an array using an integer key.  Returns
    *   nullptr if the key is not in the array.
    */
-  DISPATCH_STRMAP_SPECIALIZED(NvGetInt)
-
-  /*
-   * const TypedValue* NvGetIntConverted(const ArrayData*, int64_t key)
-   *
-   *   Lookup a value in an array using an integer key. Signifies that the key
-   *   was originally a numeric-string key that was converted to int.
-   *   Returns nullptr if the key is not in the array.
-   */
-  {
-    PackedArray::NvGetInt,
-    MixedArray::NvGetInt,
-    MixedArray::NvGetIntImpl<ArrayData::kStrMapKind>,
-    /* IntMapArray */
-    MixedArray::NvGetIntConverted,
-    PackedArray::NvGetIntConverted,
-    EmptyArray::NvGetInt,
-    APCLocalArray::NvGetInt,
-    NameValueTableWrapper::NvGetInt,
-    ProxyArray::NvGetInt,
-  },
+  DISPATCH(NvGetInt)
 
   /*
    * const TypedValue* NvGetStr(const ArrayData*, const StringData*)
@@ -217,7 +170,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   must not be an integer-like string.  Returns nullptr if the key
    *   is not in the array.
    */
-  DISPATCH_INTMAP_SPECIALIZED(NvGetStr)
+  DISPATCH(NvGetStr)
 
   /*
    * void NvGetKey(const ArrayData*, TypedValue* out, ssize_t pos)
@@ -233,27 +186,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   Set a value in the array for an integer key.  This function has
    *   copy/grow semantics.
    */
-  DISPATCH_STRMAP_SPECIALIZED(SetInt)
-
-  /*
-   * ArrayData* SetIntConverted(ArrayData*, int64_t key, Cell v, bool copy)
-   *
-   *   Set a value in the array for an integer key. Signifies that the key
-   *   was originally a numeric-string key that was converted to int.
-   *   This function has copy/grow semantics.
-   */
-  {
-    PackedArray::SetInt,
-    MixedArray::SetInt,
-    MixedArray::SetIntImpl<ArrayData::kStrMapKind>,
-    /* IntMapArray */
-    MixedArray::SetIntConverted,
-    PackedArray::SetIntConverted,
-    EmptyArray::SetInt,
-    APCLocalArray::SetInt,
-    NameValueTableWrapper::SetInt,
-    ProxyArray::SetInt,
-  },
+  DISPATCH(SetInt)
 
   /*
    * ArrayData* SetStr(ArrayData*, StringData*, Cell v, bool copy)
@@ -262,20 +195,20 @@ extern const ArrayFunctions g_array_funcs = {
    *   be an integer-like string.  This function has copy/grow
    *   semantics.
    */
-  DISPATCH_INTMAP_SPECIALIZED(SetStr)
+  DISPATCH(SetStr)
 
   /*
    * size_t Vsize(const ArrayData*)
    *
-   *   This entry point essentially is only for NameValueTableWrapper;
+   *   This entry point essentially is only for GlobalsArray and ProxyArray;
    *   all the other cases are not_reached().
    *
-   *   Because of particulars of how NameValueTableWrapper works,
+   *   Because of particulars of how GlobalsArray works,
    *   determining the size of the array is an O(N) operation---we set
    *   the size field in the generic ArrayData header to -1 in that
    *   case and dispatch through this entry point.  ProxyArray also
    *   always involves virtual size, because of the possibility that
-   *   it could be proxying a NameValueTableWrapper.
+   *   it could be proxying a GlobalsArray.
    */
   DISPATCH(Vsize)
 
@@ -302,7 +235,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   Returns true iff this array contains an element with the
    *   supplied integer key.
    */
-  DISPATCH_STRMAP_SPECIALIZED(ExistsInt)
+  DISPATCH(ExistsInt)
 
   /*
    * bool ExistsStr(const ArrayData*, const StringData*)
@@ -311,7 +244,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   supplied string key.  The string must not be an integer-like
    *   string.
    */
-  DISPATCH_INTMAP_SPECIALIZED(ExistsStr)
+  DISPATCH(ExistsStr)
 
   /*
    * ArrayData* LvalInt(ArrayData*, int64_t k, Variant*& out, bool copy)
@@ -320,7 +253,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   creating it as a KindOfNull if it doesn't exist, and sets `out'
    *   to point to it.  This function has copy/grow semantics.
    */
-  DISPATCH_STRMAP_SPECIALIZED(LvalInt)
+  DISPATCH(LvalInt)
 
   /*
    * ArrayData* LvalStr(ArrayData*, StringData* key, Variant*& out, bool copy)
@@ -330,7 +263,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   to point to it.  The string `key' may not be an integer-like
    *   string.  This function has copy/grow semantics.
    */
-  DISPATCH_INTMAP_SPECIALIZED(LvalStr)
+  DISPATCH(LvalStr)
 
   /*
    * ArrayData* LvalNew(ArrayData*, Variant*& out, bool copy)
@@ -341,21 +274,18 @@ extern const ArrayFunctions g_array_funcs = {
    *   function sets out to point to the lvalBlackHole.  This function
    *   has copy/grow semantics.
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(LvalNew)
+  DISPATCH(LvalNew)
 
   /*
    * ArrayData* LvalNewRef(ArrayData*, Variant*& out, bool copy)
    */
   {
     PackedArray::LvalNewRef,
+    StructArray::LvalNew,
     MixedArray::LvalNew,
-    MixedArray::LvalNewImpl<ArrayData::kStrMapKind>,
-    /* IntMapArray */
-    MixedArray::LvalNewImpl<ArrayData::kIntMapKind>,
-    PackedArray::LvalNewRef,
     EmptyArray::LvalNew,
     APCLocalArray::LvalNew,
-    NameValueTableWrapper::LvalNew,
+    GlobalsArray::LvalNew,
     ProxyArray::LvalNew,
   },
 
@@ -366,7 +296,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   boxed, and then insert a KindOfRef that points to v's RefData.
    *   This function has copy/grow semantics.
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(SetRefInt)
+  DISPATCH(SetRefInt)
 
   /*
    * ArrayData* SetRefStr(ArrayData*, StringData* key, Variant& v, bool copy)
@@ -376,7 +306,7 @@ extern const ArrayFunctions g_array_funcs = {
    *  then insert a KindOfRef that points to v's RefData.  This
    *  function has copy/grow semantics.
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(SetRefStr)
+  DISPATCH(SetRefStr)
 
   /*
    * ArrayData* AddInt(ArrayData*, int64_t key, Cell, bool copy)
@@ -387,8 +317,8 @@ extern const ArrayFunctions g_array_funcs = {
    *   already contain a value for the key `key' if it can make the
    *   operation more efficient.
    */
-  DISPATCH_STRMAP_SPECIALIZED(SetInt)
-  DISPATCH_INTMAP_SPECIALIZED(SetStr)
+  DISPATCH(SetInt)
+  DISPATCH(SetStr)
 
   /*
    * ArrayData* RemoveInt(ArrayData*, int64_t key, bool copy)
@@ -397,7 +327,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   entry for that element, this function does not remove it, and
    *   may or may not cow.  This function has copy/grow semantics.
    */
-  DISPATCH_STRMAP_SPECIALIZED(RemoveInt)
+  DISPATCH(RemoveInt)
 
   /*
    * ArrayData* RemoveStr(ArrayData*, const StringData*, bool copy)
@@ -406,7 +336,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   entry for that element, this function does not remove it, and
    *   may or may not cow.  This function has copy/grow semantics.
    */
-  DISPATCH_INTMAP_SPECIALIZED(RemoveStr)
+  DISPATCH(RemoveStr)
 
   /*
    * ssize_t IterEnd(const ArrayData*)
@@ -472,13 +402,13 @@ extern const ArrayFunctions g_array_funcs = {
    *
    *   Pre: fp.getContainer() == ad
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(AdvanceMArrayIter)
+  DISPATCH(AdvanceMArrayIter)
 
   /*
-   * ArrayData* EscalateForSort(ArrayData*)
+   * ArrayData* EscalateForSort(ArrayData*, SortFunction)
    *
    *   Must be called before calling any of the sort routines on an
-   *   array.  This gives arrays a chance to change to a kind that
+   *   array. This gives arrays a chance to change to a kind that
    *   supports sorting.
    */
   DISPATCH(EscalateForSort)
@@ -497,19 +427,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   Sort an array, by values, and then assign new keys to the
    *   elements in the resulting array.
    */
-  {
-    PackedArray::Sort,
-    MixedArray::Sort,
-    /* StrMapArray */
-    MixedArray::WarnAndSort,
-    /* IntMapArray */
-    MixedArray::WarnAndSort,
-    PackedArray::Sort,
-    EmptyArray::Sort,
-    APCLocalArray::Sort,
-    NameValueTableWrapper::Sort,
-    ProxyArray::Sort,
-  },
+  DISPATCH(Sort)
 
   /*
    * void Asort(int sort_flags, bool ascending)
@@ -536,19 +454,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   function (in the variant).  Returns false if the user-defined
    *   comparison function modifies the array we are sorting.
    */
-  {
-    PackedArray::Usort,
-    MixedArray::Usort,
-    /* StrMapArray */
-    MixedArray::WarnAndUsort,
-    /* IntMapArray */
-    MixedArray::WarnAndUsort,
-    PackedArray::Usort,
-    EmptyArray::Usort,
-    APCLocalArray::Usort,
-    NameValueTableWrapper::Usort,
-    ProxyArray::Usort,
-  },
+  DISPATCH(Usort)
 
   /*
    * bool Uasort(ArrayData*, const Variant&)
@@ -566,7 +472,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   Explicitly request that an array be copied.  This API does
    *   /not/ actually guarantee a copy occurs.
    *
-   *   (E.g. NameValueTableWrapper doesn't copy here.)
+   *   (E.g. GlobalsArray doesn't copy here.)
    */
   DISPATCH(Copy)
 
@@ -581,14 +487,14 @@ extern const ArrayFunctions g_array_funcs = {
   DISPATCH(CopyWithStrongIterators)
 
   /*
-   * ArrayData* NonSmartCopy(const ArrayData*)
+   * ArrayData* CopyStatic(const ArrayData*)
    *
    *   Copy an array, allocating the new array with malloc() instead
    *   of from the request local allocator.  This function does
    *   guarantee the returned array is a new copy---but it may throw a
    *   fatal error if this cannot be accomplished (e.g. for $GLOBALS).
    */
-  DISPATCH(NonSmartCopy)
+  DISPATCH(CopyStatic)
 
   /*
    * ArrayData* Append(ArrayData*, const Variant& v, bool copy)
@@ -597,7 +503,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   integer key.  If there is no next available integer key, no
    *   value is appended.  This function has copy/grow semantics.
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(Append)
+  DISPATCH(Append)
 
   /*
    * ArrayData* AppendRef(ArrayData*, Variant& v, bool copy)
@@ -608,7 +514,7 @@ extern const ArrayFunctions g_array_funcs = {
    *   If there is no next available integer key, this function does
    *   not append a value.  This function has copy/grow semantics.
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(AppendRef)
+  DISPATCH(AppendRef)
 
   /*
    * ArrayData* AppendWithRef(ArrayData*, const Variant& v, bool copy)
@@ -620,16 +526,14 @@ extern const ArrayFunctions g_array_funcs = {
    *   referenced"---i.e. if `v' is already KindOfRef and
    *   RefData::isReferenced is true.
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(AppendWithRef)
+  DISPATCH(AppendWithRef)
 
   /*
    * ArrayData* PlusEq(ArrayData*, const ArrayData* elems)
    *
    *    Performs array addition, logically mutating the first array.
    *    It may return a new array if the array needed to grow, or if
-   *    it needed to COW because hasMultipleRefs was true---in this
-   *    case the new returned array will already have a reference
-   *    count of 1.
+   *    it needed to COW because hasMultipleRefs was true.
    */
   DISPATCH(PlusEq)
 
@@ -638,28 +542,26 @@ extern const ArrayFunctions g_array_funcs = {
    *
    *   Perform part of the semantics of the php function array_merge.
    *   (Renumbering keys is not done by this routine currently.)
-   *
-   *   This function always produces a new array with reference count 1.
    */
   DISPATCH(Merge)
 
   /*
    * ArrayData* Pop(ArrayData*, Variant& value);
    *
-   *   Remove the last element from the array and assign it to
-   *   `value'.  This function may return a new (not yet incref'd)
-   *   array if it decided to COW due to hasMultipleRefs().
+   *   Remove the last element from the array and assign it to `value'.  This
+   *   function may return a new array if it decided to COW due to
+   *   hasMultipleRefs().
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(Pop)
+  DISPATCH(Pop)
 
   /*
    * ArrayData* Dequeue(ArrayData*, Variant& value)
    *
-   *   Remove the first element from the array and assign it to
-   *   `value'.  This function may return a new (not yet incref'd)
-   *   array if it decided to COW due to hasMultipleRefs().
+   *   Remove the first element from the array and assign it to `value'.  This
+   *   function may return a new array if it decided to COW due to
+   *   hasMultipleRefs().
    */
-  DISPATCH_MAP_ARRAY_SPECIALIZED(Dequeue)
+  DISPATCH(Dequeue)
 
   /*
    * ArrayData* Prepend(ArrayData*, const Variant& `v', bool copy)
@@ -705,10 +607,8 @@ extern const ArrayFunctions g_array_funcs = {
    */
   {
     &PackedArray::ZSetInt,
+    &StructArray::ZSetInt,
     &MixedArray::ZSetInt,
-    &MixedArray::ZSetInt,
-    &MixedArray::ZSetInt,
-    &PackedArray::ZSetInt,
     &ZSetIntThrow,
     &ZSetIntThrow,
     &ZSetIntThrow,
@@ -717,10 +617,8 @@ extern const ArrayFunctions g_array_funcs = {
 
   {
     &PackedArray::ZSetStr,
+    &StructArray::ZSetStr,
     &MixedArray::ZSetStr,
-    &MixedArray::ZSetStr,
-    &MixedArray::ZSetStr,
-    &PackedArray::ZSetStr,
     &ZSetStrThrow,
     &ZSetStrThrow,
     &ZSetStrThrow,
@@ -729,10 +627,8 @@ extern const ArrayFunctions g_array_funcs = {
 
   {
     &PackedArray::ZAppend,
+    &StructArray::ZAppend,
     &MixedArray::ZAppend,
-    &MixedArray::ZAppend,
-    &MixedArray::ZAppend,
-    &PackedArray::ZAppend,
     &ZAppendThrow,
     &ZAppendThrow,
     &ZAppendThrow,
@@ -740,10 +636,11 @@ extern const ArrayFunctions g_array_funcs = {
   },
 };
 
+// We create a copy so that we can install instrumentation shim-functions
+// instrument g_array_funcs at runtime.
+ArrayFunctions g_array_funcs = g_array_funcs_unmodified;
+
 #undef DISPATCH
-#undef DISPATCH_INTMAP_SPECIALIZED
-#undef DISPATCH_STRMAP_SPECIALIZED
-#undef DISPATCH_MAP_ARRAY_SPECIALIZED
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -772,8 +669,12 @@ ArrayData *ArrayData::Create(const Variant& value) {
 
 ArrayData *ArrayData::Create(const Variant& name, const Variant& value) {
   ArrayInit init(1, ArrayInit::Map{});
-  // There is no toKey() call on name.
-  init.set(name, value);
+  DEBUG_ONLY int64_t unused;
+  assertx(name.isString() ?
+         !name.getStringData()->isStrictlyInteger(unused) :
+         name.isInteger());
+
+  init.setValidKey(name, value);
   return init.create();
 }
 
@@ -785,7 +686,11 @@ ArrayData *ArrayData::CreateRef(Variant& value) {
 
 ArrayData *ArrayData::CreateRef(const Variant& name, Variant& value) {
   ArrayInit init(1, ArrayInit::Map{});
-  // There is no toKey() call on name.
+  DEBUG_ONLY int64_t unused;
+  assertx(name.isString() ?
+         !name.getStringData()->isStrictlyInteger(unused) :
+         name.isInteger());
+
   init.setRef(name, value, true);
   return init.create();
 }
@@ -802,16 +707,16 @@ int ArrayData::compare(const ArrayData *v2) const {
   if (count1 > count2) return 1;
   if (count1 == 0) return 0;
 
-  // prevent circular referenced objects/arrays or deep ones
-  DECLARE_THREAD_INFO; check_recursion(info);
+  // Prevent circular referenced objects/arrays or deep ones.
+  check_recursion_error();
 
   for (ArrayIter iter(this); iter; ++iter) {
     auto key = iter.first();
     if (!v2->exists(key)) return 1;
     auto value1 = iter.second();
     auto value2 = v2->get(key);
-    if (HPHP::more(value1, value2)) return 1;
-    if (HPHP::less(value1, value2)) return -1;
+    auto cmp = HPHP::compare(value1, value2);
+    if (cmp != 0) return cmp;
   }
 
   return 0;
@@ -826,8 +731,8 @@ bool ArrayData::equal(const ArrayData *v2, bool strict) const {
   if (count1 != count2) return false;
   if (count1 == 0) return true;
 
-  // prevent circular referenced objects/arrays or deep ones
-  DECLARE_THREAD_INFO; check_recursion(info);
+  // Prevent circular referenced objects/arrays or deep ones.
+  check_recursion_error();
 
   if (strict) {
     for (ArrayIter iter1(this), iter2(v2); iter1; ++iter1, ++iter2) {
@@ -914,36 +819,6 @@ Variant ArrayData::each() {
 ///////////////////////////////////////////////////////////////////////////////
 // helpers
 
-void ArrayData::serializeImpl(VariableSerializer *serializer) const {
-  serializer->writeArrayHeader(size(), isVectorData());
-  for (ArrayIter iter(this); iter; ++iter) {
-    serializer->writeArrayKey(iter.first());
-    serializer->writeArrayValue(iter.secondRef());
-  }
-  serializer->writeArrayFooter();
-}
-
-void ArrayData::serialize(VariableSerializer *serializer,
-                          bool skipNestCheck /* = false */) const {
-  if (size() == 0) {
-    serializer->writeArrayHeader(0, isVectorData());
-    serializer->writeArrayFooter();
-    return;
-  }
-  if (!skipNestCheck) {
-    if (serializer->incNestedLevel((void*)this)) {
-      serializer->writeOverflow((void*)this);
-    } else {
-      serializeImpl(serializer);
-    }
-    serializer->decNestedLevel((void*)this);
-  } else {
-    // If isObject, the array is temporary and we should not check or save
-    // its pointer.
-    serializeImpl(serializer);
-  }
-}
-
 const Variant& ArrayData::get(const Variant& k, bool error) const {
   assert(IsValidKey(k));
   auto const cell = k.asCell();
@@ -962,12 +837,12 @@ const Variant& ArrayData::getNotFound(const StringData* k) {
 }
 
 const Variant& ArrayData::getNotFound(int64_t k, bool error) const {
-  return error && m_kind != kNvtwKind ? getNotFound(k) :
+  return error && kind() != kGlobalsKind ? getNotFound(k) :
          null_variant;
 }
 
 const Variant& ArrayData::getNotFound(const StringData* k, bool error) const {
-  return error && m_kind != kNvtwKind ? getNotFound(k) :
+  return error && kind() != kGlobalsKind ? getNotFound(k) :
          null_variant;
 }
 
@@ -982,15 +857,13 @@ const Variant& ArrayData::getNotFound(const Variant& k) {
 }
 
 const char* ArrayData::kindToString(ArrayKind kind) {
-  std::array<const char*,9> names = {{
+  std::array<const char*,7> names = {{
     "PackedKind",
+    "StructKind",
     "MixedKind",
-    "StrMapKind",
-    "IntMapKind",
-    "VPackedKind",
     "EmptyKind",
-    "SharedKind",
-    "NvtwKind",
+    "ApcKind",
+    "GlobalsKind",
     "ProxyKind",
   }};
   static_assert(names.size() == kNumKinds, "add new kinds here");

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,13 +18,16 @@
 
 #include "hphp/runtime/base/arch.h"
 #include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/ext/ext_generator.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
 #include "hphp/runtime/vm/bytecode.h"
 #include "hphp/runtime/vm/func.h"
 #include "hphp/runtime/vm/hhbc.h"
-#include "hphp/runtime/vm/srckey.h"
+#include "hphp/runtime/vm/jit/irgen.h"
 #include "hphp/runtime/vm/jit/normalized-instruction.h"
+#include "hphp/runtime/vm/jit/prof-data.h"
 #include "hphp/runtime/vm/jit/region-selection.h"
+#include "hphp/runtime/vm/jit/trans-cfg.h"
+#include "hphp/runtime/vm/srckey.h"
 
 #include "hphp/util/trace.h"
 
@@ -42,12 +45,24 @@ bool traceRefusal(const Func* caller, const Func* callee, const char* why) {
   if (Trace::enabled) {
     UNUSED auto calleeName = callee ? callee->fullName()->data()
                                     : "(unknown)";
-    assert(caller);
+    assertx(caller);
 
     FTRACE(1, "InliningDecider: refusing {}() <- {}{}\t<reason: {}>\n",
            caller->fullName()->data(), calleeName, callee ? "()" : "", why);
   }
   return false;
+}
+
+std::atomic<bool> hasCalledDisableInliningIntrinsic;
+hphp_hash_set<const StringData*,
+                    string_data_hash,
+                    string_data_isame> forbiddenInlinees;
+SimpleMutex forbiddenInlineesLock;
+
+bool inliningIsForbiddenFor(const Func* callee) {
+  if (!hasCalledDisableInliningIntrinsic.load()) return false;
+  SimpleLock locker(forbiddenInlineesLock);
+  return forbiddenInlinees.find(callee->fullName()) != forbiddenInlinees.end();
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -57,7 +72,7 @@ bool traceRefusal(const Func* caller, const Func* callee, const char* why) {
  * Check if the funcd of `inst' has any characteristics which prevent inlining,
  * without peeking into its bytecode or regions.
  */
-bool isCalleeInlinable(const SrcKey& callSK, const Func* callee) {
+bool isCalleeInlinable(SrcKey callSK, const Func* callee) {
   auto refuse = [&] (const char* why) {
     return traceRefusal(callSK.func(), callee, why);
   };
@@ -65,17 +80,29 @@ bool isCalleeInlinable(const SrcKey& callSK, const Func* callee) {
   if (!callee) {
     return refuse("callee not known");
   }
+  if (inliningIsForbiddenFor(callee)) {
+    return refuse("inlining disabled for callee");
+  }
   if (callee == callSK.func()) {
     return refuse("call is recursive");
   }
   if (callee->hasVariadicCaptureParam()) {
-    return refuse("callee has variadic capture");
+    if (callee->attrs() & AttrMayUseVV) {
+      return refuse("callee has variadic capture and MayUseVV");
+    }
+    // Refuse if the variadic parameter actually captures something.
+    auto pc = callSK.pc();
+    auto const numArgs = getImm(pc, 0).u_IVA;
+    auto const numParams = callee->numParams();
+    if (numArgs >= numParams) {
+      return refuse("callee has variadic capture with non-empty value");
+    }
   }
   if (callee->numIterators() != 0) {
     return refuse("callee has iterators");
   }
-  if (callee->isMagic() || Func::isSpecial(callee->name())) {
-    return refuse("special or magic callee");
+  if (callee->isMagic()) {
+    return refuse("magic callee");
   }
   if (callee->isResumable()) {
     return refuse("callee is resumable");
@@ -83,7 +110,7 @@ bool isCalleeInlinable(const SrcKey& callSK, const Func* callee) {
   if (callee->maxStackCells() >= kStackCheckLeafPadding) {
     return refuse("function stack depth too deep");
   }
-  if (callee->isMethod() && callee->cls() == c_Generator::classof()) {
+  if (callee->isMethod() && callee->cls() == Generator::getClass()) {
     return refuse("generator member function");
   }
   return true;
@@ -92,14 +119,14 @@ bool isCalleeInlinable(const SrcKey& callSK, const Func* callee) {
 /*
  * Check that we don't have any missing or extra arguments.
  */
-bool checkNumArgs(const SrcKey& callSK, const Func* callee) {
-  assert(callee);
+bool checkNumArgs(SrcKey callSK, const Func* callee) {
+  assertx(callee);
 
   auto refuse = [&] (const char* why) {
     return traceRefusal(callSK.func(), callee, why);
   };
 
-  auto pc = reinterpret_cast<const Op*>(callSK.pc());
+  auto pc = callSK.pc();
   auto const numArgs = getImm(pc, 0).u_IVA;
   auto const numParams = callee->numParams();
 
@@ -111,7 +138,8 @@ bool checkNumArgs(const SrcKey& callSK, const Func* callee) {
   // as the gap can be filled in by DV funclets.
   for (auto i = numArgs; i < numParams; ++i) {
     auto const& param = callee->params()[i];
-    if (!param.hasDefaultValue()) {
+    if (!param.hasDefaultValue() &&
+        (i < numParams - 1 || !callee->hasVariadicCaptureParam())) {
       return refuse("callee called with too few arguments");
     }
   }
@@ -119,89 +147,39 @@ bool checkNumArgs(const SrcKey& callSK, const Func* callee) {
   return true;
 }
 
-/*
- * Check that the FPI region is suitable for inlining.
- *
- * We refuse to inline if the corresponding FPush is not found in the same
- * region as the FCall, or if other calls are made between the two.
- */
-bool checkFPIRegion(const SrcKey& callSK, const Func* callee,
-                    const RegionDesc& region) {
-  assert(callee);
-
-  auto refuse = [&] (const char* why) {
-    return traceRefusal(callSK.func(), callee, why);
-  };
-
-  // Check that the FPush instruction is in the same region, and that our FCall
-  // is reachable from it.
-  //
-  // TODO(#4603302) Fix this once SrcKeys can appear multiple times in a region.
-  auto fpi = callSK.func()->findFPI(callSK.offset());
-  const SrcKey pushSK { callSK.func(),
-                        fpi->m_fpushOff,
-                        callSK.resumed() };
-  int pushBlock = -1;
-
-  auto const& blocks = region.blocks();
-  for (unsigned i = 0; i < blocks.size(); ++i) {
-    if (blocks[i]->contains(pushSK)) {
-      pushBlock = i;
-      break;
-    }
-  }
-  if (pushBlock == -1) {
-    return refuse("FPush* is not in the current region");
-  }
-
-  // Check that we have an acceptable FPush.
-  switch (pushSK.op()) {
-    case OpFPushClsMethodD:
-      if (callee->mayHaveThis()) {
-        return refuse("callee may have $this pointer");
-      }
-      // fallthrough
-    case OpFPushFuncD:
-    case OpFPushObjMethodD:
-    case OpFPushCtorD:
-    case OpFPushCtor:
-      break;
-
-    default:
-      return refuse(folly::format("unsupported push op {}",
-                                  opcodeToName(pushSK.op())).str().c_str());
-  }
-
-  // Calls invalidate all live SSATmps, so don't allow any in the FPI region.
-  for (unsigned i = pushBlock; i < blocks.size(); ++i) {
-    auto const& block = *blocks[i];
-
-    auto iterSK = (i == pushBlock ? pushSK.advanced()
-                                  : block.start());
-    while (iterSK <= block.last()) {
-      // We're all set once we've hit the to-be-inlined FCall.
-      if (iterSK == callSK) return true;
-
-      auto op = iterSK.op();
-
-      if (isFCallStar(op) || op == Op::FCallBuiltin) {
-        return refuse("FPI region contains another call");
-      }
-      iterSK.advance();
-    }
-  }
-
-  not_reached();
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 }
 
-bool InliningDecider::canInlineAt(const SrcKey& callSK, const Func* callee,
-                                  const RegionDesc& region) const {
-  if (!RuntimeOption::RepoAuthoritative ||
-      !RuntimeOption::EvalHHIREnableGenTimeInlining) {
+void InliningDecider::forbidInliningOf(const Func* callee) {
+  hasCalledDisableInliningIntrinsic.store(true);
+  SimpleLock locker(forbiddenInlineesLock);
+  forbiddenInlinees.insert(callee->fullName());
+}
+
+bool InliningDecider::canInlineAt(SrcKey callSK, const Func* callee) const {
+  if (!callee || !RuntimeOption::EvalHHIREnableGenTimeInlining) {
     return false;
+  }
+
+  assert(!RuntimeOption::EvalJitEnableRenameFunction);
+  if (callee->cls()) {
+    if (!rds::isPersistentHandle(callee->cls()->classHandle())) {
+      // if the callee's class is not persistent, its still ok
+      // to use it if we're jitting into a method of a subclass
+      auto ctx = callSK.func()->cls();
+      if (!ctx || !ctx->classof(callee->cls())) {
+        return false;
+      }
+    }
+  } else {
+    if (!rds::isPersistentHandle(callee->funcHandle())) {
+      // if the callee isn't persistent, its still ok to
+      // use it if its defined at the top level in the same
+      // unit as the caller
+      if (callee->unit() != callSK.unit() || !callee->top()) {
+        return false;
+      }
+    }
   }
 
   // If inlining was disabled... don't inline.
@@ -225,9 +203,7 @@ bool InliningDecider::canInlineAt(const SrcKey& callSK, const Func* callee,
   // TODO(#4238160): Inlining into pseudomain callsites is still buggy.
   if (callSK.func()->isPseudoMain()) return false;
 
-  if (!isCalleeInlinable(callSK, callee) ||
-      !checkNumArgs(callSK, callee) ||
-      !checkFPIRegion(callSK, callee, region)) {
+  if (!isCalleeInlinable(callSK, callee) || !checkNumArgs(callSK, callee)) {
     return false;
   }
 
@@ -242,12 +218,13 @@ namespace {
  * Check if a builtin is inlinable.
  */
 bool isInlinableCPPBuiltin(const Func* f) {
-  assert(f->isCPPBuiltin());
+  assertx(f->isCPPBuiltin());
 
   // The callee needs to be callable with FCallBuiltin, because NativeImpl
   // requires a frame.
-  if (f->attrs() & AttrNoFCallBuiltin ||
-      f->numParams() > Native::maxFCallBuiltinArgs() ||
+  if (!RuntimeOption::EvalEnableCallBuiltin ||
+      (f->attrs() & AttrNoFCallBuiltin) ||
+      (f->numParams() > Native::maxFCallBuiltinArgs()) ||
       !f->nativeFuncPtr()) {
     return false;
   }
@@ -261,8 +238,7 @@ bool isInlinableCPPBuiltin(const Func* f) {
   if (auto const info = f->methInfo()) {
     if (info->attribute & (ClassInfo::NoFCallBuiltin |
                            ClassInfo::VariableArguments |
-                           ClassInfo::RefVariableArguments |
-                           ClassInfo::MixedVariableArguments)) {
+                           ClassInfo::RefVariableArguments)) {
       return false;
     }
     // Note: there is no need for a similar-to-the-above check for HNI
@@ -272,25 +248,6 @@ bool isInlinableCPPBuiltin(const Func* f) {
 
   // For now, don't inline when we'd need to adjust ObjectData pointers.
   if (f->cls() && f->cls()->preClass()->builtinODOffset() != 0) {
-    return false;
-  }
-
-  // Right now, the IR isn't prepared to do parameter coercing during an
-  // inlining of NativeImpl for any of our param modes.  We'll want to expand
-  // this in the short term, but for now we're targeting collection member
-  // functions, which are (a) IDL-based (so no HNI support here yet), and (b)
-  // take `const Variant&` for every param.
-  //
-  // So for now, we only inline when the params are Variants.
-  for (auto i = uint32_t{0}; i < f->numParams(); ++i) {
-    if (f->params()[i].builtinType != KindOfUnknown) {
-      if (f->isParamCoerceMode()) return false;
-    }
-  }
-
-  // Static methods need to be passed their class, which we don't
-  // support yet.
-  if (f->isMethod() && (f->attrs() & AttrStatic)) {
     return false;
   }
 
@@ -331,10 +288,11 @@ bool isInliningVVSafe(Op op) {
 }
 
 bool InliningDecider::shouldInline(const Func* callee,
-                                   const RegionDesc& region) {
+                                   const RegionDesc& region,
+                                   bool& needsMerge) {
   auto sk = region.empty() ? SrcKey() : region.start();
-  assert(callee);
-  assert(sk.func() == callee);
+  assertx(callee);
+  assertx(sk.func() == callee);
 
   int cost = 0;
 
@@ -364,9 +322,19 @@ bool InliningDecider::shouldInline(const Func* callee,
     return refuse("inlining stack depth limit exceeded");
   }
 
+  // Even if the func contains NativeImpl we may have broken the trace before
+  // we hit it.
+  auto containsNativeImpl = [&] {
+    for (auto block : region.blocks()) {
+      if (!block->empty() && block->last().op() == OpNativeImpl) return true;
+    }
+    return false;
+  };
+
   // Try to inline CPP builtin functions.
-  if (callee->isCPPBuiltin() &&
-      static_cast<Op>(*callee->getEntry()) == Op::NativeImpl) {
+  // The NativeImpl opcode may appear later in the function because of Asserts
+  // generated in hhbbc
+  if (callee->isCPPBuiltin() && containsNativeImpl()) {
     if (isInlinableCPPBuiltin(callee)) {
       return accept("inlinable CPP builtin");
     }
@@ -411,8 +379,8 @@ bool InliningDecider::shouldInline(const Func* callee,
       }
 
       // Count the returns.
-      if (isRet(op) || op == Op::NativeImpl) {
-        if (++numRets > 1) {
+      if (isReturnish(op)) {
+        if (++numRets > RuntimeOption::EvalHHIRInliningMaxReturns) {
           return refuse("region has too many returns");
         }
         continue;
@@ -429,7 +397,7 @@ bool InliningDecider::shouldInline(const Func* callee,
       cost += 1;
 
       // Add the size of immediate vectors to the cost.
-      auto const pc = reinterpret_cast<const Op*>(sk.pc());
+      auto const pc = sk.pc();
       if (hasMVector(op)) {
         cost += getMVector(pc).size();
       } else if (hasImmVector(op)) {
@@ -443,9 +411,10 @@ bool InliningDecider::shouldInline(const Func* callee,
     }
   }
 
-  if (numRets != 1) {
+  if (numRets == 0) {
     return refuse("region has no returns");
   }
+  needsMerge = numRets > 1;
   return accept("small region with single return");
 }
 
@@ -458,6 +427,115 @@ void InliningDecider::registerEndInlining(const Func* callee) {
   m_cost -= cost;
   m_callDepth -= 1;
   m_stackDepth -= callee->maxStackCells();
+}
+
+namespace {
+RegionDescPtr selectCalleeTracelet(const Func* callee,
+                                   const int numArgs,
+                                   std::vector<Type>& argTypes,
+                                   int32_t maxBCInstrs) {
+  auto const numParams = callee->numParams();
+
+  // Set up the RegionContext for the tracelet selector.
+  RegionContext ctx;
+  ctx.func = callee;
+  ctx.bcOffset = callee->getEntryForNumArgs(numArgs);
+  ctx.spOffset = FPInvOffset{safe_cast<int32_t>(callee->numSlotsInFrame())};
+  ctx.resumed = false;
+
+  for (uint32_t i = 0; i < numArgs; ++i) {
+    auto type = argTypes[i];
+    assertx((type <= TGen) || (type <= TCls));
+    ctx.liveTypes.push_back({RegionDesc::Location::Local{i}, type});
+  }
+
+  for (unsigned i = numArgs; i < numParams; ++i) {
+    // These locals will be populated by DV init funclets but they'll start out
+    // as Uninit.
+    ctx.liveTypes.push_back({RegionDesc::Location::Local{i}, TUninit});
+  }
+
+  // Produce a tracelet for the callee.
+  return selectTracelet(ctx, maxBCInstrs, false /* profiling */,
+                        true /* inlining */);
+}
+
+TransID findTransIDForCallee(const Func* callee, const int numArgs,
+                             std::vector<Type>& argTypes) {
+  using LTag = RegionDesc::Location::Tag;
+
+  auto const profData = mcg->tx().profData();
+  auto const idvec = profData->funcProfTransIDs(callee->getFuncId());
+
+  auto const offset = callee->getEntryForNumArgs(numArgs);
+  for (auto const id : idvec) {
+    if (profData->transStartBcOff(id) != offset) continue;
+    auto const region = profData->transRegion(id);
+
+    auto const isvalid = [&] () {
+      for (auto const& typeloc : region->entry()->typePreConditions()) {
+        if (typeloc.location.tag() != LTag::Local) continue;
+        auto const locId = typeloc.location.localId();
+
+        if (locId < numArgs && !(argTypes[locId] <= typeloc.type)) {
+          return false;
+        }
+      }
+      return true;
+    }();
+
+    if (isvalid) return id;
+  }
+  return kInvalidTransID;
+}
+
+RegionDescPtr selectCalleeCFG(const Func* callee, const int numArgs,
+                              std::vector<Type>& argTypes,
+                              int32_t maxBCInstrs) {
+  auto const profData = mcg->tx().profData();
+  if (!profData || !profData->profiling(callee->getFuncId())) return nullptr;
+
+  auto const dvID = findTransIDForCallee(callee, numArgs, argTypes);
+  if (dvID == kInvalidTransID) {
+    return nullptr;
+  }
+
+  TransIDSet selectedTIDs;
+  TransCFG cfg(callee->getFuncId(), profData, mcg->tx().getSrcDB(),
+               mcg->getJmpToTransIDMap(), true /* inlining */);
+
+  return selectHotCFG(dvID, profData, cfg, maxBCInstrs, selectedTIDs,
+                      nullptr /* selectedVec */, true /* inlining */);
+}
+}
+
+RegionDescPtr selectCalleeRegion(const SrcKey& sk,
+                                 const Func* callee,
+                                 const IRGS& irgs,
+                                 int32_t maxBCInstrs) {
+  auto const op = sk.pc();
+  auto const numArgs = getImm(op, 0).u_IVA;
+
+  std::vector<Type> argTypes;
+  for (int i = numArgs - 1; i >= 0; --i) {
+    // DataTypeGeneric is used because we're just passing the locals into the
+    // callee.  It's up to the callee to constrain further if needed.
+    auto type = irgen::publicTopType(irgs, BCSPOffset{i});
+
+    // If we don't have sufficient type information to inline the region
+    // return early
+    if (!(type <= TGen) && !(type <= TCls)) return nullptr;
+    argTypes.push_back(type);
+  }
+
+  if (RuntimeOption::EvalInlineRegionMode != "tracelet" &&
+      RuntimeOption::EvalJitPGO && !mcg->tx().profData()->freed()) {
+    auto region = selectCalleeCFG(callee, numArgs, argTypes, maxBCInstrs);
+    if (region) return region;
+    if (RuntimeOption::EvalInlineRegionMode != "both") return nullptr;
+  }
+
+  return selectCalleeTracelet(callee, numArgs, argTypes, maxBCInstrs);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

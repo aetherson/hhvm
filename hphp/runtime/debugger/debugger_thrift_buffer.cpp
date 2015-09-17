@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -25,14 +25,14 @@ TRACE_SET_MOD(debugger);
 String DebuggerThriftBuffer::readImpl() {
   TRACE(7, "DebuggerThriftBuffer::readImpl\n");
   assert(m_size <= BUFFER_SIZE);
-  int nread = m_socket->readImpl(m_buffer, m_size);
+  int nread = getSocket()->readImpl(m_buffer, m_size);
   m_buffer[nread] = '\0';
   return String(m_buffer, nread, CopyString);
 }
 
 void DebuggerThriftBuffer::flushImpl(const String& data) {
   TRACE(7, "DebuggerThriftBuffer::flushImpl\n");
-  m_socket->write(data);
+  getSocket()->write(data);
 }
 
 void DebuggerThriftBuffer::throwError(const char *msg, int code) {

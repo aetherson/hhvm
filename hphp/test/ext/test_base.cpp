@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,8 +18,8 @@
 #include <sys/param.h>
 #include "hphp/compiler/option.h"
 #include "hphp/test/ext/test.h"
-#include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/ext/ext_array.h"
+#include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/ext/array/ext_array.h"
 #include "hphp/runtime/ext/std/ext_std_variable.h"
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -73,7 +73,7 @@ bool TestBase::VerifyClose(const char *exp1, const char *exp2,
 }
 
 bool TestBase::array_value_exists(const Variant& var, const Variant& value) {
-  bool found = !same(f_array_search(value, var.toArray()), false);
+  bool found = !same(HHVM_FN(array_search)(value, var.toArray()), false);
   if (!found) {
     HHVM_FN(var_dump)(var);
   }

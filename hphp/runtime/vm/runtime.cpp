@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,28 +15,26 @@
 */
 #include "hphp/runtime/vm/runtime.h"
 #include "hphp/runtime/base/execution-context.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/server/source-root-info.h"
 #include "hphp/runtime/base/zend-string.h"
 #include "hphp/runtime/base/mixed-array.h"
 #include "hphp/runtime/base/builtin-functions.h"
 #include "hphp/runtime/base/thread-info.h"
 #include "hphp/runtime/ext/ext_closure.h"
-#include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/generator/ext_generator.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 #include "hphp/runtime/vm/bytecode.h"
 #include "hphp/runtime/vm/repo.h"
 #include "hphp/util/trace.h"
 #include "hphp/util/text-util.h"
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/base/zend-functions.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 
 namespace HPHP {
 
 TRACE_SET_MOD(runtime);
 
-CompileStringAST g_hphp_compiler_serialize_code_model_for;
 CompileStringFn g_hphp_compiler_parse;
 BuildNativeFuncUnitFn g_hphp_build_native_func_unit;
 BuildNativeClassUnitFn g_hphp_build_native_class_unit;
@@ -71,7 +69,6 @@ void print_boolean(bool val) {
 StringData* concat_ss(StringData* v1, StringData* v2) {
   if (v1->hasMultipleRefs()) {
     StringData* ret = StringData::Make(v1, v2);
-    ret->setRefCount(1);
     // Because v1->getCount() is greater than 1, we know we will never
     // have to release the string here
     v1->decRefCount();
@@ -82,7 +79,6 @@ StringData* concat_ss(StringData* v1, StringData* v2) {
   if (UNLIKELY(ret != v1)) {
     assert(v1->hasExactlyOneRef());
     v1->release();
-    ret->incRefCount();
   }
   return ret;
 }
@@ -94,10 +90,8 @@ StringData* concat_is(int64_t v1, StringData* v2) {
   char intbuf[21];
   // Convert the int to a string
   auto const s1 = conv_10(v1, intbuf + sizeof(intbuf));
-  StringSlice s2 = v2->slice();
-  StringData* ret = StringData::Make(s1, s2);
-  ret->incRefCount();
-  return ret;
+  auto const s2 = v2->slice();
+  return StringData::Make(s1, s2);
 }
 
 /**
@@ -110,7 +104,6 @@ StringData* concat_si(StringData* v1, int64_t v2) {
   if (v1->hasMultipleRefs()) {
     auto const s1 = v1->slice();
     auto const ret = StringData::Make(s1, s2);
-    ret->setRefCount(1);
     // Because v1->getCount() is greater than 1, we know we will never
     // have to release the string here
     v1->decRefCount();
@@ -121,7 +114,6 @@ StringData* concat_si(StringData* v1, int64_t v2) {
   if (UNLIKELY(ret != v1)) {
     assert(v1->hasExactlyOneRef());
     v1->release();
-    ret->incRefCount();
   }
   return ret;
 }
@@ -129,8 +121,7 @@ StringData* concat_si(StringData* v1, int64_t v2) {
 StringData* concat_s3(StringData* v1, StringData* v2, StringData* v3) {
   if (v1->hasMultipleRefs()) {
     StringData* ret = StringData::Make(
-        v1->slice(), v2->slice(), v3->slice());
-    ret->setRefCount(1);
+      v1->slice(), v2->slice(), v3->slice());
     // Because v1->getCount() is greater than 1, we know we will never
     // have to release the string here
     v1->decRefCount();
@@ -142,7 +133,6 @@ StringData* concat_s3(StringData* v1, StringData* v2, StringData* v3) {
   if (UNLIKELY(ret != v1)) {
     assert(v1->hasExactlyOneRef());
     v1->release();
-    ret->incRefCount();
   }
   return ret;
 }
@@ -152,7 +142,6 @@ StringData* concat_s4(StringData* v1, StringData* v2,
   if (v1->hasMultipleRefs()) {
     StringData* ret = StringData::Make(
         v1->slice(), v2->slice(), v3->slice(), v4->slice());
-    ret->setRefCount(1);
     // Because v1->getCount() is greater than 1, we know we will never
     // have to release the string here
     v1->decRefCount();
@@ -164,7 +153,6 @@ StringData* concat_s4(StringData* v1, StringData* v2,
   if (UNLIKELY(ret != v1)) {
     assert(v1->hasExactlyOneRef());
     v1->release();
-    ret->incRefCount();
   }
   return ret;
 }
@@ -189,7 +177,7 @@ Unit* compile_string(const char* s,
                      const char* fname /* = nullptr */) {
   auto md5string = string_md5(s, sz);
   MD5 md5(md5string.c_str());
-  Unit* u = Repo::get().loadUnit(fname ? fname : "", md5);
+  Unit* u = Repo::get().loadUnit(fname ? fname : "", md5).release();
   if (u != nullptr) {
     return u;
   }
@@ -207,8 +195,8 @@ Unit* compile_systemlib_string(const char* s, size_t sz,
     if (Repo::get().findFile(systemName.data(),
                              SourceRootInfo::GetCurrentSourceRoot(),
                              md5)) {
-      if (auto const u = Repo::get().loadUnit(fname, md5)) {
-        return u;
+      if (auto u = Repo::get().loadUnit(fname, md5)) {
+        return u.release();
       }
     }
   }
@@ -223,7 +211,7 @@ int init_closure(ActRec* ar, TypedValue* sp) {
   c_Closure* closure = static_cast<c_Closure*>(ar->getThis());
 
   // Swap in the $this or late bound class or null if it is ony from a plain
-  // function or psuedomain
+  // function or pseudomain
   ar->setThisOrClassAllowNull(closure->getThisOrClass());
 
   if (ar->hasThis()) {
@@ -262,73 +250,8 @@ void raiseArrayIndexNotice(const int64_t index) {
   raise_notice("Undefined index: %" PRId64, index);
 }
 
-//////////////////////////////////////////////////////////////////////
-
-const StaticString
-  s_HH_Traversable("HH\\Traversable"),
-  s_HH_KeyedTraversable("HH\\KeyedTraversable"),
-  s_HH_Container("HH\\Container"),
-  s_HH_KeyedContainer("HH\\KeyedContainer"),
-  s_Indexish("Indexish"),
-  s_XHPChild("XHPChild"),
-  s_Stringish("Stringish");
-
-bool interface_supports_non_objects(const StringData* s) {
-  return (s->isame(s_HH_Traversable.get()) ||
-          s->isame(s_HH_KeyedTraversable.get()) ||
-          s->isame(s_HH_Container.get()) ||
-          s->isame(s_HH_KeyedContainer.get()) ||
-          s->isame(s_Indexish.get()) ||
-          s->isame(s_XHPChild.get()) ||
-          s->isame(s_Stringish.get()));
-}
-
-bool interface_supports_array(const StringData* s) {
-  return (s->isame(s_HH_Traversable.get()) ||
-          s->isame(s_HH_KeyedTraversable.get()) ||
-          s->isame(s_HH_Container.get()) ||
-          s->isame(s_HH_KeyedContainer.get()) ||
-          s->isame(s_Indexish.get()) ||
-          s->isame(s_XHPChild.get()));
-}
-
-bool interface_supports_array(const std::string& n) {
-  const char* s = n.c_str();
-  return ((n.size() == 14 && !strcasecmp(s, "HH\\Traversable")) ||
-          (n.size() == 19 && !strcasecmp(s, "HH\\KeyedTraversable")) ||
-          (n.size() == 12 && !strcasecmp(s, "HH\\Container")) ||
-          (n.size() == 17 && !strcasecmp(s, "HH\\KeyedContainer")) ||
-          (n.size() == 8 && !strcasecmp(s, "Indexish")) ||
-          (n.size() == 8 && !strcasecmp(s, "XHPChild")));
-}
-
-bool interface_supports_string(const StringData* s) {
-  return s->isame(s_XHPChild.get())
-    || s->isame(s_Stringish.get());
-}
-
-bool interface_supports_string(const std::string& n) {
-  const char *s = n.c_str();
-  return (n.size() == 8 && !strcasecmp(s, "XHPChild"))
-    || (n.size() == 9 && !strcasecmp(s, "Stringish"));
-}
-
-bool interface_supports_int(const StringData* s) {
-  return (s->isame(s_XHPChild.get()));
-}
-
-bool interface_supports_int(const std::string& n) {
-  const char *s = n.c_str();
-  return (n.size() == 8 && !strcasecmp(s, "XHPChild"));
-}
-
-bool interface_supports_double(const StringData* s) {
-  return (s->isame(s_XHPChild.get()));
-}
-
-bool interface_supports_double(const std::string& n) {
-  const char *s = n.c_str();
-  return (n.size() == 8 && !strcasecmp(s, "XHPChild"));
+void raiseArrayKeyNotice(const StringData* key) {
+  raise_notice("Undefined key: %s", key->data());
 }
 
 //////////////////////////////////////////////////////////////////////

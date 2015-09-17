@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -60,8 +60,8 @@ void AsyncFuncImpl::start() {
   pthread_attr_init(&m_attr);
 
   if (getrlimit(RLIMIT_STACK, &rlim) != 0 || rlim.rlim_cur == RLIM_INFINITY ||
-      rlim.rlim_cur < m_stackSizeMinimum) {
-    rlim.rlim_cur = m_stackSizeMinimum;
+      rlim.rlim_cur < kStackSizeMinimum) {
+    rlim.rlim_cur = kStackSizeMinimum;
   }
 
   // On Success use the allocated memory for the thread's stack

@@ -1,7 +1,7 @@
 #ifndef incl_HPHP_ICU_COLLATOR_H
 #define incl_HPHP_ICU_COLLATOR_H
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/ext/icu/icu.h"
 
 #include <unicode/ucol.h>
@@ -15,7 +15,7 @@ class Collator : public IntlError {
   Collator() {}
   Collator(const Collator&) = delete;
   Collator& operator=(const Collator& src) {
-    *this = src;
+    IntlError::operator =(src);
     char stack[U_COL_SAFECLONE_BUFFERSIZE];
     int32_t stack_size = sizeof(stack);
     UErrorCode error = U_ZERO_ERROR;

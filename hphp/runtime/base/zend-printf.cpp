@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1998-2010 Zend Technologies Ltd. (http://www.zend.com) |
    +----------------------------------------------------------------------+
    | This source file is subject to version 2.00 of the Zend license,     |
@@ -16,13 +16,15 @@
 */
 
 #include "hphp/runtime/base/zend-printf.h"
-#include "hphp/runtime/base/zend-strtod.h"
-#include "hphp/runtime/base/zend-string.h"
-#include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/base/type-conversions.h"
-#include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/base/array-iterator.h"
+
 #include <math.h>
+
+#include "hphp/runtime/base/array-iterator.h"
+#include "hphp/runtime/base/builtin-functions.h"
+#include "hphp/runtime/base/string-buffer.h"
+#include "hphp/runtime/base/type-conversions.h"
+#include "hphp/runtime/base/zend-string.h"
+#include "hphp/runtime/base/zend-strtod.h"
 
 #if defined(__APPLE__)
 #ifndef isnan
@@ -170,7 +172,7 @@ static char * __cvt(double value, int ndigit, int *decpt, int *sign,
   if (value == 0.0) {
     *decpt = 1 - fmode; /* 1 for 'e', 0 for 'f' */
     *sign = 0;
-    if ((rve = s = (char *)smart_malloc(ndigit?siz:2)) == nullptr) {
+    if ((rve = s = (char *)req::malloc(ndigit?siz:2)) == nullptr) {
       return(nullptr);
     }
     *rve++ = '0';
@@ -191,7 +193,7 @@ static char * __cvt(double value, int ndigit, int *decpt, int *sign,
     if (pad && fmode) {
       siz += *decpt;
     }
-    if ((s = (char *)smart_malloc(siz+1)) == nullptr) {
+    if ((s = (char *)req::malloc(siz+1)) == nullptr) {
       zend_freedtoa(p);
       return(nullptr);
     }
@@ -487,7 +489,7 @@ char * php_conv_fp(register char format, register double num,
     *len = strlen(p);
     memcpy(buf, p, *len + 1);
     *is_negative = 0;
-    smart_free(p_orig);
+    req::free(p_orig);
     return (buf);
   }
   if (format == 'F') {
@@ -551,7 +553,7 @@ char * php_conv_fp(register char format, register double num,
     }
   }
   *len = s - buf;
-  smart_free(p_orig);
+  req::free(p_orig);
   return (buf);
 }
 
@@ -705,12 +707,22 @@ inline static void appenddouble(StringBuffer *buffer,
     return;
   }
 
+#if defined(HAVE_LOCALE_H)
+  struct lconv *lconv;
+  lconv = localeconv();
+# define APPENDDOUBLE_LCONV_DECIMAL_POINT (*lconv->decimal_point)
+#else
+# define APPENDDOUBLE_LCONV_DECIMAL_POINT '.'
+#endif
+
   switch (fmt) {
   case 'e':
   case 'E':
   case 'f':
   case 'F':
-    s = php_conv_fp((fmt == 'f')?'F':fmt, number, 0, precision, '.',
+    s = php_conv_fp((fmt == 'f')?'F':fmt,
+                    number, 0, precision,
+                    (fmt == 'f')?APPENDDOUBLE_LCONV_DECIMAL_POINT:'.',
                     &is_negative, &num_buf[1], &s_len);
     if (is_negative) {
       num_buf[0] = '-';
@@ -730,7 +742,10 @@ inline static void appenddouble(StringBuffer *buffer,
     /*
      * * We use &num_buf[ 1 ], so that we have room for the sign
      */
-    s = php_gcvt(number, precision, '.', (fmt == 'G')?'E':'e', &num_buf[1]);
+    s = php_gcvt(number, precision,
+                 APPENDDOUBLE_LCONV_DECIMAL_POINT,
+                 (fmt == 'G')?'E':'e',
+                 &num_buf[1]);
     is_negative = 0;
     if (*s == '-') {
       is_negative = 1;

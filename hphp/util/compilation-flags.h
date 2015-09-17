@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,15 +15,6 @@
 */
 #ifndef incl_HPHP_COMPILATION_FLAGS_H_
 #define incl_HPHP_COMPILATION_FLAGS_H_
-
-#ifndef INSTALL_PREFIX
-# if defined(__APPLE__) || defined(__FreeBSD__) || \
-     defined(__OpenBSD__) || defined(__NetBSD__)
-#  define INSTALL_PREFIX "/usr/local"
-# else
-#  define INSTALL_PREFIX ""
-# endif
-#endif
 
 namespace HPHP {
 
@@ -48,16 +39,16 @@ const bool debug =
 #endif
   ;
 
-const bool packed_tv =
-#ifdef PACKED_TV
+const bool contiguous_heap =
+#if CONTIGUOUS_HEAP
   true
 #else
   false
 #endif
   ;
 
-const bool memory_profiling =
-#ifdef MEMORY_PROFILING
+const bool hhvm_reuse_tc =
+#ifdef HHVM_REUSE_TC
   true
 #else
   false

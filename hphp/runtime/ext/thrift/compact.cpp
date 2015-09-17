@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -15,25 +15,38 @@
    +----------------------------------------------------------------------+
 */
 
+#include "hphp/runtime/base/array-init.h"
 #include "hphp/runtime/base/request-local.h"
 #include "hphp/runtime/ext/thrift/transport.h"
-#include "hphp/runtime/ext/ext_collections.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
 #include "hphp/runtime/ext/reflection/ext_reflection.h"
-#include "hphp/runtime/ext/ext_thrift.h"
+#include "hphp/runtime/ext/thrift/ext_thrift.h"
 #include "hphp/runtime/base/request-event-handler.h"
 
 #include <stack>
 #include <utility>
 
-namespace HPHP {
+namespace HPHP { namespace thrift {
+/////////////////////////////////////////////////////////////////////////////
 
-static const uint8_t VERSION_MASK = 0x1f;
-static const uint8_t VERSION = 2;
-static const uint8_t VERSION_LOW = 1;
-static const uint8_t VERSION_DOUBLE_BE = 2;
-static const uint8_t PROTOCOL_ID = 0x82;
-static const uint8_t TYPE_MASK = 0xe0;
-static const uint8_t TYPE_SHIFT_AMOUNT = 5;
+const uint8_t VERSION_MASK = 0x1f;
+const uint8_t VERSION = 2;
+const uint8_t VERSION_LOW = 1;
+const uint8_t VERSION_DOUBLE_BE = 2;
+const uint8_t PROTOCOL_ID = 0x82;
+const uint8_t TYPE_MASK = 0xe0;
+const uint8_t TYPE_SHIFT_AMOUNT = 5;
+
+enum TError {
+  ERR_UNKNOWN = 0,
+  ERR_INVALID_DATA = 1,
+  ERR_BAD_VERSION = 4
+};
+
+ATTRIBUTE_NORETURN static void thrift_error(const String& what, TError why);
+static void thrift_error(const String& what, TError why) {
+  throw create_object(s_TProtocolException, make_packed_array(what, why));
+}
 
 enum CState {
   STATE_CLEAR,
@@ -103,8 +116,10 @@ static CType ttype_to_ctype(TType x) {
     case T_FLOAT:
       return C_FLOAT;
     default:
-      raise_error("unknown TType %d", static_cast<int>(x));
-      not_reached();
+      thrift_error(
+        folly::to<std::string>(
+          "Unknown Thrift data type ", static_cast<int>(x)),
+        ERR_INVALID_DATA);
   }
 }
 
@@ -138,16 +153,12 @@ static TType ctype_to_ttype(CType x) {
     case C_FLOAT:
       return T_FLOAT;
     default:
-      raise_error("unknown CType %d", static_cast<int>(x));
-      not_reached();
+      thrift_error(
+        folly::to<std::string>(
+          "Unknown Compact data type ", static_cast<int>(x)),
+        ERR_INVALID_DATA);
   }
 }
-
-enum TError {
-  ERR_UNKNOWN = 0,
-  ERR_INVALID_DATA = 1,
-  ERR_BAD_VERSION = 4
-};
 
 struct CompactRequestData final : RequestEventHandler {
   CompactRequestData() : version(VERSION) { }
@@ -161,14 +172,11 @@ struct CompactRequestData final : RequestEventHandler {
     clear();
   }
 
+  void vscan(IMarker&) const override {}
+
   uint8_t version;
 };
 IMPLEMENT_STATIC_REQUEST_LOCAL(CompactRequestData, s_compact_request_data);
-
-static void thrift_error(const String& what, TError why) ATTRIBUTE_NORETURN;
-static void thrift_error(const String& what, TError why) {
-  throw create_object("TProtocolException", make_packed_array(what, why));
-}
 
 class CompactWriter {
   public:
@@ -216,8 +224,8 @@ class CompactWriter {
       lastFieldNum = 0;
 
       // Get field specification
-      const Array& spec = HHVM_FN(hphp_get_static_property)(obj->o_getClassName(),
-                                                       "_TSPEC", false)
+      const Array& spec = HHVM_FN(hphp_get_static_property)(obj->getClassName(),
+                                                       s_TSPEC, false)
         .toArray();
 
       // Write each member
@@ -232,11 +240,11 @@ class CompactWriter {
         Array fieldSpec = specIter.second().toArray();
 
         String fieldName = fieldSpec
-          .rvalAt(PHPTransport::s_var, AccessFlags::Error_Key).toString();
+          .rvalAt(s_var, AccessFlags::Error_Key).toString();
         TType fieldType = (TType)fieldSpec
-          .rvalAt(PHPTransport::s_type, AccessFlags::Error_Key).toByte();
+          .rvalAt(s_type, AccessFlags::Error_Key).toByte();
 
-        Variant fieldVal = obj->o_get(fieldName, true, obj->o_getClassName());
+        Variant fieldVal = obj->o_get(fieldName, true, obj->getClassName());
 
         if (!fieldVal.isNull()) {
           writeFieldBegin(fieldNo, fieldType);
@@ -357,10 +365,10 @@ class CompactWriter {
         case T_UTF8:
         case T_UTF16:
         case T_STRING: {
-            String s = value.toString();
+            auto s = value.toString();
             auto slice = s.slice();
-            writeVarint(slice.len);
-            transport->write(slice.ptr, slice.len);
+            writeVarint(slice.size());
+            transport->write(slice.data(), slice.size());
             break;
           }
 
@@ -377,19 +385,20 @@ class CompactWriter {
           break;
 
         default:
-          raise_error("unknown TType %d", static_cast<int>(type));
+          thrift_error("Unknown Thrift data type",
+            ERR_INVALID_DATA);
       }
     }
 
     void writeMap(Array arr, const Array& spec) {
       TType keyType = (TType)spec
-        .rvalAt(PHPTransport::s_ktype, AccessFlags::Error_Key).toByte();
+        .rvalAt(s_ktype, AccessFlags::Error_Key).toByte();
       TType valueType = (TType)spec
-        .rvalAt(PHPTransport::s_vtype, AccessFlags::Error_Key).toByte();
+        .rvalAt(s_vtype, AccessFlags::Error_Key).toByte();
 
-      Array keySpec = spec.rvalAt(PHPTransport::s_key, AccessFlags::Error_Key)
+      Array keySpec = spec.rvalAt(s_key, AccessFlags::Error_Key)
         .toArray();
-      Array valueSpec = spec.rvalAt(PHPTransport::s_val, AccessFlags::Error_Key)
+      Array valueSpec = spec.rvalAt(s_val, AccessFlags::Error_Key)
         .toArray();
 
       writeMapBegin(keyType, valueType, arr.size());
@@ -404,9 +413,9 @@ class CompactWriter {
 
     void writeList(Array arr, const Array& spec, CListType listType) {
       TType valueType = (TType)spec
-        .rvalAt(PHPTransport::s_etype, AccessFlags::Error_Key).toByte();
+        .rvalAt(s_etype, AccessFlags::Error_Key).toByte();
       Array valueSpec = spec
-        .rvalAt(PHPTransport::s_elem, AccessFlags::Error_Key).toArray();
+        .rvalAt(s_elem, AccessFlags::Error_Key).toArray();
 
       writeListBegin(valueType, arr.size());
 
@@ -483,8 +492,8 @@ class CompactWriter {
 
     void writeString(const String& s) {
       auto slice = s.slice();
-      writeVarint(slice.len);
-      transport->write(slice.ptr, slice.len);
+      writeVarint(slice.size());
+      transport->write(slice.data(), slice.size());
     }
 
     uint64_t i64ToZigzag(int64_t n) {
@@ -524,28 +533,19 @@ class CompactReader {
       if (type == T_REPLY) {
         Object ret = create_object(resultClassName, Array());
         Variant spec = HHVM_FN(hphp_get_static_property)(resultClassName,
-                                                         "_TSPEC", false);
+                                                         s_TSPEC, false);
         readStruct(ret, spec.toArray());
         return ret;
       } else if (type == T_EXCEPTION) {
-        Object exn = create_object("TApplicationException", Array());
+        Object exn = create_object(s_TApplicationException, Array());
         Variant spec = HHVM_FN(hphp_get_static_property)(
-                                      "TApplicationException", "_TSPEC", false);
+                                      s_TApplicationException, s_TSPEC, false);
         readStruct(exn, spec.toArray());
         throw exn;
       } else {
         thrift_error("Invalid response type", ERR_INVALID_DATA);
       }
     }
-
-  private:
-    PHPInputTransport transport;
-    uint8_t version;
-    CState state;
-    uint16_t lastFieldNum;
-    bool boolValue;
-    std::stack<std::pair<CState, uint16_t> > structHistory;
-    std::stack<CState> containerHistory;
 
     void readStruct(const Object& dest, const Array& spec) {
       readStructBegin();
@@ -565,14 +565,14 @@ class CompactReader {
         if (!fieldSpecVariant.isNull()) {
           Array fieldSpec = fieldSpecVariant.toArray();
 
-          String fieldName = fieldSpec.rvalAt(PHPTransport::s_var).toString();
-          auto expectedType = (TType)fieldSpec.rvalAt(PHPTransport::s_type)
+          String fieldName = fieldSpec.rvalAt(s_var).toString();
+          auto expectedType = (TType)fieldSpec.rvalAt(s_type)
             .toInt64();
 
           if (typesAreCompatible(fieldType, expectedType)) {
             readComplete = true;
             Variant fieldValue = readField(fieldSpec, fieldType);
-            dest->o_set(fieldName, fieldValue, dest->o_getClassName());
+            dest->o_set(fieldName, fieldValue, dest->getClassName());
           }
         }
 
@@ -585,6 +585,15 @@ class CompactReader {
 
       readStructEnd();
     }
+
+  private:
+    PHPInputTransport transport;
+    uint8_t version;
+    CState state;
+    uint16_t lastFieldNum;
+    bool boolValue;
+    std::stack<std::pair<CState, uint16_t> > structHistory;
+    std::stack<CState> containerHistory;
 
     void readStructBegin(void) {
       structHistory.push(std::make_pair(state, lastFieldNum));
@@ -640,7 +649,7 @@ class CompactReader {
           return init_null();
 
         case T_STRUCT: {
-            Variant className = spec.rvalAt(PHPTransport::s_class);
+            Variant className = spec.rvalAt(s_class);
             if (className.isNull()) {
               thrift_error("no class type in spec", ERR_INVALID_DATA);
             }
@@ -652,10 +661,10 @@ class CompactReader {
             }
 
             Variant newStructSpec =
-              HHVM_FN(hphp_get_static_property)(classNameString, "_TSPEC",
+              HHVM_FN(hphp_get_static_property)(classNameString, s_TSPEC,
                                                 false);
 
-            if (!newStructSpec.is(KindOfArray)) {
+            if (!newStructSpec.isArray()) {
               thrift_error("invalid type of spec", ERR_INVALID_DATA);
             }
 
@@ -673,7 +682,7 @@ class CompactReader {
           }
 
         case T_BYTE:
-          return readUByte();
+          return transport.readI8();
 
         case T_I16:
         case T_I32:
@@ -722,8 +731,8 @@ class CompactReader {
           return readSet(spec);
 
         default:
-          raise_error("unknown TType %d", static_cast<int>(type));
-          not_reached();
+          thrift_error("Unknown Thrift data type",
+            ERR_INVALID_DATA);
       }
     }
 
@@ -818,7 +827,8 @@ class CompactReader {
           break;
 
         default:
-          raise_error("unknown TType %d", static_cast<int>(type));
+          thrift_error("Unknown Thrift data type",
+            ERR_INVALID_DATA);
       }
     }
 
@@ -827,34 +837,31 @@ class CompactReader {
       uint32_t size;
       readMapBegin(keyType, valueType, size);
 
-      Array keySpec = spec.rvalAt(PHPTransport::s_key,
+      Array keySpec = spec.rvalAt(s_key,
         AccessFlags::Error).toArray();
-      Array valueSpec = spec.rvalAt(PHPTransport::s_val,
+      Array valueSpec = spec.rvalAt(s_val,
         AccessFlags::Error).toArray();
-      String format = spec.rvalAt(PHPTransport::s_format,
+      String format = spec.rvalAt(s_format,
         AccessFlags::None).toString();
-      Variant ret;
-      if (format.equal(PHPTransport::s_collection)) {
-        ret = NEWOBJ(c_Map)();
-        auto const data = ret.getObjectData();
-        if (size) static_cast<BaseMap*>(data)->reserve(size);
+      if (format.equal(s_collection)) {
+        auto ret(req::make<c_Map>(size));
         for (uint32_t i = 0; i < size; i++) {
           Variant key = readField(keySpec, keyType);
           Variant value = readField(valueSpec, valueType);
-          BaseMap::OffsetSet(data, key.asCell(), value.asCell());
+          BaseMap::OffsetSet(ret.get(), key.asCell(), value.asCell());
         }
+        readCollectionEnd();
+        return Variant(std::move(ret));
       } else {
         ArrayInit ainit(size, ArrayInit::Mixed{});
         for (uint32_t i = 0; i < size; i++) {
           Variant key = readField(keySpec, keyType);
           Variant value = readField(valueSpec, valueType);
-          ainit.set(key, value);
+          ainit.setUnknownKey(key, value);
         }
-        ret = ainit.toArray();
+        readCollectionEnd();
+        return ainit.toVariant();
       }
-
-      readCollectionEnd();
-      return ret;
     }
 
     Variant readList(const Array& spec) {
@@ -862,29 +869,25 @@ class CompactReader {
       uint32_t size;
       readListBegin(valueType, size);
 
-      Array valueSpec = spec.rvalAt(PHPTransport::s_elem,
+      Array valueSpec = spec.rvalAt(s_elem,
                                     AccessFlags::Error_Key).toArray();
-      String format = spec.rvalAt(PHPTransport::s_format,
+      String format = spec.rvalAt(s_format,
         AccessFlags::None).toString();
-      Variant ret;
-      if (format.equal(PHPTransport::s_collection)) {
-        auto const pvec = NEWOBJ(c_Vector)();
-        ret = pvec;
-        if (size) pvec->reserve(size);
+      if (format.equal(s_collection)) {
+        auto const pvec(req::make<c_Vector>(size));
         for (uint32_t i = 0; i < size; i++) {
-          Variant value = readField(valueSpec, valueType);
-          pvec->t_add(value);
+          pvec->t_add(readField(valueSpec, valueType));
         }
+        readCollectionEnd();
+        return Variant(std::move(pvec));
       } else {
         PackedArrayInit pai(size);
         for (auto i = uint32_t{0}; i < size; ++i) {
           pai.append(readField(valueSpec, valueType));
         }
-        ret = pai.toArray();
+        readCollectionEnd();
+        return pai.toVariant();
       }
-
-      readCollectionEnd();
-      return ret;
     }
 
     Variant readSet(const Array& spec) {
@@ -892,21 +895,18 @@ class CompactReader {
       uint32_t size;
       readListBegin(valueType, size);
 
-      Array valueSpec = spec.rvalAt(PHPTransport::s_elem,
+      Array valueSpec = spec.rvalAt(s_elem,
                                     AccessFlags::Error_Key).toArray();
-      String format = spec.rvalAt(PHPTransport::s_format,
+      String format = spec.rvalAt(s_format,
         AccessFlags::None).toString();
-      Variant ret;
-      if (format.equal(PHPTransport::s_collection)) {
-        p_Set set_ret = NEWOBJ(c_Set)();
-        if (size) set_ret->reserve(size);
-
+      if (format.equal(s_collection)) {
+        auto set_ret = req::make<c_Set>(size);
         for (uint32_t i = 0; i < size; i++) {
           Variant value = readField(valueSpec, valueType);
           set_ret->t_add(value);
         }
-
-        ret = Variant(set_ret);
+        readCollectionEnd();
+        return Variant(std::move(set_ret));
       } else {
         // Note: the Mixed{} is just out of uncertainty right now.
         // These probably are generally string keys and this should
@@ -914,14 +914,11 @@ class CompactReader {
         ArrayInit ainit(size, ArrayInit::Mixed{});
         for (uint32_t i = 0; i < size; i++) {
           Variant value = readField(valueSpec, valueType);
-          ainit.setKeyUnconverted(value, true);
+          ainit.setUnknownKey(value, true);
         }
-        ret = ainit.toArray();
+        readCollectionEnd();
+        return ainit.toVariant();
       }
-
-
-      readCollectionEnd();
-      return ret;
     }
 
     void readMapBegin(TType &keyType, TType &valueType, uint32_t &size) {
@@ -986,19 +983,19 @@ class CompactReader {
       }
     }
 
-    Variant readString(void) {
+    String readString(void) {
       uint32_t size = readVarint();
 
       if (size && (size + 1)) {
         String s = String(size, ReserveString);
-        char* buf = s.bufferSlice().ptr;
+        char* buf = s.mutableData();
 
         transport.readBytes(buf, size);
         s.setSize(size);
         return s;
       } else {
         transport.skip(size);
-        return empty_string_variant();
+        return empty_string();
       }
     }
 
@@ -1016,18 +1013,20 @@ class CompactReader {
 
 };
 
-int f_thrift_protocol_set_compact_version(int version) {
+int64_t HHVM_FUNCTION(thrift_protocol_set_compact_version,
+                      int version) {
   int result = s_compact_request_data->version;
   s_compact_request_data->version = (uint8_t)version;
   return result;
 }
 
-void f_thrift_protocol_write_compact(const Object& transportobj,
-                                     const String& method_name,
-                                     int64_t msgtype,
-                                     const Object& request_struct,
-                                     int seqid,
-                                     bool oneway) {
+void HHVM_FUNCTION(thrift_protocol_write_compact,
+                   const Object& transportobj,
+                   const String& method_name,
+                   int64_t msgtype,
+                   const Object& request_struct,
+                   int seqid,
+                   bool oneway) {
   PHPOutputTransport transport(transportobj);
 
   CompactWriter writer(&transport);
@@ -1042,10 +1041,22 @@ void f_thrift_protocol_write_compact(const Object& transportobj,
   }
 }
 
-Variant f_thrift_protocol_read_compact(const Object& transportobj,
-                                       const String& obj_typename) {
+Variant HHVM_FUNCTION(thrift_protocol_read_compact,
+                      const Object& transportobj,
+                      const String& obj_typename) {
   CompactReader reader(transportobj);
   return reader.read(obj_typename);
 }
 
+Object HHVM_FUNCTION(thrift_protocol_read_compact_struct,
+                     const Object& transportobj,
+                     const String& obj_typename) {
+  CompactReader reader(transportobj);
+  Object ret = create_object(obj_typename, Array());
+  Variant spec = HHVM_FN(hphp_get_static_property)(obj_typename,
+                                                   s_TSPEC, false);
+  reader.readStruct(ret, spec.toArray());
+  return ret;
 }
+
+}}

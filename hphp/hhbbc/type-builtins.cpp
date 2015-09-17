@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -76,13 +76,13 @@ bool is_collection_method_returning_this(borrowed_ptr<php::Class> cls,
 }
 
 Type native_function_return_type(borrowed_ptr<const php::Func> f) {
-  if (f->nativeInfo->returnType == KindOfInvalid) {
+  if (!f->nativeInfo->returnType) {
     if (f->attrs & AttrReference) {
       return TRef;
     }
     return TInitCell;
   }
-  auto t = from_DataType(f->nativeInfo->returnType);
+  auto t = from_DataType(*f->nativeInfo->returnType);
   // Regardless of ParamCoerceMode, native functions can return null if
   // too many arguments are passed.
   t = union_of(t, TInitNull);

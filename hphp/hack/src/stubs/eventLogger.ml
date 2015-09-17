@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,13 +8,10 @@
  *
  *)
 
-let init _ = ()
-let init_done _ = ()
-let out_of_date _ = ()
-let killed _ = ()
-let lock_lost _ _ = ()
-let lock_stolen _ _ = ()
-let client_startup _ = ()
-let client_begin_work _ = ()
-let client_finish _ = ()
-let check_response _ = ()
+let init _ _ = ()
+let master_exception _ = ()
+let worker_exception _ = ()
+let sharedmem_gc_ran _ _ _ _ = ()
+let sharedmem_init_done _ = ()
+let log_gc_stats () = ()
+let flush _ = ()

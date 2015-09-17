@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -24,9 +24,8 @@
 #include "hphp/runtime/base/pprof-server.h"
 #include "hphp/runtime/base/program-functions.h"
 #include "hphp/runtime/base/runtime-option.h"
-#include "hphp/runtime/base/thread-init-fini.h"
+#include "hphp/runtime/base/init-fini-node.h"
 #include "hphp/runtime/debugger/debugger.h"
-#include "hphp/runtime/ext/ext_apc.h"
 #include "hphp/runtime/server/admin-request-handler.h"
 #include "hphp/runtime/server/http-request-handler.h"
 #include "hphp/runtime/server/replay-transport.h"
@@ -35,22 +34,19 @@
 #include "hphp/runtime/server/warmup-request-handler.h"
 #include "hphp/runtime/server/xbox-server.h"
 
-#include "hphp/util/db-conn.h"
+#include "hphp/util/boot_timer.h"
 #include "hphp/util/logger.h"
 #include "hphp/util/process.h"
 #include "hphp/util/ssl-init.h"
 
+#include <folly/Conv.h>
 #include <folly/Format.h>
-
-#include <boost/lexical_cast.hpp>
 
 #include <sys/types.h>
 #include <signal.h>
 
 namespace HPHP {
-extern InitFiniNode *extra_server_init, *extra_server_exit;
 
-using boost::lexical_cast;
 using std::string;
 
 
@@ -144,7 +140,7 @@ HttpServer::HttpServer()
   }
 
   if (RuntimeOption::XboxServerPort != 0) {
-    std::shared_ptr<SatelliteServerInfo> xboxInfo(new XboxServerInfo());
+    auto xboxInfo = std::make_shared<XboxServerInfo>();
     auto satellite = SatelliteServer::Create(xboxInfo);
     if (satellite) {
       m_satellites.push_back(std::move(satellite));
@@ -167,7 +163,7 @@ HttpServer::HttpServer()
     ReplayTransport rt;
     rt.replayInput(hdf);
     HttpRequestHandler handler(0);
-    handler.handleRequest(&rt);
+    handler.run(&rt);
     int code = rt.getResponseCode();
     if (code == 200) {
       Logger::Info("StartupDocument %s returned 200 OK: %s",
@@ -184,9 +180,7 @@ HttpServer::HttpServer()
 
 // Synchronously stop satellites and start danglings
 void HttpServer::onServerShutdown() {
-  for (InitFiniNode *in = extra_server_exit; in; in = in->next) {
-    in->func();
-  }
+  InitFiniNode::ServerFini();
 
   Eval::Debugger::Stop();
   if (RuntimeOption::EnableDebuggerServer) {
@@ -233,6 +227,11 @@ void HttpServer::serverStopped(HPHP::Server* server) {
   Logger::Info("Page server stopped");
   assert(server == m_pageServer.get());
   removePid();
+
+  auto sockFile = RuntimeOption::ServerFileSocket;
+  if (!sockFile.empty()) {
+    unlink(sockFile.c_str());
+  }
 }
 
 HttpServer::~HttpServer() {
@@ -304,14 +303,14 @@ void HttpServer::runOrExitProcess() {
     Logger::Info("debugger server started");
   }
 
-  for (InitFiniNode *in = extra_server_init; in; in = in->next) {
-    in->func();
-  }
+  InitFiniNode::ServerInit();
 
   {
+    BootTimer::mark("servers started");
     Logger::Info("all servers started");
     createPid();
     Lock lock(this);
+    BootTimer::done();
     // continously running until /stop is received on admin server
     while (!m_stopped) {
       wait();
@@ -347,8 +346,8 @@ void HttpServer::runOrExitProcess() {
   }
 
   waitForServers();
-  hphp_process_exit();
   m_watchDog.waitForEnd();
+  hphp_process_exit();
   Logger::Info("all servers stopped");
 }
 
@@ -368,10 +367,14 @@ void HttpServer::waitForServers() {
 static void exit_on_timeout(int sig) {
   signal(sig, SIG_DFL);
   kill(getpid(), SIGKILL);
-  exit(0);
+  // we really shouldn't get here, but who knows.
+  // abort so we catch it as a crash.
+  abort();
 }
 
 void HttpServer::stop(const char* stopReason) {
+  if (m_stopped) return;
+
   if (RuntimeOption::ServerGracefulShutdownWait) {
     signal(SIGALRM, exit_on_timeout);
     alarm(RuntimeOption::ServerGracefulShutdownWait);
@@ -381,18 +384,6 @@ void HttpServer::stop(const char* stopReason) {
   m_stopped = true;
   m_stopReason = stopReason;
   notify();
-}
-
-void HttpServer::abortServers() {
-  for (unsigned int i = 0; i < m_satellites.size(); i++) {
-    m_satellites[i]->stop();
-  }
-  if (RuntimeOption::AdminServerPort) {
-    m_adminServer->stop();
-  }
-  if (RuntimeOption::ServerPort) {
-    m_pageServer->stop();
-  }
 }
 
 void HttpServer::stopOnSignal(int sig) {
@@ -419,6 +410,8 @@ void HttpServer::stopOnSignal(int sig) {
   if (m_adminServer) {
     m_adminServer->stop();
   }
+
+  waitForServers();
 }
 
 void HttpServer::createPid() {
@@ -499,8 +492,9 @@ void HttpServer::dropCache() {
 void HttpServer::checkMemory() {
   int64_t used = Process::GetProcessRSS(Process::GetProcessId()) * 1024 * 1024;
   if (RuntimeOption::MaxRSS > 0 && used > RuntimeOption::MaxRSS) {
-    Logger::Error("ResourceLimit.MaxRSS %ld reached %ld used, exiting",
-                  RuntimeOption::MaxRSS, used);
+    Logger::Error(
+      "ResourceLimit.MaxRSS %" PRId64 " reached %" PRId64 " used, exiting",
+      RuntimeOption::MaxRSS, used);
     stop();
   }
 }
@@ -515,6 +509,16 @@ void HttpServer::getSatelliteStats(
     stats->push_back(active);
     stats->push_back(queued);
   }
+}
+
+std::pair<int, int> HttpServer::getSatelliteRequestCount() const {
+  int inflight = 0;
+  int queued = 0;
+  for (const auto& i : m_satellites) {
+    inflight += i->getActiveWorker();
+    queued += i->getQueuedJobs();
+  }
+  return std::make_pair(inflight, queued);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -556,7 +560,7 @@ bool HttpServer::startServer(bool pageServer) {
         RuntimeOption::ServerIP;
       url += serverIp;
       url += ":";
-      url += boost::lexical_cast<std::string>(RuntimeOption::AdminServerPort);
+      url += folly::to<std::string>(RuntimeOption::AdminServerPort);
       url += "/stop";
       std::string auth;
 
@@ -647,7 +651,7 @@ bool HttpServer::startServer(bool pageServer) {
           }
 
           std::string cmd = "lsof -t -i :";
-          cmd += lexical_cast<std::string>(port);
+          cmd += folly::to<std::string>(port);
           cmd += " | xargs kill -9";
           FileUtil::ssystem(cmd.c_str());
         }

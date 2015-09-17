@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -29,7 +29,7 @@ namespace HPHP {
 
 class FilesMatch {
 public:
-  explicit FilesMatch(const IniSetting::Map& ini, Hdf vh);
+  explicit FilesMatch(const IniSetting::Map& ini, const Hdf& vh);
 
   bool match(const std::string &filename) const;
   const std::vector<std::string> &getHeaders() const { return m_headers;}

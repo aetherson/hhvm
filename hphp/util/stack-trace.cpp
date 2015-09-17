@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,27 +15,32 @@
 */
 #include "hphp/util/stack-trace.h"
 
-#if (!defined(__CYGWIN__) && !defined(__MINGW__) && !defined(__MSC_VER))
+#if (!defined(__CYGWIN__) && !defined(__MINGW__) && !defined(_MSC_VER))
 #include <execinfo.h>
 #endif
+
+#ifdef HAVE_LIBBFD
 #include <bfd.h>
+#endif
+
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#include "folly/String.h"
-#include "folly/ScopeGuard.h"
-#include "folly/Conv.h"
+#include <folly/String.h>
+#include <folly/ScopeGuard.h>
+#include <folly/Conv.h>
 
 #include "hphp/util/process.h"
 #include "hphp/util/lock.h"
 #include "hphp/util/logger.h"
-#include "hphp/util/light-process.h"
 #include "hphp/util/compatibility.h"
 #include "hphp/util/hash.h"
 
 namespace HPHP {
+
+#ifdef HAVE_LIBBFD
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -233,14 +238,12 @@ void StackTraceNoHeap::ClearAllExtraLogging() {
   StackTraceLog::s_logData->data.clear();
 }
 
-void StackTraceNoHeap::log(const char *errorType, const char *tracefn,
-                           const char *pid, const char *buildId,
+void StackTraceNoHeap::log(const char *errorType, int fd, const char *buildId,
                            int debuggerCount) const {
-  int fd = ::open(tracefn, O_CREAT|O_TRUNC|O_WRONLY, S_IRUSR|S_IWUSR);
-  if (fd < 0) return;
+  assert(fd >= 0);
 
   dprintf(fd, "Host: %s\n",Process::GetHostName().c_str());
-  dprintf(fd, "ProcessID: %s\n", pid);
+  dprintf(fd, "ProcessID: %u\n", Process::GetProcessId());
   dprintf(fd, "ThreadID: %" PRIx64"\n", (int64_t)Process::GetThreadId());
   dprintf(fd, "ThreadPID: %u\n", Process::GetThreadPid());
   dprintf(fd, "Name: %s\n", Process::GetAppName().c_str());
@@ -256,8 +259,6 @@ void StackTraceNoHeap::log(const char *errorType, const char *tracefn,
   dprintf(fd, "\n");
 
   printStackTrace(fd);
-
-  ::close(fd);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -486,7 +487,7 @@ static bool fill_bfd_cache(const char *filename, bfd_cache *p) {
 #ifdef BFD_DECOMPRESS
   abfd->flags |= BFD_DECOMPRESS;
 #endif
-  p->abfd = abfd;
+  p->abfd = nullptr;
   p->syms = nullptr;
   char **match;
   if (bfd_check_format(abfd, bfd_archive) ||
@@ -495,6 +496,7 @@ static bool fill_bfd_cache(const char *filename, bfd_cache *p) {
     bfd_close(abfd);
     return true;
   }
+  p->abfd = abfd;
   return false;
 }
 
@@ -610,6 +612,75 @@ void StackTraceNoHeap::Demangle(int fd, const char *mangled) {
   return ;
 }
 
-
 ///////////////////////////////////////////////////////////////////////////////
+
+#else // HAVE_LIBBFD
+
+// Basically everything in here requires libbfd. So, stub city it is.
+
+std::string StackTraceBase::Frame::toString() const {
+  return "";
+}
+
+bool StackTraceBase::Enabled = false;
+const char** StackTraceBase::FunctionBlacklist = {};
+unsigned int StackTraceBase::FunctionBlacklistCount = 0;
+
+StackTraceBase::StackTraceBase() {
+}
+
+std::string StackTrace::Frame::toString() const {
+  return "";
+}
+
+StackTrace::StackTrace(bool trace) {
+}
+
+std::shared_ptr<StackTrace::Frame> StackTrace::Translate(void *bt) {
+  return std::shared_ptr<StackTrace::Frame>(new Frame(bt));
+}
+
+void StackTrace::TranslateFromPerfMap(void* bt, Frame* f) {
+}
+
+std::string Demangle(const char *mangled) {
+  return "";
+}
+
+StackTrace::StackTrace(const StackTrace &bt) {
+}
+
+StackTrace::StackTrace(const std::string &hexEncoded) {
+}
+
+StackTrace::StackTrace(const char *hexEncoded) {
+}
+
+const std::string &StackTrace::toString(int skip, int limit) const {
+  return m_bt;
+}
+
+void StackTrace::get(std::vector<std::shared_ptr<Frame>> &frames) const {
+}
+
+std::string StackTrace::hexEncode(int minLevel, int maxLevel) const {
+  return "";
+}
+
+StackTraceNoHeap::StackTraceNoHeap(bool trace) {
+}
+
+void StackTraceNoHeap::log(const char *errorType, int fd, const char *buildId,
+    int debuggerCount) const {
+}
+
+void StackTraceNoHeap::AddExtraLogging(const char *name,
+    const std::string &value) {
+}
+
+void StackTraceNoHeap::ClearAllExtraLogging() {
+}
+
+#endif // HAVE_LIBBFD
+
 }

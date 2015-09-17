@@ -18,6 +18,7 @@
                         "type": null
                     },
                     "flags": [
+                      "IsFinal"
                     ],
                     "args": [
                     ]
@@ -28,8 +29,118 @@
                         "type": "StringMap"
                     },
                     "flags": [
+                      "IsFinal"
                     ],
                     "args": [
+                    ]
+                },
+                {
+                    "name": "__get",
+                    "flags": [
+                      "IsFinal"
+                    ],
+                    "return": {
+                        "type": "Variant"
+                    },
+                    "args": [
+                        {
+                            "name": "name",
+                            "type": "Variant"
+                        }
+                    ]
+                },
+                {
+                    "name": "__set",
+                    "flags": [
+                      "IsFinal"
+                    ],
+                    "return": {
+                        "type": "Variant"
+                    },
+                    "args": [
+                        {
+                            "name": "name",
+                            "type": "Variant"
+                        },
+                        {
+                            "name": "value",
+                            "type": "Variant"
+                        }
+                    ]
+                },
+                {
+                    "name": "__isset",
+                    "flags": [
+                      "IsFinal"
+                    ],
+                    "return": {
+                        "type": "Boolean"
+                    },
+                    "args": [
+                        {
+                            "name": "name",
+                            "type": "Variant"
+                        }
+                    ]
+                },
+                {
+                    "name": "__unset",
+                    "flags": [
+                      "IsFinal"
+                    ],
+                    "return": {
+                        "type": "Variant"
+                    },
+                    "args": [
+                        {
+                            "name": "name",
+                            "type": "Variant"
+                        }
+                    ]
+                },
+                {
+                    "name": "bind",
+                    "return": {
+                        "type": "Object"
+                    },
+                    "flags": [
+                      "IsFinal",
+                      "IsStatic"
+                    ],
+                    "args": [
+                        {
+                            "name": "closure",
+                            "type": "Variant"
+                        },
+                        {
+                            "name": "newthis",
+                            "type": "Variant"
+                        },
+                        {
+                            "name": "newscope",
+                            "type": "Variant",
+                            "value": "\"static\""
+                        }
+                    ]
+                },
+                {
+                    "name": "bindto",
+                    "return": {
+                        "type": "Object"
+                    },
+                    "flags": [
+                      "IsFinal"
+                    ],
+                    "args": [
+                        {
+                            "name": "newthis",
+                            "type": "Variant"
+                        },
+                        {
+                            "name": "newscope",
+                            "type": "Variant",
+                            "value": "\"static\""
+                        }
                     ]
                 }
             ],

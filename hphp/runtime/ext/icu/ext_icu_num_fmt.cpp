@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -16,7 +16,7 @@
 */
 #include "hphp/runtime/ext/icu/ext_icu_num_fmt.h"
 #include "hphp/runtime/base/exceptions.h"
-#include "hphp/runtime/ext/ext_string.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 
 namespace HPHP { namespace Intl {
 //////////////////////////////////////////////////////////////////////////////
@@ -291,9 +291,9 @@ static Variant HHVM_METHOD(NumberFormatter, format, const Variant& value,
   }
 
   if (type == UNUM(TYPE_DEFAULT)) {
-    if (value.isInteger()) {
+    if (num.isInteger()) {
       type = UNUM(TYPE_INT64);
-    } else if (value.isDouble()) {
+    } else if (num.isDouble()) {
       type = UNUM(TYPE_DOUBLE);
     }
   }
@@ -445,9 +445,9 @@ static Variant HHVM_METHOD(NumberFormatter, parseCurrency,
                         val.getBuffer(), val.length(),
                         &pos, cur, &error);
   NUMFMT_CHECK(obj, error, false);
-  position = (int64_t)pos;
+  position.assignIfRef((int64_t)pos);
   error = U_ZERO_ERROR;
-  currency = u8(cur, u_strlen(cur), error);
+  currency.assignIfRef(u8(cur, u_strlen(cur), error));
   NUMFMT_CHECK(obj, error, false);
   return parsed;
 }
@@ -480,7 +480,7 @@ static Variant HHVM_METHOD(NumberFormatter, parse,
       return false;
   }
   NUMFMT_CHECK(obj, error, false);
-  position = pos;
+  position.assignIfRef(pos);
   return ret;
 }
 

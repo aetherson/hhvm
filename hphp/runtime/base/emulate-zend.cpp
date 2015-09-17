@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -14,12 +14,13 @@
    +----------------------------------------------------------------------+
 */
 #include "hphp/runtime/base/emulate-zend.h"
+#include "hphp/runtime/base/ini-setting.h"
 
-#include <stdlib.h>
+#include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <assert.h>
 
 #include <vector>
 #include <string>
@@ -31,6 +32,7 @@ namespace HPHP {
 int execute_program(int argc, char **argv);
 
 bool check_option(const char *option) {
+#ifndef _MSC_VER
   // Parameters that can be directly passed through to hhvm.
   static const char *passthru[] = {
   };
@@ -38,16 +40,23 @@ bool check_option(const char *option) {
   for (int i = 0; i < sizeof(passthru) / sizeof(const char *); i++) {
     if (strcmp(option, passthru[i]) == 0) return true;
   }
+#endif
   return false;
 }
 
 static int get_tempfile_if_not_exists(int ini_fd, char ini_path[]) {
   if (ini_fd == -1) {
-     ini_fd = mkstemp(ini_path);
-     if (ini_fd == -1) {
-       fprintf(stderr, "Error: unable to open temporary file");
-       exit(EXIT_FAILURE);
-     }
+#ifdef _MSC_VER
+    // MSVC doesn't require the characters to be the last
+    // 6 in the string.
+    ini_fd = open(mktemp(ini_path), O_RDWR | O_EXCL);
+#else
+    ini_fd = mkstemps(ini_path, 4); // keep the .ini suffix
+#endif
+    if (ini_fd == -1) {
+      fprintf(stderr, "Error: unable to open temporary file");
+      exit(EXIT_FAILURE);
+    }
   }
   return ini_fd;
 }
@@ -61,7 +70,7 @@ int emulate_zend(int argc, char** argv) {
   bool show = false;
   bool need_file = true;
   int ini_fd = -1;
-  char ini_path[] = "/tmp/php-ini-XXXXXX";
+  char ini_path[] = "/tmp/php-ini-XXXXXX.ini";
   std::string ini_section = "";
   const char* program = nullptr;
 
@@ -229,16 +238,12 @@ int emulate_zend(int argc, char** argv) {
 
     // If the -c option is specified without a -n, php behavior is to
     // load the default ini/hdf
-    auto default_config_file = INSTALL_PREFIX "/etc/hhvm/php.ini";
-    if (access(default_config_file, R_OK) != -1) {
+    auto cb = [&newargv] (const char *filename) {
       newargv.push_back("-c");
-      newargv.push_back(default_config_file);
-    }
-    default_config_file = INSTALL_PREFIX "/etc/hhvm/config.hdf";
-    if (access(default_config_file, R_OK) != -1) {
-      newargv.push_back("-c");
-      newargv.push_back(default_config_file);
-    }
+      newargv.push_back(filename);
+    };
+    add_default_config_files_globbed(DEFAULT_CONFIG_DIR "/php*.ini", cb);
+    add_default_config_files_globbed(DEFAULT_CONFIG_DIR "/config*.hdf", cb);
   }
 
   if (cnt < argc && strcmp(argv[cnt], "--") == 0) cnt++;
@@ -250,7 +255,7 @@ int emulate_zend(int argc, char** argv) {
     }
   }
 
-  char *newargv_array[newargv.size() + 1];
+  char** newargv_array = (char**)alloca(sizeof(char*) * (newargv.size() + 1));
   for (unsigned i = 0; i < newargv.size(); i++) {
     // printf("%s\n", newargv[i].data());
     newargv_array[i] = (char *)newargv[i].data();

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -20,12 +20,11 @@
 #include <array>
 #include <cstdint>
 
+#include "hphp/runtime/base/array-data-defs.h"
+#include "hphp/runtime/base/req-containers.h"
+#include "hphp/runtime/base/req-ptr.h"
+#include "hphp/runtime/base/type-variant.h"
 #include "hphp/util/tls-pod-bag.h"
-#include "hphp/runtime/base/types.h"
-#include "hphp/runtime/base/smart-ptr.h"
-#include "hphp/runtime/base/complex-types.h"
-#include "hphp/runtime/base/smart-containers.h"
-#include "hphp/runtime/base/mixed-array.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -34,14 +33,13 @@ struct TypedValue;
 class BaseVector;
 class BaseMap;
 class BaseSet;
-class c_ImmVector;
-class c_ImmSet;
-class c_Pair;
 struct Iter;
+struct MixedArray;
 
 enum class IterNextIndex : uint16_t {
   ArrayPacked = 0,
   ArrayMixed,
+  ArrayStruct,
   Array,
   Vector,
   ImmVector,
@@ -94,7 +92,7 @@ struct ArrayIter {
   explicit ArrayIter(ObjectData* obj);
   ArrayIter(ObjectData* obj, NoInc);
   explicit ArrayIter(const Object& obj);
-  explicit ArrayIter(const Cell& c);
+  explicit ArrayIter(Cell);
   explicit ArrayIter(const Variant& v);
 
   // Copy ctor
@@ -128,14 +126,15 @@ struct ArrayIter {
 
   explicit operator bool() { return !end(); }
   void operator++() { next(); }
-  bool end() {
+  bool end() const {
     if (LIKELY(hasArrayData())) {
       auto* ad = getArrayData();
       return !ad || m_pos == ad->iter_end();
+      return endHelper();
     }
     return endHelper();
   }
-  bool endHelper();
+  bool endHelper() const;
 
   void next() {
     if (LIKELY(hasArrayData())) {
@@ -193,10 +192,10 @@ struct ArrayIter {
   bool hasArrayData() const {
     return !((intptr_t)m_data & 1);
   }
-  bool hasCollection() {
+  bool hasCollection() const {
     return (!hasArrayData() && getObject()->isCollection());
   }
-  bool hasIteratorObj() {
+  bool hasIteratorObj() const {
     return (!hasArrayData() && !getObject()->isCollection());
   }
 
@@ -280,11 +279,12 @@ struct ArrayIter {
     return m_nextHelperIdx;
   }
 
-  ObjectData* getObject() {
+  ObjectData* getObject() const {
     assert(!hasArrayData());
     return (ObjectData*)((intptr_t)m_obj & ~1);
   }
 
+  template<typename F> void scan(F& mark) const;
 private:
   friend int64_t new_iter_array(Iter*, ArrayData*, TypedValue*);
   template<bool withRef>
@@ -296,7 +296,7 @@ private:
   template <bool incRef>
   void objInit(ObjectData* obj);
 
-  void cellInit(const Cell& c);
+  void cellInit(Cell);
 
   static void VectorInit(ArrayIter* iter, ObjectData* obj);
   static void MapInit(ArrayIter* iter, ObjectData* obj);
@@ -308,49 +308,9 @@ private:
   static void IteratorObjInit(ArrayIter* iter, ObjectData* obj);
 
   typedef void(*InitFuncPtr)(ArrayIter*,ObjectData*);
-  static const InitFuncPtr initFuncTable[Collection::MaxNumTypes];
+  static const InitFuncPtr initFuncTable[];
 
   void destruct();
-
-  BaseVector* getVector() {
-    assert(hasCollection());
-    assert(getCollectionType() == Collection::VectorType ||
-           getCollectionType() == Collection::ImmVectorType);
-    return (BaseVector*)((intptr_t)m_obj & ~1);
-  }
-  BaseMap* getMap() {
-    assert(hasCollection());
-    assert(Collection::isMapType(getCollectionType()));
-    return (BaseMap*)((intptr_t)m_obj & ~1);
-  }
-  BaseSet* getSet() {
-    assert(hasCollection());
-    assert(getCollectionType() == Collection::SetType ||
-           getCollectionType() == Collection::ImmSetType);
-    return (BaseSet*)((intptr_t)m_obj & ~1);
-  }
-  c_Pair* getPair() {
-    assert(hasCollection() && getCollectionType() == Collection::PairType);
-    return (c_Pair*)((intptr_t)m_obj & ~1);
-  }
-  c_ImmVector* getImmVector() {
-    assert(hasCollection() &&
-           getCollectionType() == Collection::ImmVectorType);
-
-    return (c_ImmVector*)((intptr_t)m_obj & ~1);
-  }
-  c_ImmSet* getImmSet() {
-    assert(hasCollection() && getCollectionType() == Collection::ImmSetType);
-    return (c_ImmSet*)((intptr_t)m_obj & ~1);
-  }
-  Collection::Type getCollectionType() {
-    ObjectData* obj = getObject();
-    return obj->getCollectionType();
-  }
-  ObjectData* getIteratorObj() {
-    assert(hasIteratorObj());
-    return getObject();
-  }
 
   void setArrayData(const ArrayData* ad) {
     assert((intptr_t(ad) & 1) == 0);
@@ -524,6 +484,7 @@ struct MArrayIter {
   bool getResetFlag() const { return m_resetFlag; }
   void setResetFlag(bool reset) { m_resetFlag = reset; }
 
+  template<typename F> void scan(F& mark) const;
 private:
   ArrayData* getData() const {
     assert(hasRef());
@@ -610,9 +571,16 @@ private:
 struct MIterTable {
   struct Ent { ArrayData* array; MArrayIter* iter; };
 
+  void clear() {
+    ents.fill({nullptr, nullptr});
+    if (!extras.empty()) {
+      extras.release_if([] (const MIterTable::Ent& e) { return true; });
+    }
+  }
+
   std::array<Ent,7> ents;
   // Slow path: we expect this `extras' list to rarely be allocated.
-  TlsPodBag<Ent,smart::Allocator<Ent>> extras;
+  TlsPodBag<Ent,req::Allocator<Ent>> extras;
 };
 static_assert(sizeof(MIterTable) == 2*64, "");
 extern __thread MIterTable tl_miter_table;
@@ -622,8 +590,7 @@ ArrayData* move_strong_iterators(ArrayData* dest, ArrayData* src);
 
 //////////////////////////////////////////////////////////////////////
 
-class CufIter {
- public:
+struct CufIter {
   CufIter() : m_func(nullptr), m_ctx(nullptr), m_name(nullptr) {}
   ~CufIter();
   const Func* func() const { return m_func; }
@@ -637,16 +604,23 @@ class CufIter {
   }
   void setName(StringData* name) { m_name = name; }
 
-  static uint32_t funcOff() { return offsetof(CufIter, m_func); }
-  static uint32_t ctxOff()  { return offsetof(CufIter, m_ctx); }
-  static uint32_t nameOff() { return offsetof(CufIter, m_name); }
+  static constexpr uint32_t funcOff() { return offsetof(CufIter, m_func); }
+  static constexpr uint32_t ctxOff()  { return offsetof(CufIter, m_ctx); }
+  static constexpr uint32_t nameOff() { return offsetof(CufIter, m_name); }
+
+  template<class F> void scan(F& mark) const {
+    if (m_ctx && intptr_t(m_ctx) % 2 == 0) {
+      mark(reinterpret_cast<const ObjectData*>(m_ctx));
+    }
+    mark(m_name);
+  }
  private:
   const Func* m_func;
   void* m_ctx;
   StringData* m_name;
 };
 
-struct Iter {
+struct alignas(16) Iter {
   const ArrayIter&   arr() const { return m_u.aiter; }
   const MArrayIter& marr() const { return m_u.maiter; }
   const CufIter&     cuf() const { return m_u.cufiter; }
@@ -667,7 +641,7 @@ private:
     MArrayIter maiter;
     CufIter cufiter;
   } m_u;
-} __attribute__ ((__aligned__(16)));
+};
 
 //////////////////////////////////////////////////////////////////////
 

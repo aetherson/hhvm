@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -22,9 +22,10 @@
 #include <set>
 #include <deque>
 
-#include "hphp/runtime/base/complex-types.h"
+#include "hphp/runtime/base/type-array.h"
 #include "hphp/runtime/server/transport.h"
 #include "hphp/runtime/server/server-task-event.h"
+#include "hphp/util/synchronizable.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -99,7 +100,7 @@ public:
   virtual void addHeaderImpl(const char *name, const char *value);
   virtual void removeHeaderImpl(const char *name);
   virtual void sendImpl(const void *data, int size, int code,
-                        bool chunked);
+                        bool chunked, bool eom);
   virtual void onSendEndImpl();
   virtual bool isUploadedFile(const String& filename);
   virtual bool getFiles(std::string &files);
@@ -153,7 +154,7 @@ private:
   PageletServerTaskEvent *m_event;
 };
 
-class PageletServerTaskEvent : public AsioExternalThreadEvent {
+class PageletServerTaskEvent final : public AsioExternalThreadEvent {
 public:
 
   ~PageletServerTaskEvent() {
@@ -171,7 +172,7 @@ public:
 
 protected:
 
-  void unserialize(Cell& result) {
+  void unserialize(Cell& result) override final {
     // Main string responses from pagelet thread.
     Array responses = Array::Create();
 
@@ -191,7 +192,7 @@ protected:
       ret.append(init_null_variant);
     } else {
       // The event was added to the job to be triggered next.
-      ret.append(event->getWaitHandle());
+      ret.append(Variant{event->getWaitHandle()});
     }
 
     cellDup(*(Variant(ret)).asCell(), result);

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,7 +17,7 @@
 #ifndef incl_HPHP_VM_FUNC_H_
 #define incl_HPHP_VM_FUNC_H_
 
-#include "hphp/runtime/base/types.h"
+#include "hphp/runtime/base/atomic-countable.h"
 #include "hphp/runtime/base/attr.h"
 #include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/base/datatype.h"
@@ -33,6 +33,7 @@
 #include "hphp/util/fixed-vector.h"
 #include "hphp/util/hash-map-typedefs.h"
 
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -65,22 +66,19 @@ using DVFuncletsVec = std::vector<std::pair<int, Offset>>;
  * Exception handler table entry.
  */
 struct EHEnt {
-  enum class Type {
+  enum class Type : uint8_t {
     Catch,
     Fault
   };
-  typedef std::vector<std::pair<Id, Offset>> CatchVec;
 
   Type m_type;
+  bool m_itRef;
   Offset m_base;
   Offset m_past;
   int m_iterId;
-  bool m_itRef;
   int m_parentIndex;
   Offset m_fault;
-  CatchVec m_catches;
-
-  template<class SerDe> void serde(SerDe& sd);
+  FixedVector<std::pair<Id,Offset>> m_catches;
 };
 
 /*
@@ -104,17 +102,10 @@ struct FPIEnt {
  * The Func class cannot be safely extended, because variable amounts of memory
  * associated with the Func are allocated before and after the actual object.
  *
- * If the function is a closure, the Func is preceded by a Func* which points
- * to the next cloned closures (closures are cloned in order to transplant them
- * into different implementation contexts).  This pointer is considered
- * mutable, even on const Funcs.
- *
  * All Funcs are also followed by a variable number of function prologue
  * pointers.  Six are statically allocated as part of the Func object, but more
  * may follow, depending on the value of getMaxNumPrologues().
  *
- *              +--------------------------------+ low address
- *              |  [Func** to next closure]      |
  *              +--------------------------------+ Func* address
  *              |  Func object                   |
  *              |                                |
@@ -134,45 +125,28 @@ struct Func {
    * Parameter default value info.
    */
   struct ParamInfo {
-    ParamInfo()
-      : builtinType(KindOfInvalid)
-      , funcletOff(InvalidAbsoluteOffset)
-      , defaultValue(make_tv<KindOfUninit>())
-      , phpCode(nullptr)
-      , userType(nullptr)
-      , variadic(false)
-    {}
+    ParamInfo();
 
-    template<class SerDe>
-    void serde(SerDe& sd) {
-      sd(builtinType)
-        (funcletOff)
-        (defaultValue)
-        (phpCode)
-        (typeConstraint)
-        (variadic)
-        (userAttributes)
-        (userType)
-        ;
-    }
+    bool hasDefaultValue() const;
+    bool hasScalarDefaultValue() const;
+    bool isVariadic() const;
 
-    bool hasDefaultValue() const {
-      return funcletOff != InvalidAbsoluteOffset;
-    }
-    bool hasScalarDefaultValue() const {
-      return hasDefaultValue() && defaultValue.m_type != KindOfUninit;
-    }
-    bool isVariadic() const { return variadic; }
+    template<class SerDe> void serde(SerDe& sd);
 
-  public:
-    DataType builtinType;     // Typehint for builtins.
-    Offset funcletOff;
-    TypedValue defaultValue;  // Set to Uninit if there is no DV,
-                              // or if there's a nonscalar DV.
-    LowStringPtr phpCode;     // Eval'able PHP code.
-    LowStringPtr userType;    // User-annotated type.
+    // Typehint for builtins.
+    MaybeDataType builtinType{folly::none};
+    // True if this is a `...' parameter.
+    bool variadic{false};
+    // DV initializer funclet offset.
+    Offset funcletOff{InvalidAbsoluteOffset};
+    // Set to Uninit if there is no DV, or if there's a nonscalar DV.
+    TypedValue defaultValue;
+    // Eval-able PHP code.
+    LowStringPtr phpCode{nullptr};
+    // User-annotated type.
+    LowStringPtr userType{nullptr};
+
     TypeConstraint typeConstraint;
-    bool variadic;
     UserAttributeMap userAttributes;
   };
 
@@ -195,17 +169,14 @@ struct Func {
   /////////////////////////////////////////////////////////////////////////////
   // Creation and destruction.
 
-  Func(Unit& unit, PreClass* preClass, int line1, int line2,
-       Offset base, Offset past, const StringData* name, Attr attrs,
-       bool top, const StringData* docComment, int numParams);
+  Func(Unit& unit, const StringData* name, Attr attrs);
   ~Func();
 
   /*
-   * Allocate memory for a function, including the extra preceding and
-   * succeeding data.
+   * Allocate memory for a function, including the variable number of prologues
+   * that follow.
    */
-  static void* allocFuncMem(const StringData* name, int numParams,
-                            bool needsNextClonedClosure, bool lowMem);
+  static void* allocFuncMem(int numParams);
 
   /*
    * Destruct and free a Func*.
@@ -225,7 +196,20 @@ struct Func {
    * class's copy of the method.
    */
   Func* clone(Class* cls, const StringData* name = nullptr) const;
-  Func* cloneAndSetClass(Class* cls) const;
+
+  /*
+   * Reset this function's cls and attrs.
+   *
+   * Used to change the Class scope of a closure method.
+   */
+  void rescope(Class* ctx, Attr attrs);
+
+  /*
+   * Free up a PreFunc for re-use as a cloned Func.
+   *
+   * @requires: isPreFunc()
+   */
+  void freeClone();
 
   /*
    * Rename a function and reload it.
@@ -281,20 +265,47 @@ struct Func {
   // Basic info.                                                        [const]
 
   /*
-   * Whether this function was defined in a psuedomain.
+   * Whether this function was defined in a pseudomain.
    */
   bool top() const;
 
   /*
-   * The Unit, PreClass, Classes of the function.
-   *
-   * The `baseCls' is the first Class in the inheritance hierarchy which
-   * declares the method; the `cls' is the Class which implements it.
+   * The Unit the function is defined in.
    */
   Unit* unit() const;
+
+  /*
+   * The various Class contexts of a method.
+   *
+   * cls():       The Class context of the method.  This is usually the Class
+   *              which implements the method, but for closure methods (i.e.,
+   *              the __invoke() method on a closure object), it is instead the
+   *              Class that the Closure object is scoped to.
+   * preClass():  The PreClass of the method's cls().  For closures, this still
+   *              corresponds to the Closure subclass, rather than to the
+   *              scoped Class.
+   * baseCls():   The first Class in the inheritance hierarchy which declares
+   *              this method.
+   * implCls():   The Class which implements the method.  Just like cls(), but
+   *              ignores closure scope (so it returns baseCls() for closures).
+   *
+   * It is possible for cls() to be nullptr on a method---this occurs when a
+   * closure method is scoped to a null class context (e.g., if the closure is
+   * created in a non-method function scope).  In this case, only the `cls' is
+   * changed; the `preClass' and `baseCls' will continue to refer to the
+   * PreClass and Class of the closure object.
+   *
+   * The converse also occurs---a function can have a `cls' (and `baseCls')
+   * without being a method.  This happens when a pseudomain is included from a
+   * class context.
+   *
+   * Consequently, none of these methods should be used to test whether the
+   * function is a method; for that purpose, see isMethod().
+   */
+  Class* cls() const;
   PreClass* preClass() const;
   Class* baseCls() const;
-  Class* cls() const;
+  Class* implCls() const;
 
   /*
    * The function's short name (e.g., foo).
@@ -407,6 +418,8 @@ struct Func {
    *
    * There are a number of caveats regarding this value:
    *
+   *    - If the returnType() is folly::none, the return is a Variant.
+   *
    *    - If the returnType() is KindOfString, KindOfArray, or KindOfObject,
    *      null may also be returned.
    *
@@ -418,7 +431,7 @@ struct Func {
    *
    *    - This list of caveats may be incorrect and/or incomplete.
    */
-  DataType returnType() const;
+  MaybeDataType returnType() const;
 
   /*
    * Whether this function returns by reference.
@@ -536,6 +549,11 @@ struct Func {
    */
   int maxStackCells() const;
 
+  /*
+   * Checks if $this belong to a class that is not a subclass of cls().
+   */
+  bool hasForeignThis() const;
+
 
   /////////////////////////////////////////////////////////////////////////////
   // Static locals.                                                     [const]
@@ -591,8 +609,19 @@ struct Func {
    *
    * Instance methods certainly have $this, but pseudomains may as well, if
    * they were included in the context of an instance method definition.
+   *
+   * Note that closure __invoke() methods that are scoped outside the context
+   * of a class (e.g., in a toplevel non-method function) may /not/ have $this.
    */
   bool mayHaveThis() const;
+
+  /*
+   * Is this Func owned by a PreClass?
+   *
+   * A PreFunc may be "adopted" by a Class when clone() is called, but only the
+   * owning PreClass is allowed to free it.
+   */
+  bool isPreFunc() const;
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -663,33 +692,6 @@ struct Func {
    */
   bool isClosureBody() const;
 
-  /*
-   * Is this function cloned from another closure function in order to
-   * transplant it into a different context?
-   */
-  bool isClonedClosure() const;
-
-private:
-  /*
-   * Closures are allocated with an extra pointer before the Func object
-   * itself.  These are used to chain clones of these closures with different
-   * Class contexts.
-   *
-   * We consider this extra pointer to be a mutable member of Func, hence the
-   * `const' specifier here.
-   *
-   * @requires: isClosureBody()
-   */
-  Func*& nextClonedClosure() const;
-
-  /*
-   * Find the clone of this closure with `cls' as its context.
-   *
-   * Return nullptr if this is not a closure or if no such clone exists.
-   */
-  Func* findCachedClone(Class* cls) const;
-
-public:
 
   /////////////////////////////////////////////////////////////////////////////
   // Resumables.                                                        [const]
@@ -890,7 +892,7 @@ public:
    * We can burn these into the TC even when functions are not persistent,
    * since only a single name-to-function mapping will exist per request.
    */
-  RDS::Handle funcHandle() const;
+  rds::Handle funcHandle() const;
 
   /*
    * Get and set the function body code pointer.
@@ -923,6 +925,11 @@ public:
    */
   void resetPrologue(int numParams);
   void resetPrologues();
+
+  /*
+   * Smash prologue guards to prevent function from being called.
+   */
+  void smashPrologues() const;
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -969,26 +976,9 @@ public:
   char& maybeIntercepted() const;
 
   /*
-   * Populate the MethodInfo for this function in `mi'.
-   *
-   * If methInfo() is non-null, this just performs a deep copy.
+   * Access to the global vector of funcs.  This maps FuncID's back to Func*'s.
    */
-  void getFuncInfo(ClassInfo::MethodInfo* mi) const;
-
   static const AtomicVector<const Func*>& getFuncVec();
-
-  /*
-   * Profile-guided optimization linkage.
-   */
-  bool shouldPGO() const;
-  void incProfCounter();
-  uint32_t profCounter() const { return m_profCounter; }
-  void setHot() { m_attrs = (Attr)(m_attrs | AttrHot); }
-
-  /*
-   * Does any HHBC block end at `off'?
-   */
-  bool anyBlockEndsAt(Offset off) const;
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -1002,7 +992,7 @@ public:
 
   void setAttrs(Attr attrs);
   void setBaseCls(Class* baseCls);
-  void setFuncHandle(RDS::Link<Func*> l);
+  void setFuncHandle(rds::Link<Func*> l);
   void setHasPrivateAncestor(bool b);
   void setMethodSlot(Slot s);
 
@@ -1038,7 +1028,15 @@ public:
 private:
   typedef IndexedStringMap<LowStringPtr, true, Id> NamedLocalsMap;
 
-  struct SharedData : public AtomicCountable {
+  // Some 16-bit values in SharedData are stored as small deltas if they fit
+  // under this limit.  If not, they're set to the limit value and an
+  // ExtendedSharedData will be allocated for the full-width field.
+  static constexpr auto kSmallDeltaLimit = uint16_t(-1);
+
+  /*
+   * Properties shared by all clones of a Func.
+   */
+  struct SharedData : AtomicCountable {
     SharedData(PreClass* preClass, Offset base, Offset past,
                int line1, int line2, bool top, const StringData* docComment);
     ~SharedData();
@@ -1049,49 +1047,89 @@ private:
     void atomicRelease();
 
     /*
-     * Properties shared by all clones of a Func.
+     * Data fields are packed to minimize size.  Try not to add anything new
+     * here or reorder anything.
      */
-    PreClass* m_preClass;
+    // (There's a 32-bit integer in the AtomicCountable base class here.)
     Offset m_base;
-    Offset m_past;
+    PreClass* m_preClass;
     Id m_numLocals;
     Id m_numIterators;
     int m_line1;
-    int m_line2;
-    DataType m_returnType;
-    const ClassInfo::MethodInfo* m_info;
+    LowStringPtr m_docComment;
     // Bits 64 and up of the reffiness guards (the first 64 bits are in
     // Func::m_refBitVal for faster access).
     uint64_t* m_refBitPtr;
-    BuiltinFunction m_builtinFuncPtr;
-    BuiltinFunction m_nativeFuncPtr;
     ParamInfoVec m_params;
     NamedLocalsMap m_localNames;
     SVInfoVec m_staticVars;
     EHEntVec m_ehtab;
     FPIEntVec m_fpitab;
-    // Cache for the anyBlockEndsAt() method.
-    hphp_hash_set<Offset> m_blockEnds;
-    LowStringPtr m_docComment;
+
+    // One byte worth of bools right now.  Check what it does to
+    // sizeof(SharedData) if you are trying to add more than one more ...
     bool m_top : 1;
     bool m_isClosureBody : 1;
     bool m_isAsync : 1;
     bool m_isGenerator : 1;
     bool m_isPairGenerator : 1;
     bool m_isGenerated : 1;
+    bool m_hasExtendedSharedData : 1;
+
+    MaybeDataType m_returnType;
+    LowStringPtr m_retUserType;
     UserAttributeMap m_userAttributes;
     TypeConstraint m_retTypeConstraint;
-    LowStringPtr m_retUserType;
     LowStringPtr m_originalFilename;
+
+    /*
+     * The `past' offset and `line2' are likely to be small, particularly
+     * relative to m_base and m_line1.  So we encode each as a 16-bit
+     * difference.  If the delta doesn't fit, we need to have an
+     * ExtendedSharedData to hold the real values---in that case, the field
+     * here that overflowed is set to kSmallDeltaLimit and the corresponding
+     * field in ExtendedSharedData will be valid.
+     */
+    uint16_t m_line2Delta;
+    uint16_t m_pastDelta;
   };
 
-  typedef AtomicSmartPtr<SharedData> SharedDataPtr;
+  /*
+   * If a Func represents a C++ builtin, or is exceptionally large (either in
+   * line count or bytecode size), it requires extra information that most
+   * Funcs don't need, so it's SharedData is actually one of these extended
+   * SharedDatas.
+   */
+  struct ExtendedSharedData : SharedData {
+    template<class... Args>
+    explicit ExtendedSharedData(Args&&... args)
+      : SharedData(std::forward<Args>(args)...)
+    {
+      m_hasExtendedSharedData = true;
+    }
+    ExtendedSharedData(const ExtendedSharedData&) = delete;
+    ExtendedSharedData(ExtendedSharedData&&) = delete;
+
+    const ClassInfo::MethodInfo* m_info;
+    BuiltinFunction m_builtinFuncPtr;
+    BuiltinFunction m_nativeFuncPtr;
+    Offset m_past;  // Only read if SharedData::m_pastDelta is kSmallDeltaLimit
+    int m_line2;    // Only read if SharedData::m_line2 is kSmallDeltaLimit
+  };
+
+  typedef AtomicSharedPtr<SharedData> SharedDataPtr;
 
   /*
    * SharedData accessors for internal use.
    */
   const SharedData* shared() const { return m_shared.get(); }
         SharedData* shared()       { return m_shared.get(); }
+
+  /*
+   * Returns ExtendedSharedData if we have one, or else a nullptr.
+   */
+  const ExtendedSharedData* extShared() const;
+        ExtendedSharedData* extShared();
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -1100,12 +1138,55 @@ private:
   // These are all used at emit-time, and should be outsourced to FuncEmitter.
 
 private:
+  Func(const Func&) = default;  // used for clone()
+  Func& operator=(const Func&) = delete;
   void init(int numParams);
   void initPrologues(int numParams);
   void setFullName(int numParams);
   void appendParam(bool ref, const ParamInfo& info,
                    std::vector<ParamInfo>& pBuilder);
   void finishedEmittingParams(std::vector<ParamInfo>& pBuilder);
+
+
+  /////////////////////////////////////////////////////////////////////////////
+  // Internal types.
+
+  struct ClonedFlag {
+    ClonedFlag() {}
+    ClonedFlag(const ClonedFlag&) {}
+    ClonedFlag& operator=(const ClonedFlag&) = delete;
+
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+  };
+
+  /*
+   * Wrapper around std::atomic<Attr> that pretends like it's not atomic.
+   *
+   * Func::m_attrs is only accessed by multiple threads in the closure scoping
+   * process for Closure classes, which is synchronized in Class::rescope().
+   * This wrapper is just to make m_attrs copy-constructible, and there should
+   * never be a race when copying.
+   */
+  struct AtomicAttr {
+    AtomicAttr() {}
+    explicit AtomicAttr(Attr attrs) : m_attrs{attrs} {}
+
+    AtomicAttr(const AtomicAttr& o)
+      : m_attrs{o.m_attrs.load(std::memory_order_relaxed)}
+    {}
+
+    AtomicAttr& operator=(Attr attrs) {
+      m_attrs.store(attrs, std::memory_order_relaxed);
+      return *this;
+    }
+
+    /* implicit */ operator Attr() const {
+      return m_attrs.load(std::memory_order_relaxed);
+    }
+
+  private:
+    std::atomic<Attr> m_attrs;
+  };
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -1118,7 +1199,9 @@ private:
   static constexpr int kMagic = 0xba5eba11;
 
 public:
-  static std::atomic<bool> s_treadmill;
+  static std::atomic<bool>     s_treadmill;
+  static std::atomic<uint32_t> s_totalClonedClosures;
+
 
   /////////////////////////////////////////////////////////////////////////////
   // Data members.
@@ -1131,19 +1214,17 @@ private:
   // For asserts only.
   int m_magic;
 #endif
-  LowStringPtr m_fullName;
-  // Profile counter used to detect hot functions.
-  uint32_t m_profCounter{0};
   unsigned char* volatile m_funcBody;
-  mutable RDS::Link<Func*> m_cachedFunc{RDS::kInvalidHandle};
+  mutable rds::Link<Func*> m_cachedFunc{rds::kInvalidHandle};
   FuncId m_funcId{InvalidFuncId};
+  LowStringPtr m_fullName;
   LowStringPtr m_name;
   // The first Class in the inheritance hierarchy that declared this method.
   // Note that this may be an abstract class that did not provide an
   // implementation.
-  LowClassPtr m_baseCls{nullptr};
+  LowPtr<Class> m_baseCls{nullptr};
   // The Class that provided this method implementation.
-  LowClassPtr m_cls{nullptr};
+  AtomicLowPtr<Class> m_cls{nullptr};
   union {
     const NamedEntity* m_namedEntity{nullptr};
     Slot m_methodSlot;
@@ -1151,6 +1232,8 @@ private:
   // Atomically-accessed intercept flag.  -1, 0, or 1.
   // TODO(#1114385) intercept should work via invalidation.
   mutable char m_maybeIntercepted;
+  mutable ClonedFlag m_cloned;
+  bool m_isPreFunc : 1;
   bool m_hasPrivateAncestor : 1;
   int m_maxStackCells{0};
   uint64_t m_refBitVal{0};
@@ -1160,7 +1243,7 @@ private:
   // 1 if the last param is not variadic; the 31 most significant bits are the
   // total number of params (including the variadic param).
   uint32_t m_paramCounts{0};
-  Attr m_attrs;
+  AtomicAttr m_attrs;
   // This must be the last field declared in this structure, and the Func class
   // should not be inherited from.
   unsigned char* volatile m_prologueTable[kNumFixedPrologues];
@@ -1168,12 +1251,12 @@ private:
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<class EHEntVec>
-const EHEnt* findEH(const EHEntVec& ehtab, Offset o) {
+template<class Container>
+const typename Container::value_type* findEH(const Container& ehtab, Offset o) {
   uint32_t i;
   uint32_t sz = ehtab.size();
 
-  const EHEnt* eh = nullptr;
+  const typename Container::value_type* eh = nullptr;
   for (i = 0; i < sz; i++) {
     if (ehtab[i].m_base <= o && o < ehtab[i].m_past) {
       eh = &ehtab[i];
@@ -1183,6 +1266,7 @@ const EHEnt* findEH(const EHEntVec& ehtab, Offset o) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+
 }
 
 #define incl_HPHP_VM_FUNC_INL_H_

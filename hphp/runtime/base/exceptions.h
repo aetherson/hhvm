@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,28 +17,22 @@
 #ifndef incl_HPHP_CPP_BASE_EXCEPTIONS_H_
 #define incl_HPHP_CPP_BASE_EXCEPTIONS_H_
 
-#include <boost/intrusive_ptr.hpp>
 #include <string>
 #include <atomic>
 #include <utility>
 
-#include "folly/String.h"
+#include <folly/String.h>
 
 #include "hphp/util/portability.h"
 #include "hphp/util/exception.h"
+#include "hphp/runtime/base/type-array.h"
 
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
 
-struct Array;
-struct ArrayData;
 struct String;
-
-//////////////////////////////////////////////////////////////////////
-
-void intrusive_ptr_add_ref(ArrayData* a);
-void intrusive_ptr_release(ArrayData* a);
+struct IMarker;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -59,7 +53,14 @@ struct ExtendedException : Exception {
   explicit ExtendedException();
   explicit ExtendedException(const std::string& msg);
   explicit ExtendedException(SkipFrame frame, const std::string& msg);
-  explicit ExtendedException(const char* fmt, ...) ATTRIBUTE_PRINTF(2,3);
+  explicit ExtendedException(ATTRIBUTE_PRINTF_STRING const char* fmt, ...)
+    ATTRIBUTE_PRINTF(2,3);
+  ExtendedException(const ExtendedException& other);
+  ExtendedException(ExtendedException&& other) noexcept;
+  ~ExtendedException();
+
+  ExtendedException& operator=(const ExtendedException& other);
+  ExtendedException& operator=(ExtendedException&& other) noexcept;
 
   EXCEPTION_COMMON_IMPL(ExtendedException);
 
@@ -70,29 +71,37 @@ struct ExtendedException : Exception {
   bool isSilent() const { return m_silent; }
   void setSilent(bool s = true) { m_silent = s; }
 
+  virtual void vscan(IMarker&) const;
+  template<class F> void scan(F& mark) const;
 protected:
-  ExtendedException(const std::string& msg, ArrayData* backTrace)
-    : m_btp(backTrace)
-  {
-    m_msg = msg;
-  }
+  ExtendedException(const std::string& msg, ArrayData* backTrace);
 
 private:
   void computeBacktrace(bool skipFrame = false);
 
 private:
-  boost::intrusive_ptr<ArrayData> m_btp;
+  Array m_btp;
   bool m_silent{false};
+  MemoryManager::ExceptionRootKey m_key;
+
+  friend class MemoryManager;
 };
 
 struct FatalErrorException : ExtendedException {
   explicit FatalErrorException(const char *msg)
     : ExtendedException("%s", msg)
   {}
-  FatalErrorException(int, const char *msg, ...) ATTRIBUTE_PRINTF(3,4);
-  FatalErrorException(const std::string&, const Array& backtrace);
+  FatalErrorException(int, ATTRIBUTE_PRINTF_STRING const char *msg, ...)
+    ATTRIBUTE_PRINTF(3,4);
+  FatalErrorException(const std::string&, const Array& backtrace,
+                      bool isRecoverable = false);
 
   EXCEPTION_COMMON_IMPL(FatalErrorException);
+
+  bool isRecoverable() const { return m_recoverable; }
+
+private:
+  bool m_recoverable{false};
 };
 
 //////////////////////////////////////////////////////////////////////
@@ -111,6 +120,13 @@ struct RequestTimeoutException : ResourceExceededException {
   EXCEPTION_COMMON_IMPL(RequestTimeoutException);
 };
 
+struct RequestCPUTimeoutException : ResourceExceededException {
+  RequestCPUTimeoutException(const std::string& msg, const Array& backtrace)
+    : ResourceExceededException(msg, backtrace)
+  {}
+  EXCEPTION_COMMON_IMPL(RequestCPUTimeoutException);
+};
+
 struct RequestMemoryExceededException : ResourceExceededException {
   RequestMemoryExceededException(const std::string& msg,
                                  const Array& backtrace)
@@ -120,19 +136,6 @@ struct RequestMemoryExceededException : ResourceExceededException {
 };
 
 //////////////////////////////////////////////////////////////////////
-
-class ParseTimeFatalException : public Exception {
-public:
-  ParseTimeFatalException(const char* file, int line,
-                          const char* msg, ...) ATTRIBUTE_PRINTF(4,5);
-  EXCEPTION_COMMON_IMPL(ParseTimeFatalException);
-
-  void setParseFatal(bool b = true) { m_parseFatal = b; }
-
-  std::string m_file;
-  int m_line;
-  bool m_parseFatal;
-};
 
 class ExitException : public ExtendedException {
 public:
@@ -163,11 +166,11 @@ public:
  *
  * In newer code you'll generally want to use raise_error.
  */
-void throw_null_pointer_exception() ATTRIBUTE_NORETURN;
-void throw_invalid_object_type(const char* clsName) ATTRIBUTE_NORETURN;
-void throw_not_implemented(const char* feature) ATTRIBUTE_NORETURN;
-void throw_not_supported(const char* feature, const char* reason)
-  ATTRIBUTE_NORETURN;
+ATTRIBUTE_NORETURN void throw_null_pointer_exception();
+ATTRIBUTE_NORETURN void throw_invalid_object_type(const char* clsName);
+ATTRIBUTE_NORETURN void throw_not_implemented(const char* feature);
+ATTRIBUTE_NORETURN
+void throw_not_supported(const char* feature, const char* reason);
 
 //////////////////////////////////////////////////////////////////////
 

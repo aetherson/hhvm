@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -22,10 +22,10 @@
 #include <memory>
 #include <type_traits>
 
-#include "folly/gen/Base.h"
-#include "folly/Conv.h"
-#include "folly/Optional.h"
-#include "folly/Memory.h"
+#include <folly/gen/Base.h>
+#include <folly/Conv.h>
+#include <folly/Optional.h>
+#include <folly/Memory.h>
 
 #include "hphp/runtime/base/repo-auth-type.h"
 #include "hphp/runtime/base/repo-auth-type-array.h"
@@ -283,10 +283,9 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
 
     auto emit_srcloc = [&] {
       if (!inst.srcLoc.isValid()) return;
-      Location loc;
-      loc.first(inst.srcLoc.start.line, inst.srcLoc.start.col);
-      loc.last(inst.srcLoc.past.line, inst.srcLoc.past.col);
-      ue.recordSourceLocation(&loc, startOffset);
+      Location::Range loc(inst.srcLoc.start.line, inst.srcLoc.start.col,
+                          inst.srcLoc.past.line, inst.srcLoc.past.col);
+      ue.recordSourceLocation(loc, startOffset);
     };
 
     auto pop = [&] (int32_t n) {
@@ -338,7 +337,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
 #define IMM_SA(n)      ue.emitInt32(ue.mergeLitstr(data.str##n));
 #define IMM_RATA(n)    encodeRAT(ue, data.rat);
 #define IMM_AA(n)      ue.emitInt32(ue.mergeArray(data.arr##n));
-#define IMM_OA_IMPL(n) ue.emitByte(static_cast<uint8_t>(data.subop));
+#define IMM_OA_IMPL(n) ue.emitByte(static_cast<uint8_t>(data.subop##n));
 #define IMM_OA(type)   IMM_OA_IMPL
 #define IMM_BA(n)      emit_branch(*data.target);
 #define IMM_VSA(n)     emit_vsa(data.keys);
@@ -358,6 +357,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
 #define POP_C_MMANY    pop(1); pop(count_stack_elems(data.mvec));
 #define POP_R_MMANY    pop(1); pop(count_stack_elems(data.mvec));
 #define POP_V_MMANY    pop(1); pop(count_stack_elems(data.mvec));
+#define POP_MFINAL     pop(data.arg1);
 #define POP_CMANY      pop(data.arg##1);
 #define POP_SMANY      pop(data.keys.size());
 #define POP_FMANY      pop(data.arg##1);
@@ -430,6 +430,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
 #undef POP_C_MMANY
 #undef POP_R_MMANY
 #undef POP_V_MMANY
+#undef POP_MFINAL
 
 #undef PUSH_NOV
 #undef PUSH_ONE
@@ -466,7 +467,7 @@ EmitBcInfo emit_bytecode(EmitUnitState& euState,
     for (auto& inst : b->hhbcs) emit_inst(inst);
 
     if (b->fallthrough) {
-      if (boost::next(blockIt) == endBlockIt || blockIt[1] != b->fallthrough) {
+      if (std::next(blockIt) == endBlockIt || blockIt[1] != b->fallthrough) {
         if (b->fallthroughNS) {
           emit_inst(bc::JmpNS { b->fallthrough });
         } else {
@@ -868,6 +869,9 @@ void emit_class(EmitUnitState& state,
   for (auto& x : cls.requirements)       pce->addClassRequirement(x);
   for (auto& x : cls.traitPrecRules)     pce->addTraitPrecRule(x);
   for (auto& x : cls.traitAliasRules)    pce->addTraitAliasRule(x);
+  pce->setNumDeclMethods(cls.numDeclMethods);
+
+  pce->setIfaceVtableSlot(state.index.lookup_iface_vtable_slot(&cls));
 
   for (auto& m : cls.methods) {
     FTRACE(2, "    method: {}\n", m->name->data());
@@ -881,16 +885,37 @@ void emit_class(EmitUnitState& state,
   auto const privateProps   = state.index.lookup_private_props(&cls);
   auto const privateStatics = state.index.lookup_private_statics(&cls);
   for (auto& prop : cls.properties) {
-    auto const repoTy = [&] (const PropState& ps) -> RepoAuthType {
-      // TODO(#3599292): we don't currently infer closure use var types.
-      if (is_closure(cls)) return RepoAuthType{};
-      auto it = ps.find(prop.name);
-      if (it == end(ps)) return RepoAuthType{};
-      auto const rat = make_repo_type(*state.index.array_table_builder(),
-                                      it->second);
+    auto const makeRat = [&] (const Type& ty) -> RepoAuthType {
+      if (ty.couldBe(TCls)) {
+        return RepoAuthType{};
+      }
+      auto const rat = make_repo_type(*state.index.array_table_builder(), ty);
       merge_repo_auth_type(ue, rat);
       return rat;
     };
+
+    auto const privPropTy = [&] (const PropState& ps) -> Type {
+      /*
+       * Skip closures, because the types of their used vars can be
+       * communicated via assert opcodes right now.  At the time of this
+       * writing there was nothing to gain by including RAT's for the
+       * properties, since closure properties are only used internally by the
+       * runtime, not directly via opcodes like CGetM.
+       */
+      if (is_closure(cls)) return Type{};
+
+      auto it = ps.find(prop.name);
+      if (it == end(ps)) return Type{};
+      return it->second;
+    };
+
+    Type propTy;
+    auto const attrs = prop.attrs;
+    if (attrs & AttrPrivate) {
+      propTy = privPropTy((attrs & AttrStatic) ? privateStatics : privateProps);
+    } else if ((attrs & AttrPublic) && (attrs & AttrStatic)) {
+      propTy = state.index.lookup_public_static(&cls, prop.name);
+    }
 
     pce->addProperty(
       prop.name,
@@ -898,20 +923,34 @@ void emit_class(EmitUnitState& state,
       prop.typeConstraint,
       prop.docComment,
       &prop.val,
-      (prop.attrs & AttrStatic) ? repoTy(privateStatics) : repoTy(privateProps)
+      makeRat(propTy)
     );
   }
 
   for (auto& cconst : cls.constants) {
-    pce->addConstant(
-      cconst.name,
-      cconst.typeConstraint,
-      &cconst.val,
-      cconst.phpCode
-    );
+    if (!cconst.val.hasValue()) {
+      pce->addAbstractConstant(
+        cconst.name,
+        cconst.typeConstraint,
+        cconst.isTypeconst
+      );
+    } else {
+      pce->addConstant(
+        cconst.name,
+        cconst.typeConstraint,
+        &cconst.val.value(),
+        cconst.phpCode,
+        cconst.isTypeconst
+      );
+    }
   }
 
   pce->setEnumBaseTy(cls.enumBaseTy);
+}
+
+void emit_typealias(UnitEmitter& ue, const php::TypeAlias& alias) {
+  auto const id = ue.addTypeAlias(alias);
+  ue.pushMergeableTypeAlias(HPHP::Unit::MergeKind::TypeAlias, id);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -959,7 +998,7 @@ std::unique_ptr<UnitEmitter> emit_unit(const Index& index,
   emit_pseudomain(state, *ue, unit);
   for (auto& c : unit.classes)     emit_class(state, *ue, *c);
   for (auto& f : unit.funcs)       emit_func(state, *ue, *f);
-  for (auto& t : unit.typeAliases) ue->addTypeAlias(*t);
+  for (auto& t : unit.typeAliases) emit_typealias(*ue, *t);
 
   for (size_t id = 0; id < unit.classes.size(); ++id) {
     // We may not have a DefCls PC if we're a closure, or a

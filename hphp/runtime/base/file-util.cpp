@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -26,7 +26,7 @@
 #include <fcntl.h>
 #include <libgen.h>
 
-#include "folly/String.h"
+#include <folly/String.h>
 
 #include "hphp/util/lock.h"
 #include "hphp/util/logger.h"
@@ -229,7 +229,7 @@ int FileUtil::copy(const char *srcfile, const char *dstfile) {
 }
 
 static int force_sync(int fd) {
-#if defined(__FreeBSD__) || defined(__APPLE__)
+#if defined(__FreeBSD__) || defined(__APPLE__) || defined(_MSC_VER)
   return fsync(fd);
 #else
   return fdatasync(fd);
@@ -401,7 +401,7 @@ String FileUtil::relativePath(const std::string& fromDir,
   }
 
   String ret(maxlen, ReserveString);
-  char* path = ret.bufferSlice().ptr;
+  char* path = ret.mutableData();
 
   const char* from_dir = fromDir.c_str();
   const char* to_file = toFile.c_str();
@@ -445,7 +445,7 @@ String FileUtil::relativePath(const std::string& fromDir,
 
   // Ensure the result is null-terminated after the strcpy
   assert(to_start - to_file <= toFile.size());
-  assert(path_end - path + strlen(to_start) < ret.get()->capacity());
+  assert(path_end - path + strlen(to_start) <= ret.capacity());
 
   strcpy(path_end, to_start);
   return ret.setSize(strlen(path));
@@ -477,7 +477,7 @@ String FileUtil::canonicalize(const std::string &path) {
 
 String FileUtil::canonicalize(const char *addpath, size_t addlen,
                               bool collapse_slashes /* = true */) {
-  assert(strlen(addpath) == addlen);
+  assert(strlen(addpath) <= addlen);
   // 4 for slashes at start, after root, and at end, plus trailing
   // null
   size_t maxlen = addlen + 4;
@@ -490,7 +490,7 @@ String FileUtil::canonicalize(const char *addpath, size_t addlen,
     addpath = "";
 
   String ret(maxlen-1, ReserveString);
-  char *path = ret.bufferSlice().ptr;
+  char *path = ret.mutableData();
 
   if (addpath[0] == '/' && collapse_slashes) {
     /* Ignore the given root path, strip off leading

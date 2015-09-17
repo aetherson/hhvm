@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -15,7 +15,6 @@
 */
 
 #include "hphp/runtime/vm/unit.h"
-
 #include "hphp/runtime/vm/repo.h"
 
 namespace HPHP {
@@ -73,15 +72,16 @@ bool LitstrRepoProxy::GetLitstrsStmt::get() {
       txn.prepare(*this, ssSelect.str());
     }
     RepoTxnQuery query(txn, *this);
+    NamedEntityPairTable namedInfo;
     do {
       query.step();
       if (query.row()) {
-        Id litstrId;        /**/ query.getId(0, litstrId);
         StringData* litstr; /**/ query.getStaticString(1, litstr);
-        Id id UNUSED = LitstrTable::get().mergeLitstr(litstr);
-        assert(id == litstrId);
+        namedInfo.emplace_back(litstr, nullptr);
       }
     } while (!query.done());
+    namedInfo.shrink_to_fit();
+    LitstrTable::get().setNamedEntityPairTable(std::move(namedInfo));
     txn.commit();
   } catch (RepoExc& re) {
     return true;

@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -12,9 +12,9 @@ open Utils
 val remove_classes: SSet.t -> unit
 
 (*
- * This function works by side effects. It is adding in the 
+ * This function works by side effects. It is adding in the
  * Naming_heap the nast produced from the ast passed as a parameter
- * (the SharedMem must thus have been initialized via SharedMem.init()
+ * (the SharedMem must thus have been initialized via SharedMem.init
  * prior to calling this function). It also assumes the Parser_heap
  * has been previously populated. It also adds dependencies
  * via Typing_deps.add_idep. It finally adds all the typing information
@@ -22,12 +22,12 @@ val remove_classes: SSet.t -> unit
  * in Typing_env.Class, Typing_env.Fun, and Typing_env.Typedef.
  *)
 val name_and_declare_types_program:
-  Naming.env -> SSet.t SMap.t (* set of classes in all files *) -> Ast.program->
-  unit
+  Naming.env -> Relative_path.Set.t SMap.t (* set of classes in all files *) ->
+  Ast.program -> unit
 
 val make_env:
-  Naming.env -> SSet.t SMap.t -> string -> unit
-
+  Naming.env -> Relative_path.Set.t SMap.t ->
+  Relative_path.t -> unit
 
 val class_decl:
-  Nast.class_ -> unit
+  TypecheckerOptions.t -> Nast.class_ -> unit

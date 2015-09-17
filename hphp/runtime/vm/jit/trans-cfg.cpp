@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,27 +17,38 @@
 #include "hphp/runtime/vm/jit/trans-cfg.h"
 #include <algorithm>
 
-#include "folly/MapUtil.h"
+#include <folly/MapUtil.h>
 
 #include "hphp/runtime/vm/jit/prof-data.h"
 #include "hphp/runtime/vm/jit/region-selection.h"
 
 namespace HPHP { namespace jit {
 
-static const Trace::Module TRACEMOD = Trace::pgo;
+TRACE_SET_MOD(pgo);
 
-static TransIDSet findPredTrans(const SrcRec* sr,
+static TransIDSet findPredTrans(TransID dstID,
+                                const ProfData* profData,
+                                const SrcDB& srcDB,
                                 const TcaTransIDMap& jmpToTransID) {
-  assert(sr);
+  SrcKey dstSK = profData->transSrcKey(dstID);
+  const SrcRec* dstSR = srcDB.find(dstSK);
+  assertx(dstSR);
   TransIDSet predSet;
 
-  for (auto& inBr : sr->incomingBranches()) {
-    TransID srcId = folly::get_default(jmpToTransID, inBr.toSmash(),
-      kInvalidTransID);
-    FTRACE(5, "findPredTrans: toSmash = {}   srcId = {}\n",
-           inBr.toSmash(), srcId);
-    if (srcId != kInvalidTransID) {
-      predSet.insert(srcId);
+  for (auto& inBr : dstSR->incomingBranches()) {
+    TransID srcID = folly::get_default(jmpToTransID, inBr.toSmash(),
+                                       kInvalidTransID);
+    FTRACE(5, "findPredTrans: toSmash = {}   srcID = {}\n",
+           inBr.toSmash(), srcID);
+    if (srcID != kInvalidTransID && profData->isKindProfile(srcID)) {
+      auto srcSuccOffsets = profData->transLastSrcKey(srcID).succOffsets();
+      if (srcSuccOffsets.count(dstSK.offset())) {
+        predSet.insert(srcID);
+      } else {
+        FTRACE(5, "findPredTrans: WARNING: incoming branch with impossible "
+               "control flow between translations: {} -> {}"
+               "(probably due to side exit)\n", srcID, dstID);
+      }
     }
   }
 
@@ -78,17 +89,17 @@ static bool inferredArcWeight(const TransCFG::ArcPtrVec& arcVec,
 TransCFG::TransCFG(FuncId funcId,
                    const ProfData* profData,
                    const SrcDB& srcDB,
-                   const TcaTransIDMap& jmpToTransID) {
-  assert(profData);
+                   const TcaTransIDMap& jmpToTransID,
+                   bool inlining /* = false */) {
+  assertx(profData);
 
   // add nodes
   for (auto tid : profData->funcProfTransIDs(funcId)) {
-    assert(profData->transRegion(tid) != nullptr);
+    assertx(profData->transRegion(tid) != nullptr);
     // This will skip DV Funclets if they were already
     // retranslated w/ the prologues:
-    if (!profData->optimized(profData->transSrcKey(tid))) {
-      int64_t counter = profData->transCounter(tid);
-      int64_t weight  = RuntimeOption::EvalJitPGOThreshold - counter;
+    if (inlining || !profData->optimized(profData->transSrcKey(tid))) {
+      int64_t weight = profData->transCounter(tid);
       addNode(tid, weight);
     }
   }
@@ -97,13 +108,15 @@ TransCFG::TransCFG(FuncId funcId,
   for (TransID dstId : nodes()) {
     SrcKey dstSK = profData->transSrcKey(dstId);
     RegionDesc::BlockPtr dstBlock = profData->transRegion(dstId)->entry();
-    const SrcRec* dstSR = srcDB.find(dstSK);
     FTRACE(5, "TransCFG: adding incoming arcs in dstId = {}\n", dstId);
-    TransIDSet predIDs = findPredTrans(dstSR, jmpToTransID);
+    TransIDSet predIDs = findPredTrans(dstId, profData, srcDB, jmpToTransID);
     for (auto predId : predIDs) {
       if (hasNode(predId)) {
-        auto predPostConds =
-          profData->transRegion(predId)->blocks().back()->postConds();
+        const auto  predBlock = profData->transRegion(predId)->blocks().back();
+        const auto& postConds = predBlock->postConds();
+        auto predPostConds = postConds.changed;
+        predPostConds.insert(predPostConds.end(), postConds.refined.begin(),
+                             postConds.refined.end());
         SrcKey predSK = profData->transSrcKey(predId);
         if (preCondsAreSatisfied(dstBlock, predPostConds) &&
             predSK.resumed() == dstSK.resumed()) {
@@ -126,7 +139,7 @@ TransCFG::TransCFG(FuncId funcId,
     }
   } while (changed);
 
-  // guess weight or non-inferred arcs
+  // guess weight for non-inferred arcs
   for (TransID tid : nodes()) {
     for (auto arc : outArcs(tid)) {
       if (arc->weight() == Arc::kUnknownWeight) {
@@ -139,19 +152,19 @@ TransCFG::TransCFG(FuncId funcId,
 }
 
 int64_t TransCFG::weight(TransID id) const {
-  assert(hasNode(id));
+  assertx(hasNode(id));
   size_t idx = folly::get_default(m_idToIdx, id);
   return m_nodeInfo[idx].weight();
 }
 
 const TransCFG::ArcPtrVec& TransCFG::inArcs(TransID id) const {
-  assert(hasNode(id));
+  assertx(hasNode(id));
   size_t idx = folly::get_default(m_idToIdx, id);
   return m_nodeInfo[idx].inArcs();
 }
 
 const TransCFG::ArcPtrVec& TransCFG::outArcs(TransID id) const {
-  assert(hasNode(id));
+  assertx(hasNode(id));
   size_t idx = folly::get_default(m_idToIdx, id);
   return m_nodeInfo[idx].outArcs();
 }
@@ -183,8 +196,8 @@ TransCFG::ArcPtrVec TransCFG::arcs() const {
 }
 
 void TransCFG::addArc(TransID srcId, TransID dstId, int64_t weight) {
-  assert(hasNode(srcId));
-  assert(hasNode(dstId));
+  assertx(hasNode(srcId));
+  assertx(hasNode(dstId));
   size_t srcIdx = m_idToIdx[srcId];
   size_t dstIdx = m_idToIdx[dstId];
   Arc* arc = new Arc(srcId, dstId, weight);
@@ -193,8 +206,8 @@ void TransCFG::addArc(TransID srcId, TransID dstId, int64_t weight) {
 }
 
 bool TransCFG::hasArc(TransID srcId, TransID dstId) const {
-  assert(hasNode(srcId));
-  assert(hasNode(dstId));
+  assertx(hasNode(srcId));
+  assertx(hasNode(dstId));
   for (auto arc : outArcs(srcId)) {
     if (arc->dst() == dstId) return true;
   }

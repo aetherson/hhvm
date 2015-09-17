@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,17 +8,17 @@
  *
  *)
 
+open Core
 open Utils
 
 type result = {
   orig_name: string;
-  orig_pos: Pos.t;
+  orig_pos: Pos.absolute;
   dest_name: string;
-  dest_pos: Pos.t;
+  dest_pos: Pos.absolute;
   orig_p_name: string; (* Used for methods to find their parent class *)
   dest_p_name: string;
 }
-
 
 (* Used so the given input doesn't need the `\`. *)
 let add_ns name =
@@ -29,19 +29,19 @@ let get_overridden_methods origin_class or_mthds dest_class is_child acc =
     Naming_heap.ClassHeap.find_unsafe dest_class in
 
   (* Check if each destination method exists in the origin *)
-  List.fold_left begin fun acc de_mthd ->
+  List.fold_left dest_class.Nast.c_methods ~init:acc ~f:begin fun acc de_mthd ->
     let or_mthd = SMap.get (snd de_mthd.Nast.m_name) or_mthds in
     match or_mthd with
     | Some or_mthd -> {
           orig_name = snd or_mthd.Nast.m_name;
-          orig_pos = fst or_mthd.Nast.m_name;
+          orig_pos = Pos.to_absolute (fst or_mthd.Nast.m_name);
           dest_name = snd de_mthd.Nast.m_name;
-          dest_pos = fst de_mthd.Nast.m_name;
+          dest_pos = Pos.to_absolute (fst de_mthd.Nast.m_name);
           orig_p_name = origin_class;
           dest_p_name = snd dest_class.Nast.c_name;
         } :: acc
     | None -> acc
-  end acc dest_class.Nast.c_methods
+  end
 
 let check_if_extends_class_and_find_methods target_class_name mthds
       target_class_pos class_name acc =
@@ -56,9 +56,9 @@ let check_if_extends_class_and_find_methods target_class_name mthds
                       true
                       acc in {
           orig_name = target_class_name;
-          orig_pos = target_class_pos;
+          orig_pos = Pos.to_absolute target_class_pos;
           dest_name = c.Typing_defs.tc_name;
-          dest_pos = c.Typing_defs.tc_pos;
+          dest_pos = Pos.to_absolute c.Typing_defs.tc_pos;
           orig_p_name = "";
           dest_p_name = "";
         } :: acc
@@ -66,25 +66,25 @@ let check_if_extends_class_and_find_methods target_class_name mthds
 
 let filter_extended_classes target_class_name mthds target_class_pos
       acc classes =
-  List.fold_left begin fun acc cid ->
+  List.fold_left classes ~init:acc ~f:begin fun acc cid ->
    check_if_extends_class_and_find_methods
       target_class_name
       mthds
       target_class_pos
       (snd cid)
       acc
-  end acc classes
+  end
 
 let find_extended_classes_in_files target_class_name mthds target_class_pos
       acc classes =
-  List.fold_left begin fun acc classes ->
+  List.fold_left classes ~init:acc ~f:begin fun acc classes ->
     filter_extended_classes target_class_name mthds target_class_pos acc classes
-  end acc classes
+  end
 
 let find_extended_classes_in_files_parallel workers target_class_name mthds
       target_class_pos files_info files =
-  let classes = SSet.fold begin fun fn acc ->
-    let { FileInfo.classes; _ } = SMap.find_unsafe fn files_info in
+  let classes = Relative_path.Set.fold begin fun fn acc ->
+    let { FileInfo.classes; _ } = Relative_path.Map.find_unsafe fn files_info in
     classes :: acc
   end files [] in
 
@@ -134,9 +134,9 @@ let get_ancestor_classes_and_methods cls mthds acc =
                           false
                           acc in {
               orig_name = Utils.strip_ns cls.Typing_defs.tc_name;
-              orig_pos = cls.Typing_defs.tc_pos;
+              orig_pos = Pos.to_absolute cls.Typing_defs.tc_pos;
               dest_name = Utils.strip_ns c.Typing_defs.tc_name;
-              dest_pos = c.Typing_defs.tc_pos;
+              dest_pos = Pos.to_absolute c.Typing_defs.tc_pos;
               orig_p_name = "";
               dest_p_name = "";
             } :: acc
@@ -146,9 +146,9 @@ let build_method_smap cls =
   let cls =
     Naming_heap.ClassHeap.find_unsafe cls in
 
-  List.fold_left begin fun acc or_mthd ->
+  List.fold_left cls.Nast.c_methods ~init:SMap.empty ~f:begin fun acc or_mthd ->
     SMap.add (snd or_mthd.Nast.m_name) or_mthd acc
-  end SMap.empty cls.Nast.c_methods
+  end
 
 (*  Returns a list of the ancestor or child
  *  classes and methods for a given class

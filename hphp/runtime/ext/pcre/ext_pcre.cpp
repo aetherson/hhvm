@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -17,18 +17,21 @@
 
 #include "hphp/runtime/ext/pcre/ext_pcre.h"
 #include "hphp/runtime/base/preg.h"
+#include "hphp/runtime/base/builtin-functions.h"
 
 #include <pcre.h>
 
-#include "hphp/runtime/ext/ext_mb.h"
-#include "hphp/runtime/ext/ext_string.h"
-#include "hphp/runtime/ext/ext_function.h"
+#include "hphp/runtime/ext/mbstring/ext_mbstring.h"
+#include "hphp/runtime/ext/std/ext_std_function.h"
+#include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/base/ini-setting.h"
 #include "hphp/runtime/base/request-local.h"
 
 namespace HPHP {
 
 ///////////////////////////////////////////////////////////////////////////////
+
+static int s_pcre_has_jit = 0;
 
 Variant HHVM_FUNCTION(preg_grep, const String& pattern, const Array& input,
                                  int flags /* = 0 */) {
@@ -37,26 +40,24 @@ Variant HHVM_FUNCTION(preg_grep, const String& pattern, const Array& input,
 
 ///////////////////////////////////////////////////////////////////////////////
 
-Variant HHVM_FUNCTION(preg_match, const String& pattern, const String& subject,
-                                  VRefParam matches /* = null */,
-                                  int flags /* = 0 */, int offset /* = 0 */) {
-  if (matches.isReferenced()) {
-    return preg_match(pattern, subject, matches, flags, offset);
-  } else {
-    return preg_match(pattern, subject, flags, offset);
-  }
+Variant HHVM_FUNCTION(preg_match,
+                      const String& pattern, const String& subject,
+                      VRefParam matches /* = null */,
+                      int flags /* = 0 */, int offset /* = 0 */) {
+  return preg_match(pattern, subject,
+                    matches.getVariantOrNull(),
+                    flags, offset);
 }
 
-Variant HHVM_FUNCTION(preg_match_all, const String& pattern,
-                                      const String& subject,
-                                      VRefParam matches /* = null */,
-                                      int flags /* = 0 */,
-                                      int offset /* = 0 */) {
-  if (matches.isReferenced()) {
-    return preg_match_all(pattern, subject, matches, flags, offset);
-  } else {
-    return preg_match_all(pattern, subject, flags, offset);
-  }
+Variant HHVM_FUNCTION(preg_match_all,
+                      const String& pattern,
+                      const String& subject,
+                      VRefParam matches /* = null */,
+                      int flags /* = 0 */,
+                      int offset /* = 0 */) {
+  return preg_match_all(pattern, subject,
+                        matches.getVariantOrNull(),
+                        flags, offset);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -66,27 +67,29 @@ Variant HHVM_FUNCTION(preg_replace, const Variant& pattern, const Variant& repla
                                     const Variant& subject, int limit /* = -1 */,
                                     VRefParam count /* = null */) {
   return preg_replace_impl(pattern, replacement, subject,
-                           limit, count, false, false);
+                           limit, count.getVariantOrNull(), false, false);
 }
 
-Variant HHVM_FUNCTION(preg_replace_callback, const Variant& pattern, const Variant& callback,
-                                             const Variant& subject,
-                                             int limit /* = -1 */,
-                                             VRefParam count /* = null */) {
-  if (!f_is_callable(callback)) {
+Variant HHVM_FUNCTION(preg_replace_callback,
+                      const Variant& pattern,
+                      const Variant& callback,
+                      const Variant& subject,
+                      int limit /* = -1 */,
+                      VRefParam count /* = null */) {
+  if (!is_callable(callback)) {
     raise_warning("Not a valid callback function %s",
-        callback.toString().data());
+                  callback.toString().data());
     return empty_string_variant();
   }
   return preg_replace_impl(pattern, callback, subject,
-                           limit, count, true, false);
+                           limit, count.getVariantOrNull(), true, false);
 }
 
 Variant HHVM_FUNCTION(preg_filter, const Variant& pattern, const Variant& callback,
                                    const Variant& subject, int limit /* = -1 */,
                                    VRefParam count /* = null */) {
   return preg_replace_impl(pattern, callback, subject,
-                           limit, count, false, true);
+                           limit, count.getVariantOrNull(), false, true);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -117,23 +120,23 @@ int64_t HHVM_FUNCTION(preg_last_error) {
 String HHVM_FUNCTION(ereg_replace, const String& pattern,
                                    const String& replacement,
                                    const String& str) {
-  return f_mb_ereg_replace(pattern, replacement, str);
+  return HHVM_FN(mb_ereg_replace)(pattern, replacement, str);
 }
 
 String HHVM_FUNCTION(eregi_replace, const String& pattern,
                                     const String& replacement,
                                     const String& str) {
-  return f_mb_eregi_replace(pattern, replacement, str);
+  return HHVM_FN(mb_eregi_replace)(pattern, replacement, str);
 }
 
 Variant HHVM_FUNCTION(ereg, const String& pattern, const String& str,
                             VRefParam regs /* = null */) {
-  return f_mb_ereg(pattern, str, ref(regs));
+  return HHVM_FN(mb_ereg)(pattern, str, ref(regs));
 }
 
 Variant HHVM_FUNCTION(eregi, const String& pattern, const String& str,
                              VRefParam regs /* = null */) {
-  return f_mb_eregi(pattern, str, ref(regs));
+  return HHVM_FN(mb_eregi)(pattern, str, ref(regs));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -170,13 +173,13 @@ String HHVM_FUNCTION(sql_regcase, const String& str) {
 
 const StaticString s_PCRE_VERSION("PCRE_VERSION");
 
-extern IMPLEMENT_THREAD_LOCAL(PCREglobals, s_pcre_globals);
+extern IMPLEMENT_THREAD_LOCAL(PCREglobals, tl_pcre_globals);
 
-class PcreExtension : public Extension {
+class PcreExtension final : public Extension {
 public:
   PcreExtension() : Extension("pcre", NO_EXTENSION_VERSION_YET) {}
 
-  virtual void moduleInit() {
+  void moduleInit() override {
     Native::registerConstant<KindOfString>(
       s_PCRE_VERSION.get(), makeStaticString(pcre_version())
     );
@@ -221,17 +224,22 @@ public:
     HHVM_FE(sql_regcase);
 
     loadSystemlib();
+
+    pcre_config(PCRE_CONFIG_JIT, &s_pcre_has_jit);
+    IniSetting::Bind(this, IniSetting::PHP_INI_ONLY,
+                     "hhvm.pcre.jit",
+                     &s_pcre_has_jit);
   }
 
-  virtual void threadInit() {
+  void threadInit() override {
     IniSetting::Bind(this, IniSetting::PHP_INI_ALL,
                      "pcre.backtrack_limit",
                      std::to_string(RuntimeOption::PregBacktraceLimit).c_str(),
-                     &s_pcre_globals->m_preg_backtrace_limit);
+                     &tl_pcre_globals->preg_backtrace_limit);
     IniSetting::Bind(this, IniSetting::PHP_INI_ALL,
                      "pcre.recursion_limit",
                      std::to_string(RuntimeOption::PregRecursionLimit).c_str(),
-                     &s_pcre_globals->m_preg_recursion_limit);
+                     &tl_pcre_globals->preg_recursion_limit);
   }
 
 } s_pcre_extension;

@@ -1,6 +1,8 @@
 %{ /* -*- mode: c++ -*- */
 #include "hphp/parser/scanner.h"
+#include "hphp/system/systemlib.h"
 #include <cassert>
+#include <cctype>
 
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Wnull-conversion"
@@ -101,6 +103,7 @@ static int getNextTokenType(int t) {
     case T_IS_NOT_IDENTICAL:
     case T_IS_SMALLER_OR_EQUAL:
     case T_IS_GREATER_OR_EQUAL:
+    case T_SPACESHIP:
     case T_PLUS_EQUAL:
     case T_MINUS_EQUAL:
     case T_MUL_EQUAL:
@@ -177,6 +180,7 @@ static int getNextTokenType(int t) {
     case T_GROUP:
     case T_BY:
       return NextTokenType::TypeListMaybe;
+    case T_SUPER:
     case T_XHP_ATTRIBUTE:
       return NextTokenType::XhpClassName |
              NextTokenType::TypeListMaybe;
@@ -201,6 +205,7 @@ static int getNextTokenType(int t) {
 %x ST_LOOKING_FOR_PROPERTY
 %x ST_LOOKING_FOR_VARNAME
 %x ST_LOOKING_FOR_COLON
+%x ST_LOOKING_FOR_FUNC_NAME
 %x ST_VAR_OFFSET
 %x ST_LT_CHECK
 %x ST_COMMENT
@@ -261,7 +266,6 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 
 <ST_IN_SCRIPTING>"exit"                 { RETTOKEN(T_EXIT);}
 <ST_IN_SCRIPTING>"die"                  { RETTOKEN(T_EXIT);}
-<ST_IN_SCRIPTING>"function"             { RETTOKEN(T_FUNCTION);}
 <ST_IN_SCRIPTING>"const"                { RETTOKEN(T_CONST);}
 <ST_IN_SCRIPTING>"return"               { RETTOKEN(T_RETURN); }
 <ST_IN_SCRIPTING>"yield"                { RETTOKEN(T_YIELD);}
@@ -270,7 +274,7 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 <ST_IN_SCRIPTING>"finally"              { RETTOKEN(T_FINALLY);}
 <ST_IN_SCRIPTING>"throw"                { RETTOKEN(T_THROW);}
 <ST_IN_SCRIPTING>"if"                   { RETTOKEN(T_IF);}
-<ST_IN_SCRIPTING>"elseif"               { RETTOKEN(T_ELSEIF);}
+<ST_IN_SCRIPTING>"else"{WHITESPACE}*"if" {RETTOKEN(T_ELSEIF);}
 <ST_IN_SCRIPTING>"endif"                { RETTOKEN(T_ENDIF);}
 <ST_IN_SCRIPTING>"else"                 { RETTOKEN(T_ELSE);}
 <ST_IN_SCRIPTING>"while"                { RETTOKEN(T_WHILE);}
@@ -284,6 +288,7 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 <ST_IN_SCRIPTING>"enddeclare"           { RETTOKEN(T_ENDDECLARE);}
 <ST_IN_SCRIPTING>"instanceof"           { RETTOKEN(T_INSTANCEOF);}
 <ST_IN_SCRIPTING>"as"                   { RETTOKEN(T_AS);}
+<ST_IN_SCRIPTING>"super"                { RETTOKEN(T_SUPER);}
 <ST_IN_SCRIPTING>"switch"               { RETTOKEN(T_SWITCH);}
 <ST_IN_SCRIPTING>"endswitch"            { RETTOKEN(T_ENDSWITCH);}
 <ST_IN_SCRIPTING>"case"                 { RETTOKEN(T_CASE);}
@@ -306,6 +311,28 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 <ST_IN_SCRIPTING>"children"             { XHP_ONLY_KEYWORD(T_XHP_CHILDREN); }
 <ST_IN_SCRIPTING>"required"             { XHP_ONLY_KEYWORD(T_XHP_REQUIRED); }
 
+<ST_IN_SCRIPTING>"function" {
+  if (!HPHP::SystemLib::s_inited) {
+    yy_push_state(ST_LOOKING_FOR_FUNC_NAME, yyscanner);
+  }
+  RETTOKEN(T_FUNCTION);
+}
+
+<ST_LOOKING_FOR_FUNC_NAME>"&" {
+  yyless(1);
+  RETSTEP('&');
+}
+
+<ST_IN_SCRIPTING>"?->" {
+        if (_scanner->isHHSyntaxEnabled()) {
+          STEPPOS(T_NULLSAFE_OBJECT_OPERATOR);
+          yy_push_state(ST_LOOKING_FOR_PROPERTY, yyscanner);
+          return T_NULLSAFE_OBJECT_OPERATOR;
+        }
+        yyless(1);
+        RETSTEP('?');
+}
+
 <ST_IN_SCRIPTING>"->" {
         STEPPOS(T_OBJECT_OPERATOR);
         yy_push_state(ST_LOOKING_FOR_PROPERTY, yyscanner);
@@ -316,17 +343,30 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
         RETSTEP(T_OBJECT_OPERATOR);
 }
 
-<ST_LOOKING_FOR_PROPERTY>{LABEL} {
+<ST_LOOKING_FOR_PROPERTY,ST_LOOKING_FOR_FUNC_NAME>{LABEL} {
         SETTOKEN(T_STRING);
         yy_pop_state(yyscanner);
         return T_STRING;
 }
 
-<ST_LOOKING_FOR_PROPERTY>{WHITESPACE} {
+<ST_LOOKING_FOR_PROPERTY>":"{XHPLABEL}  {
+  if (_scanner->isHHSyntaxEnabled()) {
+    /* After -> or ?->, HH mode supports ":xhp-label"-style identifiers.
+       We strip off the first colon, but aside from that we do not mangle
+       the XHP name. */
+    yytext++; yyleng--;
+    yy_pop_state(yyscanner);
+    RETTOKEN(T_XHP_LABEL);
+  }
+  yyless(1);
+  RETSTEP(':');
+}
+
+<ST_LOOKING_FOR_PROPERTY,ST_LOOKING_FOR_FUNC_NAME>{WHITESPACE} {
         RETSTEP(T_WHITESPACE);
 }
 
-<ST_LOOKING_FOR_PROPERTY>{ANY_CHAR} {
+<ST_LOOKING_FOR_PROPERTY,ST_LOOKING_FOR_FUNC_NAME>{ANY_CHAR} {
         yyless(0);
         yy_pop_state(yyscanner);
 }
@@ -425,6 +465,7 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 <ST_IN_SCRIPTING>"!="|"<>"            { RETSTEP(T_IS_NOT_EQUAL);}
 <ST_IN_SCRIPTING>"<="                 { RETSTEP(T_IS_SMALLER_OR_EQUAL);}
 <ST_IN_SCRIPTING>">="                 { RETSTEP(T_IS_GREATER_OR_EQUAL);}
+<ST_IN_SCRIPTING>"<=>"                { RETSTEP(T_SPACESHIP);}
 <ST_IN_SCRIPTING>"+="                 { RETSTEP(T_PLUS_EQUAL);}
 <ST_IN_SCRIPTING>"-="                 { RETSTEP(T_MINUS_EQUAL);}
 <ST_IN_SCRIPTING>"*="                 { RETSTEP(T_MUL_EQUAL);}
@@ -446,9 +487,6 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 <ST_IN_SCRIPTING>"<<"                 { RETSTEP(T_SL);}
 
 <ST_IN_SCRIPTING>"shape"              { HH_ONLY_KEYWORD(T_SHAPE); }
-<ST_IN_SCRIPTING>"varray"             { HH_ONLY_KEYWORD(T_VARRAY); }
-<ST_IN_SCRIPTING>"miarray"            { HH_ONLY_KEYWORD(T_MIARRAY); }
-<ST_IN_SCRIPTING>"msarray"            { HH_ONLY_KEYWORD(T_MSARRAY); }
 <ST_IN_SCRIPTING>"type"               { HH_ONLY_KEYWORD(T_UNRESOLVED_TYPE); }
 <ST_IN_SCRIPTING>"newtype"            { HH_ONLY_KEYWORD(T_UNRESOLVED_NEWTYPE); }
 <ST_IN_SCRIPTING>"await"              { HH_ONLY_KEYWORD(T_AWAIT);}
@@ -468,7 +506,7 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 <ST_IN_SCRIPTING>"select"             { HH_ONLY_KEYWORD(T_SELECT); }
 <ST_IN_SCRIPTING>"group"              { HH_ONLY_KEYWORD(T_GROUP); }
 <ST_IN_SCRIPTING>"by"                 { HH_ONLY_KEYWORD(T_BY); }
-<ST_IN_SCRIPTING>"async"/{WHITESPACE_AND_COMMENTS}[a-zA-Z0-9_\x7f-\xff($] {
+<ST_IN_SCRIPTING>"async"/{WHITESPACE_AND_COMMENTS}[a-zA-Z0-9_\x7f-\xff(${] {
   HH_ONLY_KEYWORD(T_ASYNC);
 }
 
@@ -632,7 +670,8 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
         return '}';
 }
 
-<ST_LOOKING_FOR_VARNAME>{LABEL} {
+<ST_LOOKING_FOR_VARNAME>{LABEL}[[}] {
+        yyless(yyleng - 1);
         SETTOKEN(T_STRING_VARNAME);
         // Change state to IN_SCRIPTING; current state will be popped
         // when we encounter '}'
@@ -746,13 +785,13 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 <ST_IN_SCRIPTING>"__NAMESPACE__"        { RETTOKEN(T_NS_C); }
 
 <INITIAL>"#!"[^\n]*"\n" {
-        _scanner->setHashBang(yytext, yyleng, T_INLINE_HTML);
+        SETTOKEN(T_HASHBANG);
         BEGIN(ST_IN_SCRIPTING);
         yy_push_state(ST_AFTER_HASHBANG, yyscanner);
-        return T_INLINE_HTML;
+        return T_HASHBANG;
 }
 
-<INITIAL>(([^<#]|"<"[^?%s<]|"#"[^!]){1,400})|"<s"|"<" {
+<INITIAL>(([^<#]|"<"[^?%s<]){1,400})|"<s"|"<"|"#" {
         SETTOKEN(T_INLINE_HTML);
         BEGIN(ST_IN_SCRIPTING);
         yy_push_state(ST_IN_HTML, yyscanner);
@@ -799,15 +838,43 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
         return T_HH_ERROR;
 }
 
-<INITIAL,ST_IN_HTML,ST_AFTER_HASHBANG>"<%="|"<?=" {
-        if ((yytext[1]=='%' && _scanner->aspTags()) ||
-            (yytext[1]=='?' && _scanner->shortTags())) {
+<ST_IN_HTML>"<?=" {
+        if  (_scanner->shortTags()) {
+          yy_pop_state(yyscanner);
+          RETTOKEN(T_ECHO);
+        } else {
+          RETTOKEN(T_INLINE_HTML);
+        }
+}
+
+<INITIAL,ST_AFTER_HASHBANG>"<?=" {
+        if (_scanner->shortTags()) {
           if (YY_START == INITIAL) {
             BEGIN(ST_IN_SCRIPTING);
           } else {
             yy_pop_state(yyscanner);
           }
-          RETTOKEN(T_ECHO); //return T_OPEN_TAG_WITH_ECHO;
+          RETTOKEN(T_OPEN_TAG_WITH_ECHO);
+        } else {
+          if (YY_START == INITIAL) {
+            BEGIN(ST_IN_SCRIPTING);
+            yy_push_state(ST_IN_HTML, yyscanner);
+          } else {
+            BEGIN(ST_IN_HTML);
+          }
+          RETTOKEN(T_INLINE_HTML);
+        }
+}
+
+
+<INITIAL,ST_IN_HTML,ST_AFTER_HASHBANG>"<%=" {
+        if (_scanner->aspTags()) {
+          if (YY_START == INITIAL) {
+            BEGIN(ST_IN_SCRIPTING);
+          } else {
+            yy_pop_state(yyscanner);
+          }
+          RETTOKEN(T_ECHO);
         } else {
           if (YY_START == INITIAL) {
             BEGIN(ST_IN_SCRIPTING);
@@ -898,49 +965,30 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
         RETSTEP(T_WHITESPACE);
 }
 
-<ST_IN_SCRIPTING,ST_XHP_IN_TAG>"#"|"//" {
-        yy_push_state(ST_ONE_LINE_COMMENT, yyscanner);
-        yymore();
-}
-
-<ST_ONE_LINE_COMMENT>"?"|"%"|">" {
-        yymore();
-}
-
-<ST_ONE_LINE_COMMENT>[^\n\r?%>]*{ANY_CHAR} {
-        switch (yytext[yyleng-1]) {
-        case '?':
-        case '%':
-        case '>':
-                yyless(yyleng-1);
-                yymore();
-                break;
-        default:
-                STEPPOS(T_COMMENT);
-                yy_pop_state(yyscanner);
-                return T_COMMENT;
+<ST_IN_SCRIPTING,ST_XHP_IN_TAG>("#"|"//")[^\r\n]*{NEWLINE}? {
+        const char* asptag = nullptr;
+        if (_scanner->aspTags()) {
+                asptag = static_cast<const char*>(
+                  memmem(yytext, yyleng, "%>", 2)
+                );
         }
-}
-
-<ST_ONE_LINE_COMMENT>{NEWLINE} {
-        STEPPOS(T_COMMENT);
-        yy_pop_state(yyscanner);
-        return T_COMMENT;
-}
-
-<ST_ONE_LINE_COMMENT>"?>"|"%>" {
-        if (_scanner->isHHFile()) {
-          _scanner->error("HH mode: ?> not allowed");
-          return T_HH_ERROR;
+        auto phptag = static_cast<const char*>(
+          memmem(yytext, yyleng, "?>", 2)
+        );
+        if (asptag && (!phptag || (asptag < phptag))) {
+                if (_scanner->isHHFile()) {
+                        _scanner->error("HH mode: %%> not allowed");
+                        RETTOKEN(T_HH_ERROR);
+                }
+                yyless(asptag - yytext);
+        } else if (phptag) {
+                if (_scanner->isHHFile()) {
+                        _scanner->error("HH mode: ?> not allowed");
+                        RETTOKEN(T_HH_ERROR);
+                }
+                yyless(phptag - yytext);
         }
-        if (_scanner->aspTags() || yytext[yyleng-2] != '%') {
-          _scanner->setToken(yytext, yyleng-2, yytext, yyleng-2, T_COMMENT);
-                yyless(yyleng-2);
-                yy_pop_state(yyscanner);
-                return T_COMMENT;
-        } else {
-                yymore();
-        }
+        RETTOKEN(T_COMMENT);
 }
 
 <ST_IN_SCRIPTING,ST_XHP_IN_TAG>"/**"{WHITESPACE} {
@@ -1001,6 +1049,10 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 }
 
 <ST_IN_SCRIPTING>"</script"{WHITESPACE}*">"{NEWLINE}? {
+        if (_scanner->isHHFile()) {
+          _scanner->error("HH mode: </script> not allowed");
+          return T_HH_ERROR;
+        }
         yy_push_state(ST_IN_HTML, yyscanner);
         if (_scanner->full()) {
           RETSTEP(T_CLOSE_TAG);
@@ -1010,6 +1062,10 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 }
 
 <ST_IN_SCRIPTING>"%>"{NEWLINE}? {
+        if (_scanner->isHHFile()) {
+          _scanner->error("HH mode: %%> not allowed");
+          return T_HH_ERROR;
+        }
         if (_scanner->aspTags()) {
                 yy_push_state(ST_IN_HTML, yyscanner);
                 if (_scanner->full()) {
@@ -1179,8 +1235,9 @@ BACKQUOTE_CHARS     ("{"*([^$`\\{]|("\\"{ANY_CHAR}))|{BACKQUOTE_LITERAL_DOLLAR})
 
   YYCURSOR--;
 
-  // The rules that lead to this state all consume an end-of-line.
-  bool lookingForEndLabel = true;
+  // T_START_HEREDOC has a trailing newline, so we can start looking
+  // for the ending label right away
+  bool lookingForEndLabel = _scanner->lastToken() == T_START_HEREDOC;
 
   while (refillResult == EOB_ACT_CONTINUE_SCAN) {
     while (YYCURSOR < YYLIMIT) {

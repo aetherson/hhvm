@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -23,45 +23,30 @@
 
 // Super temporary
 #ifndef USE_CMAKE
-#include "hphp/facebook/extensions/async_mysql/ext_async_mysql.h"
-#include "hphp/facebook/extensions/fbml/ext_fbml.h"
-#include "hphp/facebook/extensions/obc/ext_obc.h"
 #include "hphp/facebook/extensions/phpmc/ext_phpmc.h"
-#include "hphp/facebook/extensions/string_buffer/ext_string_buffer.h"
+#define ENABLE_EXTENSION_ASIO
+#define ENABLE_EXTENSION_CLOSURE
+#define ENABLE_EXTENSION_COLLECTIONS
+#define ENABLE_EXTENSION_FB
+#define ENABLE_EXTENSION_SIMPLEXML
 #endif
 
-#include "hphp/runtime/ext/ext_apc.h"
-#include "hphp/runtime/ext/ext_array.h"
-#include "hphp/runtime/ext/ext_asio.h"
+#ifdef ENABLE_EXTENSION_CLOSURE
 #include "hphp/runtime/ext/ext_closure.h"
-#include "hphp/runtime/ext/ext_collections.h"
-#include "hphp/runtime/ext/ext_generator.h"
-#include "hphp/runtime/ext/ext_datetime.h"
-#include "hphp/runtime/ext/ext_domdocument.h"
-#include "hphp/runtime/ext/ext_fb.h"
-#include "hphp/runtime/ext/ext_file.h"
-#include "hphp/runtime/ext/ext_filter.h"
-#include "hphp/runtime/ext/ext_function.h"
-#include "hphp/runtime/ext/ext_hash.h"
-#include "hphp/runtime/ext/ext_ipc.h"
-#include "hphp/runtime/ext/ext_ldap.h"
-#include "hphp/runtime/ext/ext_math.h"
-#include "hphp/runtime/ext/ext_mb.h"
-#include "hphp/runtime/ext/ext_pdo.h"
-#include "hphp/runtime/ext/ext_posix.h"
-#include "hphp/runtime/ext/ext_process.h"
-#include "hphp/runtime/ext/ext_server.h"
-#include "hphp/runtime/ext/ext_simplexml.h"
-#include "hphp/runtime/ext/ext_soap.h"
-#include "hphp/runtime/ext/ext_socket.h"
-#include "hphp/runtime/ext/ext_spl.h"
-#include "hphp/runtime/ext/ext_sqlite3.h"
-#include "hphp/runtime/ext/stream/ext_stream.h"
-#include "hphp/runtime/ext/ext_string.h"
-#include "hphp/runtime/ext/ext_thread.h"
-#include "hphp/runtime/ext/ext_thrift.h"
-#include "hphp/runtime/ext/ext_xml.h"
-#include "hphp/runtime/ext/ext_xmlreader.h"
-#include "hphp/runtime/ext/mysql/ext_mysql.h"
+#endif
+#ifdef ENABLE_EXTENSION_COLLECTIONS
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
+#endif
+#ifdef ENABLE_EXTENSION_FB
+#include "hphp/runtime/ext/fb/ext_fb.h"
+#endif
+#ifdef ENABLE_EXTENSION_SIMPLEXML
+#include "hphp/runtime/ext/simplexml/ext_simplexml.h"
+#endif
+
+// half-IDL, half-HNI
+#ifdef ENABLE_EXTENSION_ASIO
+#include "hphp/runtime/ext/asio/ext_asio.h"
+#endif
 
 #endif // incl_EXT_LIST_EXT_H_

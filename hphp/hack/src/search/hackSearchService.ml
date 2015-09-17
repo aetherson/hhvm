@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,6 +8,7 @@
  *
  *)
 
+open Core
 open Utils
 
 type search_result_type =
@@ -31,8 +32,6 @@ module SS = SearchService.Make(struct
     (type_num a) - (type_num b)
 end)
 
-module SUtils = SS.SUtils
-
 module WorkerApi = struct
   (* cleans off namespace and colon at the start of xhp name because the
    * user will want to search for xhp classes without typing a : at
@@ -50,13 +49,13 @@ module WorkerApi = struct
    * methods so that they can also be searched for *)
   let update_class c acc =
     let prefix = (snd c.Ast.c_name)^"::" in
-    List.fold_left begin fun acc elt ->
+    List.fold_left c.Ast.c_body ~f:begin fun acc elt ->
       match elt with
         | Ast.Method m -> let id = m.Ast.m_name in
             let name = snd id in
             let full_name = prefix^name in
             let pos = fst id in
-            let is_static = List.mem Ast.Static m.Ast.m_kind in
+            let is_static = List.mem m.Ast.m_kind Ast.Static in
             let type_ =
               Method (is_static, (Utils.strip_ns (snd c.Ast.c_name)))
             in
@@ -66,7 +65,7 @@ module WorkerApi = struct
             SS.WorkerApi.process_trie_term
               (clean_key full_name) name pos type_ acc
         | _ -> acc
-    end acc c.Ast.c_body
+    end ~init:acc
 
   let add_fuzzy_term id type_ acc =
     let name = snd id in
@@ -76,7 +75,7 @@ module WorkerApi = struct
   (* Called by a worker after the file is parsed *)
   let update fn ast =
     let fuzzy_defs, trie_defs =
-        List.fold_left begin fun (fuzzy_defs, trie_defs) def ->
+      List.fold_left ast ~f:begin fun (fuzzy_defs, trie_defs) def ->
       match def with
       | Ast.Fun f ->
           let fuzzy_defs = add_fuzzy_term f.Ast.f_name Function fuzzy_defs in
@@ -96,7 +95,7 @@ module WorkerApi = struct
           in
           fuzzy_defs, trie_defs
       | _ -> fuzzy_defs, trie_defs
-    end (SS.Fuzzy.TMap.empty, []) ast in
+    end ~init:(SS.Fuzzy.TMap.empty, []) in
     SS.WorkerApi.update fn trie_defs fuzzy_defs
 end
 
@@ -115,9 +114,9 @@ module MasterApi = struct
     SS.MasterApi.clear_shared_memory
 
   let update_search_index files php_files =
-    let files = List.fold_left begin fun acc file ->
-      SSet.add file acc
-    end php_files files in
+    let files = List.fold_left files ~f:begin fun acc file ->
+      Relative_path.Set.add file acc
+    end ~init:php_files in
     SS.MasterApi.update_search_index files
 end
 

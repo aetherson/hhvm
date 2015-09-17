@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    | Copyright (c) 1997-2010 The PHP Group                                |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
@@ -16,8 +16,8 @@
 */
 #include "hphp/runtime/ext/soap/packet.h"
 
-#include "hphp/runtime/ext/ext_soap.h"
 #include <memory>
+#include "hphp/runtime/ext/soap/ext_soap.h"
 #include "hphp/util/hash-map-typedefs.h"
 
 #include "hphp/system/systemlib.h"
@@ -25,13 +25,14 @@
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
-static void add_soap_fault(c_SoapClient *client, const String& code, const String& fault) {
+static void add_soap_fault(SoapClient *client, const String& code,
+                           const String& fault) {
   client->m_soap_fault =
-    Object(SystemLib::AllocSoapFaultObject(String(code, CopyString), fault));
+    SystemLib::AllocSoapFaultObject(String(code, CopyString), fault);
 }
 
 /* SOAP client calls this function to parse response from SOAP server */
-bool parse_packet_soap(c_SoapClient *obj, const char *buffer,
+bool parse_packet_soap(SoapClient *obj, const char *buffer,
                        int buffer_size,
                        std::shared_ptr<sdlFunction> fn, const char *fn_name,
                        Variant &return_value, Array& soap_headers) {
@@ -258,8 +259,10 @@ bool parse_packet_soap(c_SoapClient *obj, const char *buffer,
       }
     }
     obj->m_soap_fault =
-      Object(SystemLib::AllocSoapFaultObject(String(faultcode, CopyString),
-                                             faultstring, faultactor, details));
+        SystemLib::AllocSoapFaultObject(String(faultcode, CopyString),
+                                        faultstring,
+                                        faultactor,
+                                        details);
     xmlFreeDoc(response);
     return false;
   }

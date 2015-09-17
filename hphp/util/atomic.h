@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,8 +18,9 @@
 #define incl_HPHP_ATOMIC_H_
 
 #include <stdint.h>
-#include <boost/type_traits/is_arithmetic.hpp>
-#include <boost/type_traits/is_pointer.hpp>
+#include <type_traits>
+
+#include <folly/Portability.h>
 
 #include "hphp/util/assertions.h"
 
@@ -27,7 +28,7 @@ namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
 inline void compiler_membar( ) {
-  asm volatile("" : : :"memory");
+  folly::asm_volatile_memory();
 }
 
 template<class T>
@@ -36,15 +37,15 @@ inline void assert_address_is_atomically_accessible(T* address) {
     sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
     "T must be a 1, 2, 4, or 8 byte object for atomic access");
   static_assert(
-    boost::is_arithmetic<T>::value || boost::is_pointer<T>::value,
+    std::is_arithmetic<T>::value || std::is_pointer<T>::value,
     "Atomic operations only supported for built in integer, floating point "
     "and pointer types.");
 
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(_M_X64)
   assert(((uintptr_t(address) + sizeof(T) - 1) & ~63ul) ==
          ( uintptr_t(address)                  & ~63ul) &&
         "Atomically accessed addresses may not span cache lines");
-#elif __AARCH64EL__
+#elif __AARCH64EL__ || __powerpc64__
   // N-byte accesses must be N-byte aligned
   assert((uintptr_t(address) & (sizeof(T) - 1)) == 0);
 #else

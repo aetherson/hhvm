@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -60,14 +60,14 @@ class type ['a] nast_visitor_type = object
   method on_array_get : 'a -> expr -> expr option -> 'a
   method on_class_get : 'a -> class_id -> pstring -> 'a
   method on_class_const : 'a -> class_id -> pstring -> 'a
-  method on_call : 'a -> call_type -> expr -> expr list -> 'a
+  method on_call : 'a -> call_type -> expr -> expr list -> expr list -> 'a
   method on_true : 'a -> 'a
   method on_false : 'a -> 'a
   method on_int : 'a -> pstring -> 'a
   method on_float : 'a -> pstring -> 'a
   method on_null : 'a -> 'a
   method on_string : 'a -> pstring -> 'a
-  method on_string2 : 'a -> expr list -> string -> 'a
+  method on_string2 : 'a -> expr list -> 'a
   method on_special_func : 'a -> special_func -> 'a
   method on_yield_break : 'a -> 'a
   method on_yield : 'a -> afield -> 'a
@@ -79,8 +79,9 @@ class type ['a] nast_visitor_type = object
   method on_unop : 'a -> Ast.uop -> expr -> 'a
   method on_binop : 'a -> Ast.bop -> expr -> expr -> 'a
   method on_eif : 'a -> expr -> expr option -> expr -> 'a
-  method on_instanceOf : 'a -> expr -> expr -> 'a
-  method on_new : 'a -> class_id -> expr list -> 'a
+  method on_instanceOf : 'a -> expr -> class_id -> 'a
+  method on_class_id : 'a -> class_id -> 'a
+  method on_new : 'a -> class_id -> expr list -> expr list -> 'a
   method on_efun : 'a -> fun_ -> id list -> 'a
   method on_xml : 'a -> sid -> (pstring * expr) list -> expr list -> 'a
   method on_assert : 'a -> assert_expr -> 'a
@@ -210,6 +211,7 @@ class virtual ['a] nast_visitor: ['a] nast_visitor_type = object(this)
    | String s    -> this#on_string acc s
    | This        -> this#on_this acc
    | Id sid      -> this#on_id acc sid
+   | Lplaceholder _pos -> acc
    | Lvar id     -> this#on_lvar acc id
    | Fun_id sid  -> this#on_fun_id acc sid
    | Method_id (expr, pstr) -> this#on_method_id acc expr pstr
@@ -223,19 +225,19 @@ class virtual ['a] nast_visitor: ['a] nast_visitor_type = object(this)
    | Clone e     -> this#on_clone acc e
    | Expr_list el    -> this#on_expr_list acc el
    | Special_func sf -> this#on_special_func acc sf
-   | Obj_get     (e1, e2)    -> this#on_obj_get acc e1 e2
+   | Obj_get     (e1, e2, _) -> this#on_obj_get acc e1 e2
    | Array_get   (e1, e2)    -> this#on_array_get acc e1 e2
    | Class_get   (cid, id)   -> this#on_class_get acc cid id
    | Class_const (cid, id)   -> this#on_class_const acc cid id
-   | Call        (ct, e, el) -> this#on_call acc ct e el
-   | String2     (el, s)     -> this#on_string2 acc el s
+   | Call        (ct, e, el, uel) -> this#on_call acc ct e el uel
+   | String2     el          -> this#on_string2 acc el
    | Pair        (e1, e2)    -> this#on_pair acc e1 e2
    | Cast        (hint, e)   -> this#on_cast acc hint e
    | Unop        (uop, e)         -> this#on_unop acc uop e
    | Binop       (bop, e1, e2)    -> this#on_binop acc bop e1 e2
    | Eif         (e1, e2, e3)     -> this#on_eif acc e1 e2 e3
    | InstanceOf  (e1, e2)         -> this#on_instanceOf acc e1 e2
-   | New         (cid, el)        -> this#on_new acc cid el
+   | New         (cid, el, uel)   -> this#on_new acc cid el uel
    | Efun        (f, idl)         -> this#on_efun acc f idl
    | Xml         (sid, attrl, el) -> this#on_xml acc sid attrl el
    | ValCollection    (s, el)     ->
@@ -280,12 +282,14 @@ class virtual ['a] nast_visitor: ['a] nast_visitor_type = object(this)
     in
     acc
 
-  method on_class_get acc _ _ = acc
-  method on_class_const acc _ _ = acc
+  method on_class_get acc cid _ = this#on_class_id acc cid
 
-  method on_call acc _ e el =
+  method on_class_const acc cid _ = this#on_class_id acc cid
+
+  method on_call acc _ e el uel =
     let acc = this#on_expr acc e in
     let acc = List.fold_left this#on_expr acc el in
+    let acc = List.fold_left this#on_expr acc uel in
     acc
 
   method on_true acc = acc
@@ -295,15 +299,14 @@ class virtual ['a] nast_visitor: ['a] nast_visitor_type = object(this)
   method on_null acc = acc
   method on_string acc _ = acc
 
-  method on_string2 acc el _ =
+  method on_string2 acc el =
     let acc = List.fold_left this#on_expr acc el in
     acc
 
   method on_special_func acc = function
     | Gena e
     | Gen_array_rec e -> this#on_expr acc e
-    | Genva el
-    | Gen_array_va_rec el -> List.fold_left this#on_expr acc el
+    | Genva el -> List.fold_left this#on_expr acc el
 
   method on_yield_break acc = acc
   method on_yield acc e = this#on_afield acc e
@@ -339,13 +342,24 @@ class virtual ['a] nast_visitor: ['a] nast_visitor_type = object(this)
 
   method on_instanceOf acc e1 e2 =
     let acc = this#on_expr acc e1 in
-    let acc = this#on_expr acc e2 in
+    let acc = this#on_class_id acc e2 in
     acc
 
-  method on_new acc _ el =
-    List.fold_left this#on_expr acc el
+  method on_class_id acc = function
+    | CIexpr e -> this#on_expr acc e
+    | _ -> acc
 
-  method on_efun acc f _ = this#on_block acc f.f_body
+  method on_new acc cid el uel =
+    let acc = this#on_class_id acc cid in
+    let acc = List.fold_left this#on_expr acc el in
+    let acc = List.fold_left this#on_expr acc uel in
+    acc
+
+  method on_efun acc f _ = match f.f_body with
+    | UnnamedBody _ ->
+      failwith "lambdas expected to be named in the context of the surrounding function"
+    | NamedBody { fnb_nast ; _ } -> this#on_block acc fnb_nast
+
   method on_xml acc _ attrl el =
     let acc = List.fold_left begin fun acc (_, e) ->
       this#on_expr acc e
@@ -355,15 +369,6 @@ class virtual ['a] nast_visitor: ['a] nast_visitor_type = object(this)
 
   method on_assert acc = function
     | AE_assert e -> this#on_expr acc e
-    | AE_invariant (e1, e2, el) ->
-        let acc = this#on_expr acc e1 in
-        let acc = this#on_expr acc e2 in
-        let acc = List.fold_left this#on_expr acc el in
-        acc
-    | AE_invariant_violation (e, el) ->
-        let acc = this#on_expr acc e in
-        let acc = List.fold_left this#on_expr acc el in
-        acc
 
   method on_clone acc e = this#on_expr acc e
 
@@ -391,13 +396,28 @@ end = struct
   let visitor =
     object
       inherit [bool] nast_visitor
-      method on_expr acc _ = acc
-      method on_return _ _ _ = true
+      method! on_expr acc _ = acc
+      method! on_return _ _ _ = true
     end
 
   let block b = visitor#on_block false b
 
 end
+
+(* Used by HasBreak and HasContinue. Does not traverse nested loops, since the
+ * breaks / continues in those loops do not affect the control flow of the
+ * outermost loop. *)
+
+class loop_visitor =
+  object
+    inherit [bool] nast_visitor
+    method! on_expr acc _ = acc
+    method! on_for acc _ _ _ _ = acc
+    method! on_foreach acc _ _ _ = acc
+    method! on_do acc _ _ = acc
+    method! on_while acc _ _ = acc
+    method! on_switch acc _ _ = acc
+  end
 
 (*****************************************************************************)
 (* Returns true if a block has a continue statement.
@@ -417,9 +437,28 @@ end = struct
 
   let visitor =
     object
-      inherit [bool] nast_visitor
-      method on_expr acc _ = acc
-      method on_continue _ _ = true
+      inherit loop_visitor
+      method! on_continue _ _ = true
+    end
+
+  let block b = visitor#on_block false b
+
+end
+
+(*****************************************************************************)
+(* Returns true if a block has a continue statement.
+ * Useful for checking if a while(true) {...} loop is non-terminating.
+ *)
+(*****************************************************************************)
+
+module HasBreak: sig
+  val block: block -> bool
+end = struct
+
+  let visitor =
+    object
+      inherit loop_visitor
+      method! on_break _ _ = true
     end
 
   let block b = visitor#on_block false b

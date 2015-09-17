@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -113,6 +113,14 @@ struct ClassAnalysis {
  * This routine makes no changes to the php::Func.
  */
 FuncAnalysis analyze_func(const Index&, Context);
+
+/*
+ * Analyze a function like analyze_func, but exposing gathered CollectedInfo
+ * results.  The CollectedInfo structure can be initialized by the caller to
+ * enable collecting some pass-specific types of information (e.g. public
+ * static property types).
+ */
+FuncAnalysis analyze_func_collect(const Index&, Context, CollectedInfo&);
 
 /*
  * Perform a flow-sensitive type analysis on a function, using the

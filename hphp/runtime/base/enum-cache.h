@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,7 +17,7 @@
 #ifndef incl_HPHP_ENUM_CACHE_H_
 #define incl_HPHP_ENUM_CACHE_H_
 
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/vm/class.h"
 #include <tbb/concurrent_hash_map.h>
 
@@ -69,7 +69,7 @@ public:
   static void deleteValues(const Class* klass);
 
   // Helper that raises a PHP exception
-  static void failLookup(const Variant& msg) ATTRIBUTE_NORETURN;
+  ATTRIBUTE_NORETURN static void failLookup(const Variant& msg);
 
 private:
   // Class* to intptr_ti key helpers

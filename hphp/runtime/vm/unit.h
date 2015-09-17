@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -19,7 +19,6 @@
 
 #include "hphp/parser/location.h"
 
-#include "hphp/runtime/base/types.h"
 #include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/vm/class.h"
 #include "hphp/runtime/vm/hhbc.h"
@@ -73,7 +72,7 @@ struct SourceLoc {
    * Constructors.
    */
   SourceLoc() {}
-  explicit SourceLoc(const Location& l);
+  explicit SourceLoc(const Location::Range& l);
 
   /*
    * Reset to, or check for, the invalid state.
@@ -84,7 +83,7 @@ struct SourceLoc {
   /*
    * Set to a parser Location.
    */
-  void setLoc(const Location* l);
+  void setLoc(const Location::Range* l);
 
   /*
    * Equality.
@@ -110,15 +109,15 @@ struct OffsetRange {
   OffsetRange() {}
 
   OffsetRange(Offset base, Offset past)
-    : m_base(base)
-    , m_past(past)
+    : base(base)
+    , past(past)
   {}
 
-  Offset m_base{0};
-  Offset m_past{0};
+  Offset base{0};
+  Offset past{0};
 };
 
-typedef std::vector<OffsetRange> OffsetRangeVec;
+using OffsetRangeVec = std::vector<OffsetRange>;
 
 /*
  * Generic entry for representing many-to-one mappings of Offset -> T.
@@ -172,13 +171,12 @@ using LineTable      = std::vector<LineEntry>;
 using SourceLocTable = std::vector<SourceLocEntry>;
 using FuncTable      = std::vector<FuncEntry>;
 
-using LineToOffsetRangeVecMap = std::map<int, OffsetRangeVec>;
-
 /*
  * Get the line number or SourceLoc for Offset `pc' in `table'.
  */
 int getLineNumber(const LineTable& table, Offset pc);
 bool getSourceLoc(const SourceLocTable& table, Offset pc, SourceLoc& sLoc);
+void stashLineTable(const Unit* unit, LineTable table);
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -193,7 +191,6 @@ bool getSourceLoc(const SourceLocTable& table, Offset pc, SourceLoc& sLoc);
 struct Unit {
   friend class UnitEmitter;
   friend class UnitRepoProxy;
-  friend class FuncDict;
 
   /////////////////////////////////////////////////////////////////////////////
   // Types.
@@ -289,7 +286,7 @@ public:
     Define              = 2,  // Toplevel scalar define.
     PersistentDefine    = 3,  // Cross-request persistent toplevel defines.
     Global              = 4,  // Global variable declarations.
-    // Unused           = 5,
+    TypeAlias           = 5,
     ReqDoc              = 6,
     Done                = 7,
     // We cannot add more kinds here; this has to fit in 3 bits.
@@ -301,6 +298,7 @@ public:
   typedef MergeInfo::FuncRange FuncRange;
   typedef MergeInfo::MutableFuncRange MutableFuncRange;
   typedef Range<std::vector<PreClassPtr>> PreClassRange;
+  typedef Range<FixedVector<TypeAlias>> TypeAliasRange;
 
   /*
    * Cache for pseudomains for this unit, keyed by Class context.
@@ -366,7 +364,7 @@ public:
   /*
    * Get the Op at `instrOffset'.
    */
-  Op getOpcode(size_t instrOffset) const;
+  Op getOp(Offset instrOffset) const;
 
 
   /////////////////////////////////////////////////////////////////////////////
@@ -552,8 +550,8 @@ public:
    * burn the Class* into the TC, since it will be defined by the time the code
    * that needs the Class* runs (via autoload or whatnot).
    */
-  static Class* lookupUniqueClass(const NamedEntity* ne);
-  static Class* lookupUniqueClass(const StringData* name);
+  static Class* lookupClassOrUniqueClass(const NamedEntity* ne);
+  static Class* lookupClassOrUniqueClass(const StringData* name);
 
   /*
    * Look up, or autoload and define, the Class in this request with name
@@ -622,18 +620,22 @@ public:
   static bool defCns(const StringData* cnsName, const TypedValue* value,
                      bool persistent = false);
 
+  using SystemConstantCallback = const Variant& (*)();
   /*
    * Define a constant with name `cnsName' which stores an arbitrary data
    * pointer in its TypedValue (with datatype KindOfUnit).
    *
    * The canonical examples are STDIN, STDOUT, and STDERR.
    */
-  static void defDynamicSystemConstant(const StringData* cnsName,
-                                       const void* data);
+  static bool defSystemConstantCallback(const StringData* cnsName,
+                                        SystemConstantCallback callback);
 
 
   /////////////////////////////////////////////////////////////////////////////
   // Type aliases.
+
+  TypeAliasRange typeAliases() const;
+  static const TypeAliasReq* loadTypeAlias(const StringData* name);
 
   /*
    * Define the type alias given by `id', binding it to the appropriate
@@ -781,11 +783,7 @@ public:
   // Internal methods.
 
 private:
-  SourceLocTable getSourceLocTable() const;
-  LineToOffsetRangeVecMap getLineToOffsetRangeVecMap() const;
-
   void initialMerge();
-
   template<bool debugger>
   void mergeImpl(void* tcbase, MergeInfo* mi);
 
@@ -795,26 +793,23 @@ private:
   //
   // These are organized in reverse order of frequency of use.  Do not re-order
   // without checking perf!
-
-public:
-  static Mutex s_classesMutex;
-
 private:
   unsigned char const* m_bc{nullptr};
-  size_t m_bclen{0};
-  const StringData* m_filepath{nullptr};
-  LineTable m_lineTable;
+  Offset m_bclen{0};
+  LowStringPtr m_filepath{nullptr};
   MergeInfo* m_mergeInfo{nullptr};
-  int8_t m_repoId{-1};
 
+  int8_t m_repoId{-1};
   /*
    * m_mergeState is read without a lock, but only written to under
    * unitInitLock (see unit.cpp).
    */
   uint8_t m_mergeState{MergeState::Unmerged};
+  bool m_mergeOnly: 1;
+  bool m_interpretOnly : 1;
+  bool m_isHHFile : 1;
+  LowStringPtr m_dirpath{nullptr};
 
-  bool m_mergeOnly{false};
-  bool m_interpretOnly;
   TypedValue m_mainReturn;
   std::vector<PreClassPtr> m_preClasses;
   FixedVector<TypeAlias> m_typeAliases;
@@ -823,67 +818,40 @@ private:
    * The remaining fields are cold, and arbitrarily ordered.
    */
 
-  int64_t m_sn{-1};
-  const StringData* m_dirpath{nullptr};
+  int64_t m_sn{-1};             // Note: could be 32-bit
   MD5 m_md5;
   NamedEntityPairTable m_namedInfo;
-  std::vector<const ArrayData*> m_arrays;
-  SourceLocTable m_sourceLocTable;
-  bool m_isHHFile{false};
-
-  /*
-   * Map from source lines to a collection of all the bytecode ranges the line
-   * encompasses.
-   *
-   * The value type of the map is a list of offset ranges, so a single line
-   * with several sub-statements may correspond to the bytecodes of all of the
-   * sub-statements.
-   */
-  LineToOffsetRangeVecMap m_lineToOffsetRangeVecMap;
-
+  FixedVector<const ArrayData*> m_arrays;
   FuncTable m_funcTable;
   mutable PseudoMainCacheMap* m_pseudoMainCache{nullptr};
 };
 
 ///////////////////////////////////////////////////////////////////////////////
+// TODO(#4717225): Rewrite these in iterators.h.
 
-struct ConstPreClassMethodRanger {
-  typedef Func* const* Iter;
-  typedef const Func* Value;
-  static Iter get(PreClassPtr pc) {
-    return pc->methods();
-  }
-};
-
-struct MutablePreClassMethodRanger {
-  typedef Func** Iter;
-  typedef Func* Value;
-  static Func** get(PreClassPtr pc) {
-    return pc->mutableMethods();
-  }
-};
-
-template<typename FuncRange,
-         typename GetMethods>
-struct AllFuncsImpl {
-  explicit AllFuncsImpl(const Unit* unit)
+struct AllFuncs {
+  explicit AllFuncs(const Unit* unit)
     : fr(unit->funcs())
     , mr(0, 0)
     , cr(unit->preclasses())
   {
     if (fr.empty()) skip();
   }
-  bool empty() const { return fr.empty() && mr.empty() && cr.empty(); }
-  typedef typename GetMethods::Value FuncPtr;
-  FuncPtr front() const {
+
+  bool empty() const {
+    return fr.empty() && mr.empty() && cr.empty();
+  }
+
+  const Func* front() const {
     assert(!empty());
     if (!fr.empty()) return fr.front();
     assert(!mr.empty());
     return mr.front();
   }
-  FuncPtr popFront() {
-    FuncPtr f = !fr.empty() ? fr.popFront() :
-      !mr.empty() ? mr.popFront() : 0;
+
+  const Func* popFront() {
+    auto f = !fr.empty() ? fr.popFront() :
+             !mr.empty() ? mr.popFront() : 0;
     assert(f);
     if (fr.empty() && mr.empty()) skip();
     return f;
@@ -893,9 +861,9 @@ private:
   void skip() {
     assert(fr.empty());
     while (!cr.empty() && mr.empty()) {
-      PreClassPtr c = cr.popFront();
-      mr = Unit::FuncRange(GetMethods::get(c),
-                           GetMethods::get(c) + c->numMethods());
+      auto c = cr.popFront();
+      mr = Unit::FuncRange(c->methods(),
+                           c->methods() + c->numMethods());
     }
   }
 
@@ -904,23 +872,14 @@ private:
   Unit::PreClassRange cr;
 };
 
-typedef AllFuncsImpl<Unit::FuncRange,ConstPreClassMethodRanger> AllFuncs;
-typedef AllFuncsImpl<Unit::MutableFuncRange,MutablePreClassMethodRanger>
-  MutableAllFuncs;
-
-/*
- * Range over all defined classes.
- */
-class AllClasses {
+class AllCachedClasses {
   NamedEntity::Map::iterator m_next, m_end;
-  Class* m_current;
-  void next();
   void skip();
 
 public:
-  AllClasses();
+  AllCachedClasses();
   bool empty() const;
-  Class* front() const;
+  Class* front();
   Class* popFront();
 };
 

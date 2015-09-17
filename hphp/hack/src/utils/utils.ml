@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,10 +8,13 @@
  *
  *)
 
-include Sys_utils
+open Core
 
 let () = Random.self_init ()
 let debug = ref false
+let profile = ref false
+
+let log = ref (fun (_ : string)  -> ())
 
 let d s =
   if !debug
@@ -28,6 +31,11 @@ let dn s =
     flush stdout;
   end
 
+module String = struct
+  include String
+  let to_string x = x
+end
+
 module type MapSig = sig
   type +'a t
   type key
@@ -35,6 +43,8 @@ module type MapSig = sig
   val empty: 'a t
   val singleton: key -> 'a -> 'a t
   val fold: (key -> 'a -> 'b -> 'b) -> 'a t -> 'b -> 'b
+  val exists: (key -> 'a -> bool) -> 'a t -> bool
+  val for_all: (key -> 'a -> bool) -> 'a t -> bool
   val mem: key -> 'a t -> bool
   val add: key -> 'a -> 'a t -> 'a t
   val get: key -> 'a t -> 'a option
@@ -45,13 +55,15 @@ module type MapSig = sig
   val find_unsafe: key -> 'a t -> 'a
   val is_empty: 'a t -> bool
   val union: 'a t -> 'a t -> 'a t
-  val cardinal: 'a t -> int
+  val partition: (key -> 'a -> bool) -> 'a t -> 'a t * 'a t
+  val cardinal : 'a t -> int
   val compare: 'a t -> 'a t -> int
   val equal: 'a t -> 'a t -> bool
   val filter: (key -> 'a -> bool) -> 'a t -> 'a t
   val merge : (key -> 'a option -> 'b option -> 'c option)
     -> 'a t -> 'b t -> 'c t
   val choose : 'a t -> key * 'a
+  val split: key -> 'a t -> 'a t * 'a option * 'a t
   val keys: 'a t -> key list
   val values: 'a t -> 'a list
 
@@ -132,25 +144,16 @@ module HashSet = (struct
 end : HashSetSig)
 
 let spf = Printf.sprintf
-
-
-let internal_error s =
-  Printf.fprintf stderr
-    "You just found a bug!\nShoot me an email: julien.verlaguet@fb.com";
-  exit 2
+let print_endlinef fmt = Printf.ksprintf print_endline fmt
+let prerr_endlinef fmt = Printf.ksprintf prerr_endline fmt
 
 let opt f env = function
   | None -> env, None
   | Some x -> let env, x = f env x in env, Some x
 
-let opt_map f = function
-  | None -> None
-  | Some x -> Some (f x)
-
-let default x y f =
-  match y with
-  | None -> x
-  | Some y -> f y
+let opt_fold f env = function
+  | None -> env
+  | Some x -> f env x
 
 let rec lmap f env l =
   match l with
@@ -182,20 +185,12 @@ let imap_union m1 m2 = IMap.fold IMap.add m1 m2
 let smap_inter_list = function
   | [] -> SMap.empty
   | x :: rl ->
-      List.fold_left smap_inter x rl
+      List.fold_left rl ~f:smap_inter ~init:x
 
 let imap_inter_list = function
   | [] -> IMap.empty
   | x :: rl ->
-      List.fold_left imap_inter x rl
-
-let partition_smap f m =
-  SMap.fold (
-  fun x ty (acc1, acc2) ->
-    if f x
-    then SMap.add x ty acc1, acc2
-    else acc1, SMap.add x ty acc2
- ) m (SMap.empty, SMap.empty)
+      List.fold_left rl ~f:imap_inter ~init:x
 
 (* This is a significant misnomer... you may want fold_left_env instead. *)
 let lfold = lmap
@@ -246,7 +241,7 @@ let safe_ios p s =
   with _ -> None
 
 let sl l =
-  List.fold_right (^) l ""
+  List.fold_right l ~f:(^) ~init:""
 
 let soi = string_of_int
 
@@ -254,29 +249,26 @@ let maybe f env = function
   | None -> ()
   | Some x -> f env x
 
-let unsafe_opt = function
-  | None -> assert false
+(* Since OCaml usually runs w/o backtraces enabled, the note makes errors
+ * easier to debug. *)
+let unsafe_opt_note note = function
+  | None -> raise (Invalid_argument note)
   | Some x -> x
 
-let liter f env l = List.iter (f env) l
+let unsafe_opt x = unsafe_opt_note "unsafe_opt got None" x
+
+let liter f env l = List.iter l (f env)
 
 let inter_list = function
   | [] -> SSet.empty
   | x :: rl ->
-      List.fold_left SSet.inter x rl
+      List.fold_left rl ~f:SSet.inter ~init:x
 
 let rec list_last f1 f2 =
   function
     | [] -> ()
     | [x] -> f2 x
     | x :: rl -> f1 x; list_last f1 f2 rl
-
-let rec uniq = function
-  | [] -> []
-  | [x] -> [x]
-  | x :: (y :: _ as l) when x = y -> uniq l
-  | x :: rl -> x :: uniq rl
-
 
 let is_prefix_dir dir fn =
   let prefix = dir ^ Filename.dir_sep in
@@ -292,16 +284,6 @@ let try_with_channel oc f1 f2 =
     close_out oc;
     f2 e
 
-let pipe (x : 'a)  (f : 'a -> 'b) : 'b = f x
-let (|>) = pipe
-
-let rec filter_some = function
-  | [] -> []
-  | None :: l -> filter_some l
-  | Some e :: l -> e :: filter_some l
-
-let map_filter f xs = xs |> List.map f |> filter_some
-
 let rec cut_after n = function
   | [] -> []
   | l when n <= 0 -> []
@@ -314,12 +296,23 @@ let iter_n_acc n f acc =
   done;
   !acc
 
-let set_of_list list =
-  List.fold_right SSet.add list SSet.empty
+let map_of_list list =
+  List.fold_left ~f:(fun m (k, v) -> SMap.add k v m) ~init:SMap.empty list
 
+let set_of_list l =
+  List.fold_right l ~f:SSet.add ~init:SSet.empty
+
+(* \A\B\C -> A\B\C *)
 let strip_ns s =
   if String.length s == 0 || s.[0] <> '\\' then s
   else String.sub s 1 ((String.length s) - 1)
+
+(* \A\B\C -> C *)
+let strip_all_ns s =
+  try
+    let base_name_start = String.rindex s '\\' + 1 in
+    String.sub s base_name_start ((String.length s) - base_name_start)
+  with Not_found -> s
 
 let str_starts_with long short =
   try
@@ -336,6 +329,19 @@ let str_ends_with long short =
   with Invalid_argument _ ->
     false
 
+(* Return a copy of the string with prefixing string removed.
+ * The function is a no-op if it s does not start with prefix.
+ * Modeled after Python's string.lstrip.
+ *)
+let lstrip s prefix =
+  let prefix_length = String.length prefix in
+  if str_starts_with s prefix
+  then String.sub s prefix_length (String.length s - prefix_length)
+  else s
+
+let string_of_char = String.make 1
+
+(* let match_re_string = Sys_utils.match_re *)
 (*****************************************************************************)
 (* Same as List.iter2, except that we only iterate as far as the shortest
  * of both lists.
@@ -347,6 +353,25 @@ let rec iter2_shortest f l1 l2 =
   | [], _ | _, [] -> ()
   | x1 :: rl1, x2 :: rl2 -> f x1 x2; iter2_shortest f rl1 rl2
 
-(* We may want to replace this with a tail-recursive map at some point,
- * factoring here so we have a clean way to grep. *)
-let rev_rev_map f l = List.rev (List.rev_map f l)
+let fold_fun_list acc fl =
+  List.fold_left fl ~f:(|>) ~init:acc
+
+let compose f g x = f (g x)
+
+let with_context ~enter ~exit ~do_ =
+  enter ();
+  let result = try do_ () with e ->
+    exit ();
+    raise e in
+  exit ();
+  result
+
+(* We run with exception backtraces turned off for performance reasons. But for
+ * some kinds of catastrophic exceptions, which we never recover from (so the
+ * performance doesn't matter) we do want the backtrace. "assert false" is one
+ * of such conditions.
+ *)
+let assert_false_log_backtrace () =
+  Printf.eprintf "%s" (Printexc.raw_backtrace_to_string
+    (Printexc.get_callstack 100));
+  assert false

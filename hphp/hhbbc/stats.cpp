@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -29,10 +29,10 @@
 
 #include <tbb/concurrent_hash_map.h>
 
-#include "folly/Conv.h"
-#include "folly/String.h"
-#include "folly/Format.h"
-#include "folly/ScopeGuard.h"
+#include <folly/Conv.h>
+#include <folly/String.h>
+#include <folly/Format.h>
+#include <folly/ScopeGuard.h>
 
 #include "hphp/util/trace.h"
 #include "hphp/runtime/vm/hhbc.h"
@@ -129,6 +129,7 @@ struct Stats {
   std::atomic<uint64_t> uniqueFunctions;
   std::atomic<uint64_t> totalClasses;
   std::atomic<uint64_t> totalFunctions;
+  std::atomic<uint64_t> totalMethods;
   std::atomic<uint64_t> persistentSPropsPub;
   std::atomic<uint64_t> persistentSPropsProt;
   std::atomic<uint64_t> persistentSPropsPriv;
@@ -169,7 +170,7 @@ std::string show(const Builtins& builtins) {
          it != builtins.builtinsInfo.end(); ++it) {
       ret += folly::format(
         "  {: >30} [tot:{: >8}, red:{: >8}]\t\ttype: {}\n",
-        it->first->data(),
+        it->first,
         std::get<1>(it->second),
         std::get<2>(it->second),
         show(std::get<0>(it->second))
@@ -202,6 +203,7 @@ std::string show(const Stats& stats) {
 
   folly::format(
     &ret,
+    "       total_methods:  {: >8}\n"
     "         total_funcs:  {: >8}\n"
     "        unique_funcs:  {: >8}\n"
     "    persistent_funcs:  {: >8}\n"
@@ -213,6 +215,7 @@ std::string show(const Stats& stats) {
     "   persistent_sprops_pub:  {: >8}\n"
     "   persistent_sprops_prot: {: >8}\n"
     "   persistent_sprops_priv: {: >8}\n",
+    stats.totalMethods.load(),
     stats.totalFunctions.load(),
     stats.uniqueFunctions.load(),
     stats.persistentFunctions.load(),
@@ -306,7 +309,7 @@ bool in(StatsSS& env, const bc::CGetM& op) {
     case LSL:
     case LSC:
       return TTop;
-    case NumLocationCodes:
+    case InvalidLocationCode:
       break;
     }
     not_reached();
@@ -328,16 +331,7 @@ bool in(StatsSS& env, const bc::FCallBuiltin& op) {
     }
   }
 
-  // run the interpreter and check the top of the stack
   default_dispatch(env, op);
-
-  if (reducible) {
-    auto t = topT(env);
-    auto const v = tv(t);
-    if (!v) {
-      reducible = false;
-    }
-  }
 
   auto builtin = op.str3;
   {
@@ -415,8 +409,7 @@ void collect_simple(Stats& stats, const Bytecode& bc) {
 }
 
 void collect_func(Stats& stats, const Index& index, php::Func& func) {
-  auto const isPM = func.unit->pseudomain.get() == &func;
-  if (!func.cls && !isPM) {
+  if (!func.cls) {
     ++stats.totalFunctions;
     if (func.attrs & AttrPersistent) {
       ++stats.persistentFunctions;
@@ -436,17 +429,17 @@ void collect_func(Stats& stats, const Index& index, php::Func& func) {
     }
   }
 
-  if (!options.extendedStats || isPM) return;
+  if (!options.extendedStats) return;
 
   auto const ctx = Context { func.unit, &func, func.cls };
   auto const fa  = analyze_func(index, ctx);
   {
-    Trace::Bump bumper{Trace::hhbbc, kTraceBump};
+    Trace::Bump bumper{Trace::hhbbc, kStatsBump};
     for (auto& blk : func.blocks) {
       auto state = fa.bdata[blk->id].stateIn;
       if (!state.initialized) continue;
 
-      CollectedInfo collect { index, ctx, nullptr };
+      CollectedInfo collect { index, ctx, nullptr, nullptr };
       Interp interp { index, ctx, collect, borrow(blk), state };
       for (auto& bc : blk->hhbcs) {
         auto noop    = [] (php::Block&, const State&) {};
@@ -467,12 +460,15 @@ void collect_class(Stats& stats, const Index& index, const php::Class& cls) {
   if (cls.attrs & AttrUnique) {
     ++stats.uniqueClasses;
   }
+  stats.totalMethods += cls.methods.size();
+
   for (auto& kv : index.lookup_private_props(&cls)) {
     add_type(stats.privateProps, kv.second);
   }
   for (auto& kv : index.lookup_private_statics(&cls)) {
     add_type(stats.privateStatics, kv.second);
   }
+
   for (auto& prop : cls.properties) {
     if (prop.attrs & AttrStatic) {
       ++stats.totalSProps;
@@ -524,17 +520,32 @@ void print_stats(const Index& index, const php::Program& program) {
     std::cout << str;
   }
 
-  char fileBuf[] = "/tmp/hhbbcXXXXXX";
-  int fd = mkstemp(fileBuf);
-  if (fd == -1) {
-    std::cerr << "couldn't open temporary file for stats: "
+  auto stats_file = options.stats_file;
+
+  auto const file = [&] () -> std::FILE* {
+    if (!stats_file.empty()) {
+      return fopen(stats_file.c_str(), "w");
+    }
+
+    char fileBuf[] = "/tmp/hhbbcXXXXXX";
+    auto const fd = mkstemp(fileBuf);
+    stats_file = fileBuf;
+    if (fd == -1) return nullptr;
+
+    if (auto const fp = fdopen(fd, "w")) return fp;
+    close(fd);
+    return nullptr;
+  }();
+
+  if (file == nullptr) {
+    std::cerr << "couldn't open file for stats: "
               << folly::errnoStr(errno) << '\n';
     return;
   }
-  SCOPE_EXIT { close(fd); };
-  auto file = fdopen(fd, "w");
-  std::cout << "stats saved to " << fileBuf << '\n';
-  std::fprintf(file, "%s", str.c_str());
+
+  SCOPE_EXIT { fclose(file); };
+  std::cout << "stats saved to " << stats_file << '\n';
+  std::fwrite(str.c_str(), sizeof(char), str.size(), file);
   std::fflush(file);
 }
 

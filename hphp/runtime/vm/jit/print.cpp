@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -13,19 +13,26 @@
    | license@php.net so we can mail you a copy immediately.               |
    +----------------------------------------------------------------------+
 */
-#include "hphp/runtime/vm/jit/print.h"
-#include <vector>
 
-#include "hphp/util/text-color.h"
+#include "hphp/runtime/vm/jit/print.h"
+
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
 #include "hphp/util/abi-cxx.h"
-#include "hphp/runtime/vm/jit/containers.h"
-#include "hphp/runtime/base/stats.h"
-#include "hphp/runtime/vm/jit/ir.h"
-#include "hphp/runtime/vm/jit/layout.h"
-#include "hphp/runtime/vm/jit/block.h"
-#include "hphp/runtime/vm/jit/code-gen.h"
-#include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/util/text-color.h"
 #include "hphp/util/text-util.h"
+
+#include "hphp/runtime/base/stats.h"
+
+#include "hphp/runtime/vm/jit/asm-info.h"
+#include "hphp/runtime/vm/jit/block.h"
+#include "hphp/runtime/vm/jit/cfg.h"
+#include "hphp/runtime/vm/jit/containers.h"
+#include "hphp/runtime/vm/jit/guard-constraints.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
+#include "hphp/runtime/vm/jit/mc-generator.h"
 
 namespace HPHP { namespace jit {
 
@@ -46,21 +53,10 @@ std::string constToString(Type t) {
   return os.str();
 }
 
-const PhysLoc* srcLoc(const RegAllocInfo* regs,
-                      const IRInstruction* inst, unsigned i) {
-  return regs ? &(*regs)[inst].src(i) : nullptr;
-}
-
-const PhysLoc* dstLoc(const RegAllocInfo* regs,
-                      const IRInstruction* inst, unsigned i) {
-  return regs ? &(*regs)[inst].dst(i) : nullptr;
-}
-
-void printSrc(std::ostream& ostream, const IRInstruction* inst, uint32_t i,
-              const RegAllocInfo* regs) {
+void printSrc(std::ostream& ostream, const IRInstruction* inst, uint32_t i) {
   SSATmp* src = inst->src(i);
   if (src != nullptr) {
-    print(ostream, src, srcLoc(regs, inst, i));
+    print(ostream, src);
   } else {
     ostream << color(ANSI_COLOR_RED)
             << "!!!NULL @ " << i
@@ -132,8 +128,7 @@ void printOpcode(std::ostream& os, const IRInstruction* inst,
      << color(ANSI_COLOR_END);
 }
 
-void printSrcs(std::ostream& os, const IRInstruction* inst,
-               const RegAllocInfo* regs) {
+void printSrcs(std::ostream& os, const IRInstruction* inst) {
   bool first = true;
   if (inst->op() == IncStat) {
     os << " " << Stats::g_counterNames[inst->src(0)->intVal()]
@@ -147,36 +142,35 @@ void printSrcs(std::ostream& os, const IRInstruction* inst,
       os << " ";
       first = false;
     }
-    printSrc(os, inst, i, regs);
+    printSrc(os, inst, i);
   }
 }
 
-void printDsts(std::ostream& os, const IRInstruction* inst,
-               const RegAllocInfo* regs) {
+void printDsts(std::ostream& os, const IRInstruction* inst) {
   const char* sep = "";
   for (unsigned i = 0, n = inst->numDsts(); i < n; i++) {
     os << punc(sep);
-    print(os, inst->dst(i), dstLoc(regs, inst, i));
+    print(os, inst->dst(i));
     sep = ", ";
   }
 }
 
 void printInstr(std::ostream& ostream, const IRInstruction* inst,
-                const RegAllocInfo* regs, const GuardConstraints* guards) {
-  printDsts(ostream, inst, regs);
+                const GuardConstraints* guards) {
+  printDsts(ostream, inst);
   if (inst->numDsts()) ostream << punc(" = ");
   printOpcode(ostream, inst, guards);
-  printSrcs(ostream, inst, regs);
+  printSrcs(ostream, inst);
 }
 
 void print(std::ostream& ostream, const IRInstruction* inst,
-           const RegAllocInfo* regs, const GuardConstraints* guards) {
+           const GuardConstraints* guards) {
   if (!inst->isTransient()) {
     ostream << color(ANSI_COLOR_YELLOW);
     ostream << folly::format("({:02d}) ", inst->id());
     ostream << color(ANSI_COLOR_END);
   }
-  printInstr(ostream, inst, regs, guards);
+  printInstr(ostream, inst, guards);
   if (Block* taken = inst->taken()) {
     ostream << punc(" -> ");
     printLabel(ostream, taken);
@@ -190,57 +184,14 @@ void print(const IRInstruction* inst) {
 
 //////////////////////////////////////////////////////////////////////
 
-/*
- * SSATmp
- */
-std::ostream& operator<<(std::ostream& os, const PhysLoc& loc) {
-  auto sz = loc.numAllocated();
-  if (!sz) return os;
-  os << '(';
-  auto delim = "";
-  for (int i = 0; i < sz; ++i) {
-    os << delim;
-    if (!loc.spilled()) {
-      PhysReg reg = loc.reg(i);
-      mcg->backEnd().streamPhysReg(os, reg);
-    } else {
-      os << "spill[" << loc.slot(i) << "]";
-    }
-    delim = ",";
-  }
-  os << ')';
-  return os;
-}
-
-void printPhysLoc(std::ostream& os, const PhysLoc& loc) {
-  if (loc.numAllocated() > 0) {
-    os << color(ANSI_COLOR_BROWN) << loc << color(ANSI_COLOR_END);
-  }
-}
-
-std::string ShuffleData::show() const {
-  std::ostringstream os;
-  auto delim = "";
-  for (unsigned i = 0; i < size; ++i) {
-    os << delim;
-    printPhysLoc(os, dests[i]);
-    delim = ",";
-  }
-  return os.str();
-}
-
-void print(std::ostream& os, const SSATmp* tmp, const PhysLoc* loc) {
+void print(std::ostream& os, const SSATmp* tmp) {
   if (tmp->inst()->is(DefConst)) {
     os << constToString(tmp->type());
-    if (loc) printPhysLoc(os, *loc);
     return;
   }
   os << color(ANSI_COLOR_WHITE);
   os << "t" << tmp->id();
   os << color(ANSI_COLOR_END);
-  if (loc) {
-    printPhysLoc(os, *loc);
-  }
   os << punc(":")
      << color(ANSI_COLOR_GREEN)
      << tmp->type().toString()
@@ -265,14 +216,14 @@ void disasmRange(std::ostream& os, TCA begin, TCA end) {
                              begin, end);
 }
 
-void print(std::ostream& os, const Block* block,
-           const RegAllocInfo* regs, const AsmInfo* asmInfo,
-           const GuardConstraints* guards, BCMarker* markerPtr) {
+void print(std::ostream& os, const Block* block, AreaIndex area,
+           const AsmInfo* asmInfo, const GuardConstraints* guards,
+           BCMarker* markerPtr) {
   BCMarker dummy;
   BCMarker& curMarker = markerPtr ? *markerPtr : dummy;
 
-  TcaRange blockRange = asmInfo ? asmInfo->asmRanges[block] :
-    TcaRange(nullptr, nullptr);
+  TcaRange blockRange = asmInfo ? asmInfo->blockRangesForArea(area)[block]
+                                : TcaRange { nullptr, nullptr };
 
   os << '\n' << std::string(kIndent - 3, ' ');
   printLabel(os, block);
@@ -281,7 +232,7 @@ void print(std::ostream& os, const Block* block,
   if (!preds.empty()) {
     os << " (preds";
     for (auto const& edge : preds) {
-      os << " B" << edge.inst()->block()->id();
+      os << " B" << edge.from()->id();
     }
     os << ')';
   }
@@ -341,14 +292,14 @@ void print(std::ostream& os, const Block* block,
                           folly::format("({}) ", inst.id()).str().size(),
                           ' ');
         auto dst = inst.dst(i);
-        jit::print(os, dst, dstLoc(regs, &inst, i));
+        jit::print(os, dst);
         os << punc(" = ") << color(ANSI_COLOR_CYAN) << "phi "
            << color(ANSI_COLOR_END);
         bool first = true;
         inst.block()->forEachSrc(i, [&](IRInstruction* jmp, SSATmp*) {
             if (!first) os << punc(", ");
             first = false;
-            printSrc(os, jmp, i, regs);
+            printSrc(os, jmp, i);
             os << punc("@");
             printLabel(os, jmp->block());
           });
@@ -357,40 +308,43 @@ void print(std::ostream& os, const Block* block,
     }
 
     os << std::string(kIndent, ' ');
-    jit::print(os, &inst, regs, guards);
+    jit::print(os, &inst, guards);
     os << '\n';
 
     if (asmInfo) {
-      TcaRange instRange = asmInfo->instRanges[inst];
-      if (!instRange.empty()) {
-        disasmRange(os, instRange.begin(), instRange.end());
-        os << '\n';
-        assert(instRange.end() >= blockRange.start() &&
-               instRange.end() <= blockRange.end());
-        blockRange = TcaRange(instRange.end(), blockRange.end());
+      // There can be asm ranges in areas other than the one this blocks claims
+      // to be in so we have to iterate all the areas to be sure to get
+      // everything.
+      for (auto i = 0; i < kNumAreas; ++i) {
+        AreaIndex currentArea = static_cast<AreaIndex>(i);
+        TcaRange instRange = asmInfo->instRangesForArea(currentArea)[inst];
+        if (!instRange.empty()) {
+          os << std::string(kIndent + 4, ' ') << areaAsString(currentArea);
+          os << ":\n";
+          disasmRange(os, instRange.begin(), instRange.end());
+          os << '\n';
+          if (currentArea == area) {
+            // FIXME: this used to be an assertion
+            auto things_are_ok =
+              instRange.end() >= blockRange.start() &&
+              instRange.end() <= blockRange.end();
+            if (things_are_ok) {
+              blockRange = TcaRange(instRange.end(), blockRange.end());
+            } else {
+              // Don't crash; do something broken instead.
+              os << "<note: print range is probably incorrect right now>\n";
+            }
+          }
+        }
       }
     }
   }
 
   if (asmInfo) {
-    // print code associated with this block that isn't tied to any
-    // instruction.  This includes code after the last isntruction (e.g.
-    // jmp to next block), and ACold or AFrozen code.
+    // Print code associated with the block that isn't tied to any instruction.
     if (!blockRange.empty()) {
       os << std::string(kIndent, ' ') << punc("A:") << "\n";
       disasmRange(os, blockRange.start(), blockRange.end());
-    }
-    auto acoldRange = asmInfo->acoldRanges[block];
-    if (!acoldRange.empty()) {
-      os << std::string(kIndent, ' ') << punc("ACold:") << "\n";
-      disasmRange(os, acoldRange.start(), acoldRange.end());
-    }
-    auto afrozenRange = asmInfo->afrozenRanges[block];
-    if (!afrozenRange.empty()) {
-      os << std::string(kIndent, ' ') << punc("AFrozen:") << "\n";
-      disasmRange(os, afrozenRange.start(), afrozenRange.end());
-    }
-    if (!blockRange.empty() || !acoldRange.empty() || !afrozenRange.empty()) {
       os << '\n';
     }
   }
@@ -407,13 +361,13 @@ void print(std::ostream& os, const Block* block,
 }
 
 void print(const Block* block) {
-  print(std::cerr, block);
+  print(std::cerr, block, AreaIndex::Main);
   std::cerr << std::endl;
 }
 
 std::string Block::toString() const {
   std::ostringstream out;
-  print(out, this);
+  print(out, this, AreaIndex::Main);
   return out.str();
 }
 
@@ -439,26 +393,37 @@ void printOpcodeStats(std::ostream& os, const BlockList& blocks) {
 /*
  * Unit
  */
-void print(std::ostream& os, const IRUnit& unit,
-           const RegAllocInfo* regs, const AsmInfo* asmInfo,
-           const GuardConstraints* guards, bool dotBodies) {
+void print(std::ostream& os, const IRUnit& unit, const AsmInfo* asmInfo,
+           const GuardConstraints* guards) {
   // For nice-looking dumps, we want to remember curMarker between blocks.
   BCMarker curMarker;
+  static bool dotBodies = getenv("HHIR_DOT_BODIES");
 
-  auto const layout = layoutBlocks(unit);
-  auto const& blocks = layout.blocks;
+  auto blocks = rpoSortCfg(unit);
+  // Partition into main, cold and frozen, without changing relative order.
+  auto cold = std::stable_partition(blocks.begin(), blocks.end(),
+    [&] (Block* b) {
+      return b->hint() == Block::Hint::Neither ||
+             b->hint() == Block::Hint::Likely;
+    }
+  );
+  auto frozen = std::stable_partition(cold, blocks.end(),
+    [&] (Block* b) { return b->hint() == Block::Hint::Unlikely; }
+  );
 
   if (dumpIREnabled(kExtraExtraLevel)) printOpcodeStats(os, blocks);
 
   // Print the block CFG above the actual code.
+
+  auto const retreating_edges = findRetreatingEdges(unit);
   os << "digraph G {\n";
-  for (Block* block : blocks) {
+  for (auto block : blocks) {
     if (block->empty()) continue;
     if (dotBodies && block->hint() != Block::Hint::Unlikely &&
         block->hint() != Block::Hint::Unused) {
       // Include the IR in the body of the node
       std::ostringstream out;
-      print(out, block, regs, asmInfo, guards, &curMarker);
+      print(out, block, AreaIndex::Main, asmInfo, guards, &curMarker);
       auto bodyRaw = out.str();
       std::string body;
       body.reserve(bodyRaw.size() * 1.25);
@@ -472,27 +437,46 @@ void print(std::ostream& os, const IRUnit& unit,
                           block->id(), body);
     }
 
-    auto* next = block->next();
-    auto* taken = block->taken();
+    auto next = block->nextEdge();
+    auto taken = block->takenEdge();
     if (!next && !taken) continue;
+    auto edge_color = [&] (Edge* edge) {
+      auto const target = edge->to();
+      return
+        target->isCatch() ? " [color=blue]" :
+        target->isExit() ? " [color=cyan]" :
+        retreating_edges.count(edge) ? " [color=red]" :
+        target->hint() == Block::Hint::Unlikely ? " [color=green]" : "";
+    };
+    auto show_edge = [&] (Edge* edge) {
+      os << folly::format(
+        "B{} -> B{}{}",
+        block->id(),
+        edge->to()->id(),
+        edge_color(edge)
+      );
+    };
     if (next) {
-      os << folly::format("B{} -> B{}", block->id(), next->id());
+      show_edge(next);
       if (taken) os << "; ";
     }
-    if (taken) os << folly::format("B{} -> B{}", block->id(), taken->id());
+    if (taken) show_edge(taken);
     os << "\n";
   }
   os << "}\n";
 
+  AreaIndex currentArea = AreaIndex::Main;
   curMarker = BCMarker();
   for (auto it = blocks.begin(); it != blocks.end(); ++it) {
-    if (it == layout.acoldIt) {
+    if (it == cold) {
       os << folly::format("\n{:-^60}", "cold blocks");
+      currentArea = AreaIndex::Cold;
     }
-    if (it == layout.afrozenIt) {
+    if (it == frozen) {
       os << folly::format("\n{:-^60}", "frozen blocks");
+      currentArea = AreaIndex::Frozen;
     }
-    print(os, *it, regs, asmInfo, guards, &curMarker);
+    print(os, *it, currentArea, asmInfo, guards, &curMarker);
   }
 }
 
@@ -501,30 +485,36 @@ void print(const IRUnit& unit) {
   std::cerr << std::endl;
 }
 
-std::string IRUnit::toString() const {
+std::string show(const IRUnit& unit) {
   std::ostringstream out;
-  print(out, *this);
+  print(out, unit);
   return out.str();
+}
+
+std::string banner(const char* caption) {
+  return folly::sformat(
+    "{}{:-^80}{}\n",
+    color(ANSI_COLOR_BLACK, ANSI_BGCOLOR_GREEN),
+    caption,
+    color(ANSI_COLOR_END)
+  );
 }
 
 // Suggested captions: "before jiffy removal", "after goat saturation",
 // etc.
-void printUnit(int level, const IRUnit& unit, const char* caption,
-               const RegAllocInfo* regs, AsmInfo* ai,
+void printUnit(int level, const IRUnit& unit, const char* caption, AsmInfo* ai,
                const GuardConstraints* guards) {
   if (dumpIREnabled(level)) {
     std::ostringstream str;
-    auto bannerFmt = "{:-^80}\n";
-    str << color(ANSI_COLOR_BLACK, ANSI_BGCOLOR_GREEN)
-        << folly::format(bannerFmt, caption)
-        << color(ANSI_COLOR_END)
-        ;
-    print(str, unit, regs, ai, guards);
-    str << color(ANSI_COLOR_BLACK, ANSI_BGCOLOR_GREEN)
-        << folly::format(bannerFmt, "")
-        << color(ANSI_COLOR_END)
-        ;
-    HPHP::Trace::traceRelease("%s\n", str.str().c_str());
+    str << banner(caption);
+    print(str, unit, ai, guards);
+    str << banner("");
+    if (HPHP::Trace::moduleEnabledRelease(HPHP::Trace::printir, level)) {
+      HPHP::Trace::traceRelease("%s\n", str.str().c_str());
+    }
+    if (RuntimeOption::EvalDumpIR >= level) {
+      mcg->annotations().emplace_back(caption, std::move(str.str()));
+    }
   }
 }
 

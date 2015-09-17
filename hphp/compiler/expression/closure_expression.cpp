@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,7 +17,7 @@
 
 #include <boost/make_shared.hpp>
 #include <set>
-#include "folly/ScopeGuard.h"
+#include <folly/ScopeGuard.h>
 
 #include "hphp/compiler/expression/parameter_expression.h"
 #include "hphp/compiler/expression/expression_list.h"
@@ -31,9 +31,6 @@
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
-
-TypePtr ClosureExpression::s_ClosureType =
-  Type::CreateObjectType("closure"); // needs lower case
 
 ClosureExpression::ClosureExpression(
     EXPRESSION_CONSTRUCTOR_PARAMETERS,
@@ -57,7 +54,7 @@ ClosureExpression::ClosureExpression(
 
 void ClosureExpression::initializeFromUseList(ExpressionListPtr vars) {
   m_vars = ExpressionListPtr(
-    new ExpressionList(vars->getScope(), vars->getLocation()));
+    new ExpressionList(vars->getScope(), vars->getRange()));
 
   // Because PHP is insane you can have a use variable with the same
   // name as a param name.
@@ -65,8 +62,7 @@ void ClosureExpression::initializeFromUseList(ExpressionListPtr vars) {
   auto seenBefore = collectParamNames();
 
   for (int i = vars->getCount() - 1; i >= 0; i--) {
-    ParameterExpressionPtr param(
-      dynamic_pointer_cast<ParameterExpression>((*vars)[i]));
+    auto param = dynamic_pointer_cast<ParameterExpression>((*vars)[i]);
     assert(param);
     if (param->getName() == "this") {
       // "this" is automatically included.
@@ -86,14 +82,13 @@ void ClosureExpression::initializeValuesFromVars() {
   if (!m_vars) return;
 
   m_values = ExpressionListPtr
-    (new ExpressionList(m_vars->getScope(), m_vars->getLocation()));
+    (new ExpressionList(m_vars->getScope(), m_vars->getRange()));
   for (int i = 0; i < m_vars->getCount(); i++) {
-    ParameterExpressionPtr param =
-      dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
-    const string &name = param->getName();
+    auto param = dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
+    auto const& name = param->getName();
 
     SimpleVariablePtr var(new SimpleVariable(param->getScope(),
-                                             param->getLocation(),
+                                             param->getRange(),
                                              name));
     if (param->isRef()) {
       var->setContext(RefValue);
@@ -169,9 +164,8 @@ void ClosureExpression::analyzeVars(AnalysisResultPtr ar) {
     VariableTablePtr variables = m_func->getFunctionScope()->getVariables();
     VariableTablePtr containing = getFunctionScope()->getVariables();
     for (int i = 0; i < m_vars->getCount(); i++) {
-      ParameterExpressionPtr param =
-        dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
-      const string &name = param->getName();
+      auto param = dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
+      auto const& name = param->getName();
       {
         Symbol *containingSym = containing->addDeclaredSymbol(name, param);
         containingSym->setPassClosureVar();
@@ -195,9 +189,8 @@ void ClosureExpression::analyzeVars(AnalysisResultPtr ar) {
     // closure function's variable table (not containing function's)
     VariableTablePtr variables = m_func->getFunctionScope()->getVariables();
     for (int i = 0; i < m_vars->getCount(); i++) {
-      ParameterExpressionPtr param =
-        dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
-      const string &name = param->getName();
+      auto param = dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
+      auto const& name = param->getName();
 
       // so we can assign values to them, instead of seeing CVarRef
       Symbol *sym = variables->getSymbol(name);
@@ -206,67 +199,6 @@ void ClosureExpression::analyzeVars(AnalysisResultPtr ar) {
       }
     }
   }
-}
-
-TypePtr ClosureExpression::inferTypes(AnalysisResultPtr ar, TypePtr type,
-                                      bool coerce) {
-  if (m_vars) {
-    assert(m_values && m_values->getCount() == m_vars->getCount());
-
-    // containing function's variable table (not closure function's)
-    VariableTablePtr variables = getScope()->getVariables();
-
-    // closure function's variable table
-    VariableTablePtr cvariables = m_func->getFunctionScope()->getVariables();
-
-    // force all reference use vars into variant for this function scope
-    for (int i = 0; i < m_vars->getCount(); i++) {
-      ParameterExpressionPtr param =
-        dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
-      const string &name = param->getName();
-      if (param->isRef()) {
-        variables->forceVariant(ar, name, VariableTable::AnyVars);
-      }
-    }
-
-    // infer the types of the values
-    m_values->inferAndCheck(ar, Type::Some, false);
-
-    // coerce the types inferred from m_values into m_vars
-    for (int i = 0; i < m_vars->getCount(); i++) {
-      ExpressionPtr value = (*m_values)[i];
-      ParameterExpressionPtr var =
-        dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
-      assert(!var->getExpectedType());
-      assert(!var->getImplementedType());
-      if (var->isRef()) {
-        var->setActualType(Type::Variant);
-      } else {
-        TypePtr origVarType(var->getActualType() ?
-                            var->getActualType() : Type::Some);
-        var->setActualType(Type::Coerce(ar, origVarType, value->getType()));
-      }
-    }
-
-    {
-      // this lock isn't technically needed for thread-safety, since
-      // the dependencies are all set up. however, the lock assertions
-      // will fail if we don't acquire it.
-      GET_LOCK(m_func->getFunctionScope());
-
-      // bootstrap the closure function's variable table with
-      // the types from m_vars
-      for (int i = 0; i < m_vars->getCount(); i++) {
-        ParameterExpressionPtr param =
-          dynamic_pointer_cast<ParameterExpression>((*m_vars)[i]);
-        const string &name = param->getName();
-        cvariables->addParamLike(name, param->getType(), ar,
-                                 shared_from_this(),
-                                 getScope()->isFirstPass());
-      }
-    }
-  }
-  return s_ClosureType;
 }
 
 void ClosureExpression::setCaptureList(
@@ -295,7 +227,7 @@ void ClosureExpression::setCaptureList(
   if (captureNames.empty()) return;
 
   m_vars = ExpressionListPtr(
-    new ExpressionList(getOriginalScope(), getLocation()));
+    new ExpressionList(getScope(), getRange()));
 
   for (auto const& name : captureNames) {
     if (name == "this") {
@@ -303,9 +235,9 @@ void ClosureExpression::setCaptureList(
       continue;
     }
 
-    auto expr = ParameterExpressionPtr(new ParameterExpression(
-      BlockScopePtr(getOriginalScope()),
-      getLocation(),
+    auto expr = std::make_shared<ParameterExpression>(
+      BlockScopePtr(getScope()),
+      getRange(),
       TypeAnnotationPtr(),
       true /* hhType */,
       name,
@@ -313,7 +245,7 @@ void ClosureExpression::setCaptureList(
       0 /* token modifier thing */,
       ExpressionPtr(),
       ExpressionPtr()
-    ));
+    );
     m_vars->insertElement(expr);
   }
 
@@ -350,8 +282,8 @@ bool ClosureExpression::hasStaticLocalsImpl(ConstructPtr root) {
   }
 
   for (int i = 0; i < root->getKidCount(); i++) {
-    ConstructPtr cons = root->getNthKid(i);
-    if (StatementPtr s = dynamic_pointer_cast<Statement>(cons)) {
+    auto cons = root->getNthKid(i);
+    if (auto s = dynamic_pointer_cast<Statement>(cons)) {
       if (s->is(Statement::KindOfStaticStatement)) {
         return true;
       }
@@ -375,7 +307,7 @@ void ClosureExpression::outputCodeModel(CodeGenerator &cg) {
     cg.printExpressionVector(m_vars);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

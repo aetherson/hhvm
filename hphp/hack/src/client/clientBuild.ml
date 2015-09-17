@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -8,73 +8,77 @@
  *
  *)
 
-(* 300s was chosen because it was the p90 of hack server startup times
- * as observed here: https://fburl.com/29184831 *)
-let num_build_retries = 300
+open Utils
 
-type env = ServerMsg.build_opts
+(* 800s was chosen because it was above most of the historical p95 of
+ * hack server startup times as observed here:
+ * https://fburl.com/48825801, see also https://fburl.com/29184831 *)
+let num_build_retries = 800
 
-let rec connect env retries =
+type env = {
+  root : Path.t;
+  wait : bool;
+  build_opts : ServerBuild.build_opts;
+}
+
+let build_kind_of build_opts =
+  let module LC = ClientLogCommand in
+  let {ServerBuild.steps; no_steps; is_push; incremental; _} = build_opts in
+  if steps <> None || no_steps <> None then
+    `Steps
+  else if is_push then
+    `Push
+  else if incremental then
+    `Incremental
+  else
+    `Full
+
+let handle_response env ic =
+  let finished = ref false in
+  let exit_code = ref Exit_status.Ok in
+  HackEventLogger.client_begin_work (ClientLogCommand.LCBuild
+    (env.root, build_kind_of env.build_opts, env.build_opts.ServerBuild.id));
   try
-    let result = ClientUtils.connect env.ServerMsg.root in
-    if Tty.spinner_used() then Tty.print_clear_line stdout;
-    result
+    while true do
+      let line:ServerBuild.build_progress = Marshal.from_channel ic in
+      match line with
+      | ServerBuild.BUILD_PROGRESS s -> print_endline s
+      | ServerBuild.BUILD_ERROR s ->
+          exit_code := Exit_status.Build_error; print_endline s
+      | ServerBuild.BUILD_FINISHED -> finished := true
+    done;
+    Exit_status.Ok
   with
-  | ClientExceptions.Server_cant_connect ->
-    Printf.printf "Can't connect to server yet, retrying.\n%!";
-    if retries > 0
-    then begin
-      Unix.sleep 1;
-      connect env (retries - 1)
-    end
-    else exit 2
-  | ClientExceptions.Server_initializing ->
-    Printf.printf
-      (* This extra space before the \r is here to erase the spinner
-         when the length of this line decreases (but by at most 1!) as
-         it ticks down. We don't want to rely on Tty.print_clear_line
-         --- it would emit newlines when stdout is not a tty, and
-         obviate the effect of the \r. *)
-      "Hack server still initializing. (will wait %d more seconds) %s \r%!"
-      retries (Tty.spinner());
-    if retries > 0
-    then begin
-      Unix.sleep 1;
-      connect env (retries - 1)
-    end
-    else begin
-      if Tty.spinner_used() then Tty.print_clear_line stdout;
-      Printf.printf "Waited >%ds for hack server initialization. Try again.\n%!"
-        num_build_retries;
-      exit 2
-    end
-
-let rec main_ env retries =
-  (* Check if a server is up *)
-  if not (ClientUtils.server_exists env.ServerMsg.root)
-  then ClientStart.start_server env.ServerMsg.root;
-  let ic, oc = connect env retries in
-  ServerMsg.cmd_to_channel oc (ServerMsg.BUILD env);
-  let response = ServerMsg.response_from_channel ic in
-  match response with
-  | ServerMsg.SERVER_OUT_OF_DATE ->
-    Printf.printf
-      "Hack server is an old version, trying again.\n%!";
-    Unix.sleep 2;
-    main_ env (retries - 1)
-  | ServerMsg.PONG -> (* successful case *)
-    begin
-      EventLogger.client_begin_work (
-        ClientLogCommand.LCBuild env.ServerMsg.root);
-      try
-        while true do
-          print_endline (input_line ic)
-        done
-      with End_of_file ->
-        ()
-    end
-  | resp -> Printf.printf "Unexpected server response %s.\n%!"
-    (ServerMsg.response_to_string resp)
+  | End_of_file ->
+    if not !finished then begin
+      Printf.fprintf stderr ("Build unexpectedly terminated! "^^
+        "You may need to do `hh_client restart`.\n");
+      Exit_status.Build_terminated
+    end else !exit_code
+  | Failure _ as e ->
+    (* We are seeing Failure "input value: bad object" which can
+     * realistically only happen from Marshal.from_channel ic.
+     * This admittedly won't help us root cause this, but at least
+     * this will help us identify where it is occurring
+     *)
+    let backtrace = Printexc.get_backtrace () in
+    let e_str = Printexc.to_string e in
+    Printf.fprintf stderr "Unexpected error: %s\n%s%!" e_str backtrace;
+    raise e
 
 let main env =
-  main_ env num_build_retries
+  let ic, oc = ClientConnect.connect { ClientConnect.
+    root = env.root;
+    autostart = true;
+    retries = if env.wait then None else Some num_build_retries;
+    retry_if_init = true;
+    expiry = None;
+    no_load = false;
+  } in
+  with_context
+    ~enter:(fun () -> ())
+    ~exit:(fun () ->
+      Printf.eprintf "\nHack build id: %s\n%!" env.build_opts.ServerBuild.id)
+    ~do_:(fun () ->
+      ServerCommand.(stream_request oc (BUILD env.build_opts));
+      handle_response env ic)

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,16 +18,17 @@
 #define incl_HPHP_RUNTIME_VM_JIT_GUARD_RELAXATION_H_
 
 #include "hphp/runtime/base/datatype.h"
-#include "hphp/runtime/vm/jit/ir.h"
 #include "hphp/runtime/vm/jit/region-selection.h"
+#include "hphp/runtime/vm/jit/type-constraint.h"
 #include "hphp/runtime/vm/jit/type.h"
 
 #include "hphp/runtime/vm/jit/block.h"
 
 namespace HPHP { namespace jit {
 
-struct SSATmp;
+struct GuardConstraints;
 struct IRUnit;
+struct SSATmp;
 
 enum RelaxGuardsFlags {
   RelaxNormal =      0,
@@ -46,12 +47,19 @@ bool typeMightRelax(const SSATmp* tmp);
 bool relaxGuards(IRUnit&, const GuardConstraints& guards,
                  RelaxGuardsFlags flags);
 
-typedef std::function<void(const RegionDesc::Location&, Type)> VisitGuardFn;
-void visitGuards(IRUnit&, const VisitGuardFn& func);
-
+/*
+ * Returns true iff `t' is specific enough to fit `cat', meaning a consumer
+ * constraining a value with `cat' would be satisfied with `t' as the value's
+ * type after relaxation.
+ */
 bool typeFitsConstraint(Type t, TypeConstraint cat);
-Type relaxType(Type t, TypeConstraint cat);
-void incCategory(DataTypeCategory& c);
+
+/*
+ * Returns the least specific supertype of t that maintains the properties
+ * required by tc.
+ */
+Type relaxType(Type t, DataTypeCategory cat);
+
 TypeConstraint relaxConstraint(const TypeConstraint origTc,
                                const Type knownType, const Type toRelax);
 TypeConstraint applyConstraint(TypeConstraint origTc, TypeConstraint newTc);

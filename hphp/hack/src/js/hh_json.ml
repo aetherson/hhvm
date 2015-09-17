@@ -1,5 +1,5 @@
 (**
- * Copyright (c) 2014, Facebook, Inc.
+ * Copyright (c) 2015, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under the BSD-style license found in the
@@ -13,6 +13,8 @@
  *
  *)
 
+open Core
+
 type json =
     JList of json list
   | JBool of bool
@@ -22,18 +24,19 @@ type json =
   | JInt of int
 
 
-let rec json_to_string (json:json): string =
+let rec to_js_object json =
   match json with
-    JList l ->
-      let nl = List.map json_to_string l in
-      "[" ^ (String.concat "," nl) ^ "]"
+  | JList l ->
+      let l = List.map l to_js_object in
+      let l = Array.of_list l in
+      Js.Unsafe.inject (Js.array l)
   | JAssoc l ->
-      let nl = List.map (fun (k, v) -> (json_to_string (JString k)) ^ ":" ^ (json_to_string v)) l in
-      "{" ^ (String.concat "," nl) ^ "}"
-  | JBool b -> if b then "true" else "false"
-  | JString s ->
-      let b = Buffer.create (String.length s) in
-      Deriving_Json_Str.write b s;
-      Buffer.contents b
-  | JNull -> "null"
-  | JInt i -> Printf.sprintf "%d" i
+      let l = List.map l begin fun (k, v) ->
+        k, to_js_object v
+      end in
+      let l = Array.of_list l in
+      Js.Unsafe.obj l
+  | JBool b -> Js.Unsafe.inject (Js.bool b)
+  | JString s -> Js.Unsafe.inject (Js.string s)
+  | JNull -> Js.Unsafe.inject Js.null
+  | JInt i -> Js.Unsafe.inject (Js.number_of_float (float_of_int i))

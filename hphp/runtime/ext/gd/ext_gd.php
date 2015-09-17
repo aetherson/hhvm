@@ -21,6 +21,13 @@ function gd_info(): array;
 function getimagesize(string $filename,
                       mixed &$imageinfo = null): mixed;
 
+/* Identical to getimagesize() except that getimagesizefromstring() accepts
+ * a string instead of a file name as the first parameter.
+ */
+<<__Native>>
+function getimagesizefromstring(string $filename,
+                      mixed &$imageinfo = null): mixed;
+
 /* Returns the extension for the given IMAGETYPE_XXX constant.
  */
 <<__Native>>
@@ -746,6 +753,13 @@ function imagerotate(resource $source_image,
 function imagesavealpha(resource $image,
                         bool $saveflag): bool;
 
+/*
+ * imagescale - Scale an image using the given new width and height.
+ */
+<<__Native>>
+function imagescale(resource $img, int $newwidth, int $newheigh = -1,
+                               int $method = IMG_BILINEAR_FIXED): mixed;
+
 /* imagesetbrush() sets the brush image to be used by all line drawing
  * functions (such as imageline() and imagepolygon()) when drawing with the
  * special colors IMG_COLOR_BRUSHED or IMG_COLOR_STYLEDBRUSHED.
@@ -904,8 +918,19 @@ function png2wbmp(string $pngname,
                   int $dest_width,
                   int $threshold): bool;
 
-/* imagepalettecopy() copies the palette from the source image to the destination image.
-*/
+/**
+ * imagepalettecopy() copies the palette from the source image
+ * to the destination image.
+ */
 <<__Native>>
 function imagepalettecopy(resource $dst,
-                            resource $src): mixed;
+                          resource $src): mixed;
+
+/**
+ * Sets the interpolation method, setting an interpolation method
+ * effects the rendering of various functions in GD,
+ * such as the imagerotate() function.
+ */
+<<__Native>>
+function imagesetinterpolation(resource $img,
+                               int $method = IMG_BILINEAR_FIXED): bool;

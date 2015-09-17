@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,6 +17,7 @@
 #ifndef incl_HPHP_JIT_TYPE_SOURCE_H_
 #define incl_HPHP_JIT_TYPE_SOURCE_H_
 
+#include "hphp/runtime/vm/jit/containers.h"
 #include "hphp/util/assertions.h"
 
 #include <string>
@@ -34,13 +35,12 @@ struct SSATmp;
  */
 struct TypeSource {
   enum class Kind : uint8_t {
-    None,
     Value,
     Guard,
   };
 
   static TypeSource makeValue(SSATmp* value) {
-    assert(value);
+    assertx(value);
     TypeSource src;
     src.value = value;
     src.kind = Kind::Value;
@@ -48,14 +48,13 @@ struct TypeSource {
   }
 
   static TypeSource makeGuard(const IRInstruction* guard) {
-    assert(guard);
+    assertx(guard);
     TypeSource src;
     src.guard = guard;
     src.kind = Kind::Guard;
     return src;
   }
 
-  bool isNone() const { return kind == Kind::None; }
   bool isGuard() const { return kind == Kind::Guard; }
   bool isValue() const { return kind == Kind::Value; }
 
@@ -65,6 +64,9 @@ struct TypeSource {
   bool operator!=(const TypeSource& rhs) const {
     return !operator==(rhs);
   }
+  bool operator<(const TypeSource& rhs) const;
+
+  std::string toString() const;
 
   // Members.
   union {
@@ -72,10 +74,13 @@ struct TypeSource {
     const IRInstruction* guard;
   };
 
-  Kind kind{Kind::None};
+  Kind kind;
 };
 
+typedef jit::flat_set<TypeSource> TypeSourceSet;
+
 std::string show(const TypeSource&);
+std::string show(const TypeSourceSet&);
 
 }}
 

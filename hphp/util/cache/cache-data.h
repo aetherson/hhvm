@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -69,6 +69,8 @@ class CacheData : private boost::noncopyable {
   // Make a decompressed copy of the data.  Only works if actually compressed.
   // Returns false if data is not compressed, or on any other error.
   bool getDecompressedData(std::string* data) const;
+
+  void dump() const;
 
  private:
   static const int kFlag_Compressed  = 0x00000001;

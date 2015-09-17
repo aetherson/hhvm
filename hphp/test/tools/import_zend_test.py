@@ -18,7 +18,7 @@ import urllib2
 
 # The version that we will be importing the tests from.
 # Must be a valid, released version from php download site
-zend_version = "5.5.15"
+zend_version = "5.6.1"
 
 # Don't even pull these into the repo.
 # We want running the bad tests to still complete.
@@ -68,7 +68,6 @@ no_import = (
     '/ext/pdo_odbc',
     '/ext/pdo_pgsql',
     '/ext/pspell',
-    '/ext/readline',
     '/ext/recode',
     '/ext/shmop',
     '/ext/skeleton',
@@ -100,6 +99,11 @@ flaky_tests = (
 
     # our build machines have no members in group 0...
     '/ext/posix/tests/posix_getgrgid.php',
+
+    # Checking stat of ' ' races with mkdir_variation1
+    '/ext/standard/tests/file/lstat_stat_variation22.php',
+    '/ext/standard/tests/file/copy_variation3.php',
+    '/ext/standard/tests/file/file_exists_variation1.php',
 
     # concurrency issues
     '/ext/mysql/tests/001.php',
@@ -177,6 +181,9 @@ flaky_tests = (
     '/ext/ftp/tests/ftp_nb_fget_basic1.php',
 
     # flaky: t3851970
+    '/ext/sockets/tests/socket_write_params.php',
+    '/ext/sockets/tests/socket_bind_params.php',
+    '/ext/sockets/tests/socket_getpeername.php',
     '/ext/session/tests/009.php',
     '/ext/standard/tests/file/bug39538.php',
     '/ext/standard/tests/file/bug53848.php',
@@ -203,6 +210,11 @@ flaky_tests = (
     # a new process can crop up
     '/ext/posix/tests/posix_kill_basic.php',
 
+    # Using PHP7 versions of these tests
+    '/ext/session/tests/session_set_save_handler_class_002.php',
+    '/ext/session/tests/session_set_save_handler_class_016.php',
+    '/ext/session/tests/session_set_save_handler_iface_001.php',
+
     # unsure why
     '/ext/standard/tests/file/symlink_link_linkinfo_is_link_variation4.php',
 
@@ -216,6 +228,109 @@ flaky_tests = (
     '/ext/standard/tests/network/fsockopen_variation2.php',
     '/ext/sockets/tests/socket_create_listen.php',
     '/ext/sockets/tests/socket_create_listen-win32.php',
+
+    # it references a whole directory with *
+    '/ext/standard/tests/file/copy_variation6.php',
+
+    # Tests for a bug in PHP
+    '/ext/gmp/tests/014.php',
+
+    # Another process can be created in the meantime
+    '/ext/posix/tests/posix_errno_variation2.php',
+
+    # duplicate of a test in test/slow
+    '/ext/gmp/tests/002.php',
+
+    # Something could be on sending on that UDP port
+    '/ext/standard/tests/network/bug20134.php',
+
+    # These pass with a proper proxy setup, which our build machines don't seem
+    # to have. i.e., the internet is attempted to be used and that is bad
+    '/ext/soap/tests/bugs/bug40609.php',
+    '/ext/soap/tests/schema/schema060.php',
+    '/ext/soap/tests/schema/schema084.php',
+    '/ext/soap/tests/schema/schema008.php',
+    '/ext/soap/tests/schema/schema070.php',
+    '/ext/soap/tests/schema/schema076.php',
+    '/ext/soap/tests/schema/schema034.php',
+    '/ext/soap/tests/schema/schema027.php',
+    '/ext/soap/tests/schema/schema037.php',
+    '/ext/soap/tests/schema/schema028.php',
+    '/ext/soap/tests/schema/schema080.php',
+    '/ext/soap/tests/schema/schema033.php',
+    '/ext/soap/tests/schema/schema031.php',
+    '/ext/soap/tests/schema/schema075.php',
+    '/ext/soap/tests/schema/schema015.php',
+    '/ext/soap/tests/schema/schema018.php',
+    '/ext/soap/tests/schema/schema069.php',
+    '/ext/soap/tests/schema/schema065.php',
+    '/ext/soap/tests/schema/schema019.php',
+    '/ext/soap/tests/schema/schema061.php',
+    '/ext/soap/tests/schema/schema074.php',
+    '/ext/soap/tests/schema/schema071.php',
+    '/ext/soap/tests/schema/schema077.php',
+    '/ext/soap/tests/schema/schema017.php',
+    '/ext/soap/tests/schema/schema005.php',
+    '/ext/soap/tests/schema/schema058.php',
+    '/ext/soap/tests/schema/schema003.php',
+    '/ext/soap/tests/schema/schema079.php',
+    '/ext/soap/tests/schema/schema032.php',
+    '/ext/soap/tests/schema/schema047.php',
+    '/ext/soap/tests/schema/schema004.php',
+    '/ext/soap/tests/schema/schema016.php',
+    '/ext/soap/tests/schema/schema045.php',
+    '/ext/soap/tests/schema/schema039.php',
+    '/ext/soap/tests/schema/schema026.php',
+    '/ext/soap/tests/schema/schema038.php',
+    '/ext/soap/tests/schema/schema001.php',
+    '/ext/soap/tests/schema/schema050.php',
+    '/ext/soap/tests/schema/schema041.php',
+    '/ext/soap/tests/schema/schema083.php',
+    '/ext/soap/tests/schema/schema011.php',
+    '/ext/soap/tests/schema/schema062.php',
+    '/ext/soap/tests/schema/schema029.php',
+    '/ext/soap/tests/schema/schema073.php',
+    '/ext/soap/tests/schema/schema025.php',
+    '/ext/soap/tests/schema/schema044.php',
+    '/ext/soap/tests/schema/schema023.php',
+    '/ext/soap/tests/schema/schema014.php',
+    '/ext/soap/tests/schema/schema052.php',
+    '/ext/soap/tests/schema/schema024.php',
+    '/ext/soap/tests/schema/schema072.php',
+    '/ext/soap/tests/schema/schema006.php',
+    '/ext/soap/tests/schema/schema082.php',
+    '/ext/soap/tests/schema/schema053.php',
+    '/ext/soap/tests/schema/schema085.php',
+    '/ext/soap/tests/schema/schema049.php',
+    '/ext/soap/tests/schema/schema063.php',
+    '/ext/soap/tests/schema/schema040.php',
+    '/ext/soap/tests/schema/schema043.php',
+    '/ext/soap/tests/schema/schema066.php',
+    '/ext/soap/tests/schema/schema048.php',
+    '/ext/soap/tests/schema/schema046.php',
+    '/ext/soap/tests/schema/schema007.php',
+    '/ext/soap/tests/schema/schema056.php',
+    '/ext/soap/tests/schema/schema067.php',
+    '/ext/soap/tests/schema/schema042.php',
+    '/ext/soap/tests/schema/schema059.php',
+    '/ext/soap/tests/schema/schema054.php',
+    '/ext/soap/tests/schema/schema036.php',
+    '/ext/soap/tests/schema/schema057.php',
+    '/ext/soap/tests/schema/schema002.php',
+    '/ext/soap/tests/schema/schema013.php',
+    '/ext/soap/tests/schema/schema051.php',
+    '/ext/soap/tests/schema/schema009.php',
+    '/ext/soap/tests/schema/schema078.php',
+    '/ext/soap/tests/schema/schema081.php',
+    '/ext/soap/tests/schema/schema030.php',
+    '/ext/soap/tests/schema/schema055.php',
+    '/ext/soap/tests/schema/schema021.php',
+    '/ext/soap/tests/schema/schema035.php',
+    '/ext/standard/tests/network/http-stream.php',
+
+    # Socket based test that are possibly port clowny
+    # Github commit: 6ae44fc92acb63e7fa31b5fd4fcd4cf939c3ef54
+    '/ext/sockets/tests/socket_getsockname.php',
 )
 
 # Tests that work but not in repo mode
@@ -242,6 +357,8 @@ norepo_tests = (
     '/Zend/tests/class_alias_013.php',
     '/Zend/tests/class_constants_003.php',
     '/Zend/tests/class_exists_001.php',
+    '/Zend/tests/closure_040.php',
+    '/Zend/tests/closure_042.php',
     '/Zend/tests/constants_005.php',
     '/Zend/tests/errmsg_007.php',
     '/Zend/tests/errmsg_026.php',
@@ -274,8 +391,16 @@ norepo_tests = (
     '/ext/pdo_sqlite/tests/bug46139.php',
     '/ext/pdo_sqlite/tests/bug52487.php',
     '/ext/phar/tests/012.php',
+    # missing undefined variable notice
+    '/ext/posix/tests/posix_kill_variation1.php',
+    '/ext/posix/tests/posix_kill_variation2.php',
+    '/ext/posix/tests/posix_strerror_variation1.php',
+    '/ext/posix/tests/posix_getgrgid_variation.php',
+    '/ext/posix/tests/posix_getpwuid_variation.php',
+    ####################################
     '/ext/reflection/tests/bug64936.php',
     '/ext/reflection/tests/bug29268.php',
+    '/ext/reflection/tests/traits005.php',
     '/ext/sqlite3/tests/bug47159.php',
     '/ext/sqlite3/tests/sqlite3_01_open.php',
     '/ext/sqlite3/tests/sqlite3_02_create.php',
@@ -315,6 +440,8 @@ norepo_tests = (
     '/ext/standard/tests/file/file_get_contents_file_put_contents_variation2.php',
     '/ext/standard/tests/file/file_get_contents_variation1.php',
     '/ext/standard/tests/file/readfile_variation6.php',
+    '/ext/standard/tests/file/unlink_variation8.php',
+    '/ext/standard/tests/file/unlink_variation10.php',
     '/ext/standard/tests/general_functions/is_callable_error.php',
     '/ext/standard/tests/general_functions/is_numeric.php',
     '/ext/standard/tests/math/abs.php',
@@ -421,11 +548,15 @@ norepo_tests = (
     '/tests/lang/static_variation_001.php',
     '/tests/lang/static_variation_002.php',
 
+    # This test passes "by accident".
+    'ext/dom/tests/DOMNode_hasChildNodes.php',
+
     # These tests use eval(), which is banned in repo mode.
     '/Zend/tests/bug31102.php',
     '/Zend/tests/bug33116.php',
     '/Zend/tests/bug36513.php',
     '/Zend/tests/bug43128.php',
+    '/Zend/tests/bug47714.php',
     '/Zend/tests/bug54624.php',
     '/Zend/tests/bug60444.php',
     '/Zend/tests/bug62907.php',
@@ -501,6 +632,9 @@ norepo_tests = (
     # This creates an interface with the same name as a builtin, which
     # hphpc doesn't correctly support AttrUnique flags on.
     '/Zend/tests/inter_06.php',
+
+    # Tests use banned reflection features
+    '/ext/reflection/tests/bug30146.php',
 )
 
 # Random other files that zend wants
@@ -529,12 +663,24 @@ other_files = (
     '/ext/date/tests/examine_diff.inc',
     '/ext/dba/tests/skipif.inc',
     '/ext/dom/tests/book.xml',
+    '/ext/dom/tests/book.xml.gz',
     '/ext/dom/tests/book.xsd',
     '/ext/dom/tests/book-attr.xml',
     '/ext/dom/tests/book-non-conforming-schema.xsd',
+    '/ext/dom/tests/book-not-a-schema.xsd',
+    '/ext/dom/tests/bug67081_0.xml',
+    '/ext/dom/tests/bug67081_1.xml',
+    '/ext/dom/tests/bug67081_2.xml',
     '/ext/dom/tests/dom_test.inc',
+    '/ext/dom/tests/dom.xml',
+    '/ext/dom/tests/dom.ent',
+    '/ext/dom/tests/empty.html',
+    '/ext/dom/tests/note.xml',
+    '/ext/dom/tests/not_well.html',
     '/ext/dom/tests/nsdoc.xml',
     '/ext/dom/tests/skipif.inc',
+    '/ext/dom/tests/test.html',
+    '/ext/dom/tests/xinclude.xml',
     '/ext/exif/tests/bug34704.jpg',
     '/ext/exif/tests/bug48378.jpeg',
     '/ext/exif/tests/bug60150.jpg',
@@ -647,6 +793,7 @@ other_files = (
     '/ext/openssl/tests/openssl.cnf',
     '/ext/openssl/tests/private.key',
     '/ext/openssl/tests/public.key',
+    '/ext/openssl/tests/ServerClientTestCase.inc',
     '/ext/pdo_firebird/tests/skipif.inc',
     '/ext/pdo_mysql/tests/common.phpt',
     '/ext/pdo_mysql/tests/config.inc',
@@ -681,6 +828,8 @@ other_files = (
     '/ext/soap/tests/bugs/bug38055.wsdl',
     '/ext/soap/tests/bugs/bug38067.wsdl',
     '/ext/soap/tests/bugs/bug38536.wsdl',
+    '/ext/soap/tests/bugs/bug40609.wsdl',
+    '/ext/soap/tests/bugs/bug40609.phpt',
     '/ext/soap/tests/bugs/bug41337.wsdl',
     '/ext/soap/tests/bugs/bug42326.wsdl',
     '/ext/soap/tests/bugs/bug42692.wsdl',
@@ -799,7 +948,10 @@ other_files = (
     '/ext/xsl/tests/xslt.xml',
     '/ext/xsl/tests/xslt.xsl',
     '/ext/xsl/tests/xslt.xsl.gz',
+    '/ext/zip/tests/utils.inc',
+    '/ext/zip/tests/test_with_comment.zip',
     '/ext/zlib/tests/004.txt.gz',
+    '/ext/zlib/tests/bug_52944_corrupted_data.inc',
     '/ext/zlib/tests/data.inc',
     '/ext/zlib/tests/gzopen_include_path.inc',
     '/ext/zlib/tests/reading_include_path.inc',
@@ -854,29 +1006,15 @@ other_files = (
     '/Zend/tests/ns_067.inc',
     '/Zend/tests/ns_069.inc',
     '/Zend/tests/unset.inc',
+    '/Zend/tests/use_const/includes/foo_bar.php',
+    '/Zend/tests/use_const/includes/foo_php_version.php',
+    '/Zend/tests/use_const/includes/global_bar.php',
+    '/Zend/tests/use_const/includes/global_baz.php',
+    '/Zend/tests/use_function/includes/foo_bar.php',
+    '/Zend/tests/use_function/includes/foo_strlen.php',
+    '/Zend/tests/use_function/includes/global_bar.php',
+    '/Zend/tests/use_function/includes/global_baz.php',
 )
-
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "-o",
-    "--only",
-    type=str,
-    action='append',
-    help="only import tests whose path contains this substring."
-)
-parser.add_argument(
-    "--dirty",
-    action='store_true',
-    help="leave around test/zend/all directory."
-)
-parser.add_argument(
-    "-v",
-    "--verbose",
-    action='store_true',
-    help="print out extra stuff."
-)
-args = parser.parse_args()
-
 
 def mkdir_p(path):
     try:
@@ -891,16 +1029,15 @@ def walk(filename, dest_subdir):
     full_dest_filename = os.path.join(dest_subdir, dest_filename)
 
     # Exactly mirror zend's directories incase some tests depend on random crap.
-    # We'll only move things we want into 'good'
-    shutil.copyfile(filename, full_dest_filename)
+    # We'll only move things we want into 'good'. The condition below is in case
+    # of using --local on a file already in the current workind directory.
+    if os.path.abspath(filename) != os.path.abspath(full_dest_filename):
+        shutil.copyfile(filename, full_dest_filename)
 
     full_dest_filename = full_dest_filename.replace('.phpt', '.php')
 
     if not '.phpt' in filename:
-        data = file(full_dest_filename).read()
-
-        if '/ext/ftp/tests/server.inc' in full_dest_filename:
-            data = data.replace('stream_socket_server', '@stream_socket_server')
+        data = open(full_dest_filename).read()
 
         if '/ext/mysqli/tests/table.inc' in full_dest_filename:
             data = data.replace(
@@ -922,15 +1059,21 @@ def walk(filename, dest_subdir):
                 'DROP TABLE IF EXISTS \'.$test_table_name'
             )
 
-        file(full_dest_filename, 'w').write(data)
+        if '/tests/security/open_basedir.inc' in full_dest_filename:
+            data = data.replace(
+                'getcwd()',
+                '__DIR__',
+            )
+
+        open(full_dest_filename, 'w').write(data)
 
         if full_dest_filename.endswith('.php'):
-            f = file(full_dest_filename.replace('.php', '.php.skipif'), 'w')
+            f = open(full_dest_filename.replace('.php', '.php.skipif'), 'w')
             f.write('always skip - not a test')
 
         return
 
-    print "Importing %s" % full_dest_filename
+    print("Importing %s" % full_dest_filename)
 
     def split(pattern, str):
         return re.split(r'\n\s*--'+pattern+'--\s*\n', str, 1)
@@ -947,18 +1090,18 @@ def walk(filename, dest_subdir):
                 sections[cur_header].append(line)
         return sections
 
-    sections = parse_headers(file(filename).read())
-    for i in sections.keys():
+    sections = parse_headers(open(filename).read())
+    for i in list(sections.keys()):
         sections[i] = '\n'.join(sections[i])
 
     unsupported_sections = ('POST_RAW')
     for name in unsupported_sections:
         if name in sections:
-            print "Unsupported test with section --%s--: " % name, filename
+            print("Unsupported test with section --%s--: " % name, filename)
             return
 
     if not 'FILE' in sections:
-        print "Malformed test, no --FILE--: ", filename
+        print("Malformed test, no --FILE--: ", filename)
         return
 
     for key in ('EXPECT', 'EXPECTF', 'EXPECTREGEX'):
@@ -981,8 +1124,8 @@ def walk(filename, dest_subdir):
 
             exp = re.sub(r'(?:Parse|Fatal)\\? error\\?:.*',
                     '\nFatal error: '+match_rest_of_line, exp)
-            exp = re.sub(r'Catchable\\? fatal\\? error\\?:.*',
-                    '\nFatal error: '+match_rest_of_line, exp)
+            exp = re.sub(r'(?:Catchable fatal)\\? error\\?:.*',
+                    '\nCatchable fatal error: '+match_rest_of_line, exp)
             exp = re.sub(r'Warning\\?:.*',
                     '\nWarning: '+match_rest_of_line, exp)
             exp = re.sub(r'Notice\\?:.*',
@@ -1001,28 +1144,26 @@ def walk(filename, dest_subdir):
             exp = exp.replace('100000', '1000')
 
         # we use %a for error messages so always write expectf
-        file(full_dest_filename+'.expectf', 'w').write(exp)
+        open(full_dest_filename + '.expectf', 'w').write(exp)
     elif 'EXPECTREGEX' in sections:
         exp = sections['EXPECTREGEX']
 
         if '/ext/standard/tests/strings/004.php' in full_dest_filename:
             exp = exp.replace(': 3', ': [3-4]')
 
-        file(full_dest_filename+'.expectregex', 'w').write(exp)
+        open(full_dest_filename + '.expectregex', 'w').write(exp)
     elif 'EXPECTF' in sections:
         exp = sections['EXPECTF']
 
-        if '/ext/standard/tests/file/tempnam_variation5.php' in full_dest_filename:
-            exp = exp.replace('tempnam_variation6', 'tempnam_variation5')
-        if '/ext/standard/tests/url/parse_url_variation_002_64bit.php' in full_dest_filename:
+        if ('/ext/standard/tests/url/parse_url_variation_002_64bit.php' in full_dest_filename or
+          '/ext/zlib/tests/gzfile_variation13.php' in full_dest_filename or
+          '/ext/zlib/tests/gzopen_variation3.php' in full_dest_filename or
+          '/ext/zlib/tests/readgzfile_variation13.php' in full_dest_filename):
             exp = exp.replace('to be long', 'to be integer')
-        if '/ext/curl/tests/curl_basic_008.php' in full_dest_filename or \
-           '/ext/curl/tests/curl_basic_010.php' in full_dest_filename:
-            exp = exp.replace('host:)', 'host:|Could not resolve:)')
 
-        file(full_dest_filename+'.expectf', 'w').write(exp)
+        open(full_dest_filename + '.expectf', 'w').write(exp)
     else:
-        print "Malformed test, no --EXPECT*--: ", filename
+        print("Malformed test, no --EXPECT*--: ", filename)
         return
 
     if 'INI' in sections:
@@ -1039,7 +1180,7 @@ def walk(filename, dest_subdir):
            '/ext/soap/tests/bugs/bug36999.php' in full_dest_filename:
             ini = ini + '\n' + 'hhvm.enable_zend_compat = true'
 
-        file(full_dest_filename + '.ini', 'w').write(ini)
+        open(full_dest_filename + '.ini', 'w').write(ini)
 
     if 'SKIPIF' in sections:
         skipif = sections['SKIPIF'].strip()
@@ -1048,8 +1189,13 @@ def walk(filename, dest_subdir):
 
         if '/ext/standard/tests/strings/fprintf_' in full_dest_filename:
             skipif = skipif.replace('dump.txt', dest_filename + '.txt')
+        # php-src#817
+        if ('/ext/zlib/tests/gzfile_variation4.php' in full_dest_filename or
+            '/ext/zlib/tests/readgzfile_variation4.php' in full_dest_filename):
+            skipif = skipif.replace("extension_loaded(zlib)",
+                                    "extension_loaded('zlib')")
 
-        file(full_dest_filename + '.skipif', 'w').write(skipif)
+        open(full_dest_filename + '.skipif', 'w').write(skipif)
 
     test = sections['FILE'] + "\n"
 
@@ -1090,19 +1236,20 @@ def walk(filename, dest_subdir):
             test += '?>\n'
         if not test.endswith('\n'):
             test += '\n'
-        test += sections['CLEAN']
+        if not sections['CLEAN'].startswith('<?'):
+            sections['CLEAN'] = '<?php\n' + sections['CLEAN']
+        disable_errors = "<?php error_reporting(0); ?>\n"
+        test += disable_errors + sections['CLEAN']
 
     # If you put an exception in here, please send a pull request upstream to
     # php-src. Then when it gets merged kill your hack.
     if '/tests/classes/bug63462.php' in full_dest_filename:
         exp = exp.replace("Notice:", "\nNotice:")
-        file(full_dest_filename + '.expectf', 'w').write(exp)
-    if '/ext/ldap/tests/ldap_control_paged_results_variation1.php' in full_dest_filename:
+        open(full_dest_filename + '.expectf', 'w').write(exp)
+    if ('/ext/ldap/tests/ldap_control_paged_results_variation1.php' in full_dest_filename) or \
+       ('extldap/tests/ldap_control_paged_results_variation2.php' in full_dest_filename):
         exp = exp.replace("resource(6)", "resource(%d)")
-        file(full_dest_filename + '.expectf', 'w').write(exp)
-    if '/ext/ldap/tests/ldap_control_paged_results_variation2.php' in full_dest_filename:
-        exp = exp.replace("resource(6)", "resource(%d)")
-        file(full_dest_filename + '.expectf', 'w').write(exp)
+        open(full_dest_filename + '.expectf', 'w').write(exp)
     if ('/ext/standard/tests/math/pow.php' in full_dest_filename) or \
        ('/ext/standard/tests/math/abs.php' in full_dest_filename):
         # HHVM handles int->double promotion differently than Zend
@@ -1125,6 +1272,11 @@ def walk(filename, dest_subdir):
         test = test.replace('"*"', '__DIR__."/../../../../../../sample_dir/*"')
         test = test.replace('opendir(".")', 'opendir(__DIR__."/../../../../../../sample_dir/")')
         test = test.replace('is_dir($file)', 'is_dir(__DIR__."/../../../../../../sample_dir/".$file)')
+    if '/ext/standard/tests/file/touch_variation1.php' in full_dest_filename:
+        test = test.replace('touch.dat', 'touch_variation1.dat')
+    if '/ext/standard/tests/file/bug45181.php' in full_dest_filename:
+        test = test.replace('chdir("bug45181_x");', '$origdir = getcwd();\nchdir("bug45181_x");')
+        test = test.replace('rmdir("bug45181_x");', 'rmdir($origdir . "/bug45181_x");')
     if '/ext/standard/tests/file/fgets_socket_variation1.php' in full_dest_filename:
         test = test.replace("<?php", "<?php\n$port = rand(50000, 65535);")
         test = test.replace("31337'", "'.$port")
@@ -1160,11 +1312,15 @@ def walk(filename, dest_subdir):
         test = test.replace(pseudomain,
                             'function main() {\n' + pseudomain + '}\nmain();\n')
     if '/Zend/tests/bug55007.php' in full_dest_filename:
+        # Fixed in php-src@0ec49bba (probably PHP7)
         test = test.replace('$a[]', '$a[];')
     if '/ext/phar/tests/' in full_dest_filename:
         test = test.replace('.clean', '')
     if '/ext/phar/tests/' in full_dest_filename:
         test = test.replace('.clean', '')
+    if ('/ext/readline/tests/readline_info_001.php' in full_dest_filename) or \
+       ('/ext/readline/tests/libedit_info_001.php' in full_dest_filename):
+        test = test.replace('readline_info(', '@readline_info(')
     if '/ext/standard/tests/file/file_get_contents_variation1.php' in full_dest_filename:
         test = test.replace('afile.txt', 'file_get_contents_variation1.txt')
     if '/ext/standard/tests/file/readfile_variation6.php' in full_dest_filename:
@@ -1191,21 +1347,26 @@ def walk(filename, dest_subdir):
     if '/Zend/tests/closure_016.php' in full_dest_filename:
         # undo closure% only for first two instances
         exp = exp.replace('Closure%s::', 'Closure::', 2)
-        file(full_dest_filename + '.expectf', 'w').write(exp)
+        open(full_dest_filename + '.expectf', 'w').write(exp)
     if '/ext/json/tests/unsupported_type_error.php' in full_dest_filename:
         exp = exp.replace('resource(5)', 'resource(%d)')
-        file(full_dest_filename + '.expectf', 'w').write(exp)
+        open(full_dest_filename + '.expectf', 'w').write(exp)
     if ('/ext/xmlreader/tests/007.php' in full_dest_filename or
        '/ext/xmlreader/tests/008.php' in full_dest_filename or
-       '/ext/xmlreader/tests/012.php' in full_dest_filename):
-        file(full_dest_filename + '.ini', 'w').write('hhvm.libxml.ext_entity_whitelist = "file"')
+       '/ext/xmlreader/tests/012.php' in full_dest_filename or
+       '/ext/dom/tests/bug37456.php' in full_dest_filename or
+       '/ext/dom/tests/bug67081.php' in full_dest_filename or
+       '/ext/xsl/tests/bug53965.php' in full_dest_filename):
+        open(full_dest_filename + '.ini', 'w').write(
+                'hhvm.libxml.ext_entity_whitelist = "file"')
     if '/ext/xsl/tests/xslt008.php' in full_dest_filename:
-        file(full_dest_filename + '.ini', 'w').write('hhvm.libxml.ext_entity_whitelist = "compress.zlib"')
+        open(full_dest_filename + '.ini', 'w').write(
+                'hhvm.libxml.ext_entity_whitelist = "compress.zlib"')
     if '/ext/standard/tests/file/realpath_basic' in full_dest_filename:
         root_dest_filenname = os.path.splitext(dest_filename)[0]
         test = test.replace('realpath_basic', root_dest_filenname)
         exp = exp.replace('realpath_basic', root_dest_filenname)
-        file(full_dest_filename + '.expectf', 'w').write(exp)
+        open(full_dest_filename + '.expectf', 'w').write(exp)
     if '/ext/standard/tests/network/bug20134.php' in full_dest_filename:
         test = test.replace("<?php", "<?php\n$port = rand(1025, 65535);")
         test = test.replace("65534", "$port")
@@ -1213,6 +1374,8 @@ def walk(filename, dest_subdir):
         test = test.replace('tmp_savehtmlfile', 'DOMDocument_saveHTMLFile_basic')
     if '/ext/dom/tests/DOMDocument_saveHTMLFile_formatOutput.php' in full_dest_filename:
         test = test.replace('tmp_savehtmlfile', 'DOMDocument_saveHTMLFile_formatOutput')
+    if '/ext/standard/tests/file/fscanf_variation53.php' in full_dest_filename:
+        test = test.replace('fscanf_variation52.tmp', 'fscanf_variation53.tmp')
     if '/ext/mysqli/tests/' in full_dest_filename:
 
         (testname, _) = os.path.splitext(os.path.basename(full_dest_filename))
@@ -1465,10 +1628,10 @@ def walk(filename, dest_subdir):
                        re.MULTILINE)
         test = r.sub('', test)
 
-        for t, t_replace_config in replace_configs.iteritems():
+        for t, t_replace_config in replace_configs.items():
             for i, replace_id in enumerate(t_replace_config.get(testname, [])):
                 new_id = 'test_%s_%s_%d' % (testname, t, i + 1)
-                if isinstance(replace_id, basestring):
+                if isinstance(replace_id, str):
                     test = test.replace(replace_id, new_id)
                 else:
                     test = replace_id.sub(new_id, test)
@@ -1477,13 +1640,56 @@ def walk(filename, dest_subdir):
         test = re.sub('(require(_once)*[ (][\'"](clean_)?table.inc[\'"]\)?)',
                       '$test_table_name = \'%s\'; \\1' % (new_id, ), test)
 
-    file(full_dest_filename, 'w').write(test)
+    open(full_dest_filename, 'w').write(test)
 
 def should_import(filename):
     for bad in no_import:
         if bad in filename:
             return False
     return True
+
+# -- main --
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "-o",
+    "--only",
+    type=str,
+    action='append',
+    help="only import tests whose path contains this substring."
+)
+parser.add_argument(
+    "--dirty",
+    action='store_true',
+    help="leave around test/zend/all directory."
+)
+parser.add_argument(
+    "-v",
+    "--verbose",
+    action='store_true',
+    help="print out extra stuff."
+)
+parser.add_argument(
+    "--local",
+    type=str,
+    help="Convert a single local .phpt into *.php and expect files in the CWD.")
+args = parser.parse_args()
+
+if args.local:
+    if args.only:
+        print("--only and --local are not compatible; choose one.")
+        sys.exit(1)
+    if not os.path.exists(args.local):
+        print("--local file not found")
+        sys.exit(1)
+    if not args.local.endswith('.phpt'):
+        print("Invalid --local file. Must be a .phpt file")
+        sys.exit(1)
+
+    print("Converting %s into php and expect files..." % (args.local, ))
+    walk(args.local, os.getcwd())
+
+    sys.exit(0)
 
 script_dir = os.path.dirname(__file__)
 zend_dir = os.path.normpath(os.path.join(script_dir, '../zend'))
@@ -1495,14 +1701,14 @@ zend_release_archive = os.path.join(zend_dir, zend_release_filename)
 zend_release_path = os.path.join(zend_dir, zend_release_name)
 
 if not os.path.isfile(zend_release_archive):
-    print 'Downloading ' + zend_release_name + '...'
+    print('Downloading ' + zend_release_name + '...')
     zend_release_url = "http://php.net/get/" + zend_release_filename + "/from/this/mirror"
     zend_release_request = urllib2.Request(zend_release_url)
     zend_release_response = urllib2.urlopen(zend_release_request)
-    file(zend_release_archive, 'wb').write(zend_release_response.read())
+    open(zend_release_archive, 'wb').write(zend_release_response.read())
 
 if not os.path.isdir(zend_release_path):
-    print 'Extracting ' + zend_release_name + '...'
+    print('Extracting ' + zend_release_name + '...')
     zend_release_tar = tarfile.open(zend_release_archive, 'r:gz')
     zend_release_tar.extractall(zend_dir)
 
@@ -1529,12 +1735,13 @@ for root, dirs, files in os.walk(zend_release_path):
 
 if not os.path.isdir(all_dir):
     if args.only:
-        print "No test/zend/all. Your --only arg didn't match any test that should be imported."
+        print("No test/zend/all. " +
+              "Your --only arg didn't match any test that should be imported.")
     else:
-        print "No test/zend/all. Maybe no tests were imported?"
+        print("No test/zend/all. Maybe no tests were imported?")
     sys.exit(0)
 else:
-    print "Running all tests from zend/all"
+    print("Running all tests from zend/all")
 
 stdout = subprocess.Popen(
     [
@@ -1555,9 +1762,9 @@ last_line = stdout.strip().split("\n")[-1]
 results = json.loads(last_line)['results']
 
 if args.verbose:
-    print results
+    print(results)
 else:
-    print "Test run done, moving files"
+    print("Test run done, moving files")
 
 for test in results:
     filename = test['name']
@@ -1602,12 +1809,12 @@ for test in results:
     source_file_exp = exps[0]
     _, dest_ext = os.path.splitext(source_file_exp)
     shutil.copyfile(filename, dest_file)
-    file(dest_file + dest_ext, 'w').write(
-        file(source_file_exp).read().replace('/all', '/' + subpath)
+    open(dest_file + dest_ext, 'w').write(
+        open(source_file_exp).read().replace('/all', '/' + subpath)
     )
 
     if needs_norepo:
-        file(dest_file + '.norepo', 'w')
+        open(dest_file + '.norepo', 'w')
     if os.path.exists(filename + '.skipif'):
         shutil.copyfile(filename + '.skipif', dest_file + '.skipif')
     if os.path.exists(filename + '.ini'):
@@ -1634,7 +1841,14 @@ for root, dirs, files in os.walk(all_dir):
                     dest = filename.replace('all', subdir, 1)
                     dir = os.path.dirname(dest)
                     mkdir_p(dir)
-                    shutil.copyfile(filename, dest)
+                    data = open(filename).read()
+
+                    if '/ext/ftp/tests/server.inc' in filename:
+                        data = data.replace('<10', '<100')
+                        data = data.replace('50000', '1025')
+                        data = data.replace('stream_socket_server', '@stream_socket_server')
+
+                    open(dest, 'w').write(data)
 
 if not args.dirty:
     shutil.rmtree(all_dir)

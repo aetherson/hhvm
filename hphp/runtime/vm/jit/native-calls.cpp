@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,26 +16,37 @@
 
 #include "hphp/runtime/vm/jit/native-calls.h"
 
-#include "hphp/util/abi-cxx.h"
-#include "hphp/runtime/vm/runtime.h"
-#include "hphp/runtime/vm/runtime-type-profiler.h"
+#include "hphp/runtime/base/comparisons.h"
+#include "hphp/runtime/base/rds.h"
 #include "hphp/runtime/base/stats.h"
 #include "hphp/runtime/base/tv-conversions.h"
-#include "hphp/runtime/base/rds.h"
-#include "hphp/runtime/vm/jit/translator-runtime.h"
-#include "hphp/runtime/vm/jit/ir.h"
-#include "hphp/runtime/vm/jit/arg-group.h"
-#include "hphp/runtime/ext/asio/asio_blockable.h"
-#include "hphp/runtime/ext/asio/async_function_wait_handle.h"
-#include "hphp/runtime/ext/asio/static_wait_handle.h"
-#include "hphp/runtime/ext/ext_array.h"
+#include "hphp/runtime/vm/runtime.h"
 
-namespace HPHP { namespace jit { namespace NativeCalls {
+#include "hphp/runtime/vm/jit/arg-group.h"
+#include "hphp/runtime/vm/jit/ir-opcode.h"
+#include "hphp/runtime/vm/jit/irlower.h"
+#include "hphp/runtime/vm/jit/translator-runtime.h"
+
+#include "hphp/runtime/ext/array/ext_array.h"
+#include "hphp/runtime/ext/asio/asio-blockable.h"
+#include "hphp/runtime/ext/asio/ext_async-function-wait-handle.h"
+#include "hphp/runtime/ext/asio/ext_static-wait-handle.h"
+#include "hphp/runtime/ext/collections/ext_collections-idl.h"
+
+#include "hphp/util/abi-cxx.h"
+
+namespace HPHP { namespace jit {
+
+///////////////////////////////////////////////////////////////////////////////
+
+namespace NativeCalls {
+
+///////////////////////////////////////////////////////////////////////////////
 
 namespace {
 
-constexpr SyncOptions SNone = SyncOptions::kNoSyncPoint;
-constexpr SyncOptions SSync = SyncOptions::kSyncPoint;
+constexpr irlower::SyncOptions SNone = irlower::SyncOptions::kNoSyncPoint;
+constexpr irlower::SyncOptions SSync = irlower::SyncOptions::kSyncPoint;
 
 constexpr DestType DSSA  = DestType::SSA;
 constexpr DestType DTV   = DestType::TV;
@@ -52,14 +63,22 @@ Arg extra(MemberType EDType::*ptr) {
 
 Arg immed(intptr_t imm) { return Arg(ArgType::Imm, imm); }
 
-FuncPtr fssa(uint64_t i) { return FuncPtr { FuncType::SSA, i }; }
-
 auto constexpr SSA      = ArgType::SSA;
 auto constexpr TV       = ArgType::TV;
-auto constexpr MemberKeyS  = ArgType::MemberKeyS;
-auto constexpr MemberKeyIS = ArgType::MemberKeyIS;
 
 using IFaceSupportFn = bool (*)(const StringData*);
+
+using StrCmpFn = bool (*)(const StringData*, const StringData*);
+using ObjCmpFn = bool (*)(const ObjectData*, const ObjectData*);
+using ArrCmpFn = bool (*)(const ArrayData*, const ArrayData*);
+using ResCmpFn = bool (*)(const ResourceHdr*, const ResourceHdr*);
+using StrIntCmpFn = bool (*)(const StringData*, int64_t);
+
+using StrCmpFnInt = int64_t (*)(const StringData*, const StringData*);
+using ObjCmpFnInt = int64_t (*)(const ObjectData*, const ObjectData*);
+using ArrCmpFnInt = int64_t (*)(const ArrayData*, const ArrayData*);
+using ResCmpFnInt = int64_t (*)(const ResourceHdr*, const ResourceHdr*);
+using StrIntCmpFnInt = int64_t (*)(const StringData*, int64_t);
 
 }
 
@@ -77,7 +96,6 @@ using IFaceSupportFn = bool (*)(const StringData*);
  *     <function pointer>          - Raw function pointer
  *     <pointer to member>         - Dispatch to a C++ member function---the
  *                                   function must be non-virtual.
- *     fssa(idx)                   - Use a const TCA from inst->src(idx)
  *
  * Dest
  *   DSSA  - The helper returns a single-register value
@@ -94,16 +112,11 @@ using IFaceSupportFn = bool (*)(const StringData*);
  *     {SSA, idx}               - Pass the value in inst->src(idx)
  *     {TV, idx}                - Pass the value in inst->src(idx) as a
  *                                TypedValue, in two registers
- *     {MemberKeyS, idx}           - Like TV, but Str values are passed as a raw
- *                                StringData*, in a single register
- *     {MemberKeyIS, idx}          - Like MemberKeyS, including Int
  *     extra(&EDStruct::member) - extract an immediate from extra data
  *     immed(int64_t)           - constant immediate
  */
 static CallMap s_callMap {
     /* Opcode, Func, Dest, SyncPoint, Args */
-    {TypeProfileFunc,    profileOneArgument, DNone, SNone,
-                           {{TV,0}, extra(&TypeProfileData::param), {SSA, 1}}},
     {ConvBoolToArr,      convCellToArrHelper, DSSA, SNone,
                            {{TV, 0}}},
     {ConvDblToArr,       convCellToArrHelper, DSSA, SNone,
@@ -124,19 +137,23 @@ static CallMap s_callMap {
 
     {ConvArrToDbl,       convArrToDblHelper, DSSA, SNone,
                            {{SSA, 0}}},
-    {ConvObjToDbl,       convCellToDblHelper, DSSA, SSync,
-                           {{TV, 0}}},
+    {ConvObjToDbl,       convObjToDblHelper, DSSA, SSync,
+                           {{SSA, 0}}},
     {ConvStrToDbl,       convStrToDblHelper, DSSA, SSync,
                            {{SSA, 0}}},
-    {ConvCellToDbl,       convCellToDblHelper, DSSA, SSync,
+    {ConvResToDbl,       convResToDblHelper, DSSA, SNone,
+                           {{SSA, 0}}},
+    {ConvCellToDbl,      convCellToDblHelper, DSSA, SSync,
                            {{TV, 0}}},
 
     {ConvArrToInt,       convArrToIntHelper, DSSA, SNone,
                            {{SSA, 0}}},
-    {ConvObjToInt,       cellToInt, DSSA, SSync,
-                           {{TV, 0}}},
+    {ConvObjToInt,       &ObjectData::toInt64, DSSA, SSync,
+                           {{SSA, 0}}},
     {ConvStrToInt,       &StringData::toInt64, DSSA, SNone,
                            {{SSA, 0}, immed(10)}},
+    {ConvResToInt,       &ResourceHdr::getId, DSSA, SNone,
+                           {{SSA, 0}}},
     {ConvCellToInt,      cellToInt, DSSA, SSync,
                            {{TV, 0}}},
 
@@ -153,6 +170,23 @@ static CallMap s_callMap {
                            {{SSA, 0}}},
     {ConvCellToStr,      convCellToStrHelper, DSSA, SSync,
                            {{TV, 0}}},
+
+    {CoerceStrToInt,     coerceStrToIntHelper, DSSA, SSync,
+                           {{SSA, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
+    {CoerceStrToDbl,     coerceStrToDblHelper, DSSA, SSync,
+                           {{SSA, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
+
+    {CoerceCellToInt,    coerceCellToIntHelper, DSSA, SSync,
+                           {{TV, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
+    {CoerceCellToDbl,    coerceCellToDblHelper, DSSA, SSync,
+                           {{TV, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
+    {CoerceCellToBool,   coerceCellToBoolHelper, DSSA, SSync,
+                           {{TV, 0}, extra(&FuncArgData::argNum),
+                            extra(&FuncArgData::func)}},
 
     {ConcatStrStr,       concat_ss, DSSA, SSync, {{SSA, 0}, {SSA, 1}}},
     {ConcatStrInt,       concat_si, DSSA, SSync, {{SSA, 0}, {SSA, 1}}},
@@ -173,22 +207,16 @@ static CallMap s_callMap {
     {Clone,              &ObjectData::clone, DSSA, SSync, {{SSA, 0}}},
     {NewArray,           MixedArray::MakeReserve, DSSA, SNone, {{SSA, 0}}},
     {NewMixedArray,      MixedArray::MakeReserveMixed, DSSA, SNone, {{SSA, 0}}},
-    {NewVArray,         MixedArray::MakeReserveVArray, DSSA, SNone, {{SSA, 0}}},
-    {NewMIArray,        MixedArray::MakeReserveIntMap, DSSA, SNone, {{SSA, 0}}},
-    {NewMSArray,        MixedArray::MakeReserveStrMap, DSSA, SNone, {{SSA, 0}}},
     {NewLikeArray,       MixedArray::MakeReserveLike, DSSA, SNone,
                            {{SSA, 0}, {SSA, 1}}},
-    {NewPackedArray,     MixedArray::MakePacked, DSSA, SNone,
-                           {{SSA, 0}, {SSA, 1}}},
-    {NewCol,             newColHelper, DSSA, SSync, {{SSA, 0}, {SSA, 1}}},
+    {AllocPackedArray,   MixedArray::MakePackedUninitialized, DSSA, SNone,
+                           {{extra(&PackedArrayData::size)}}},
     {ColAddNewElemC,     colAddNewElemCHelper, DSSA, SSync,
                            {{SSA, 0}, {TV, 1}}},
-    {ColAddElemC,        colAddElemCHelper, DSSA, SSync,
+    {MapAddElemC,        colAddElemCHelper, DSSA, SSync,
                            {{SSA, 0}, {TV, 1}, {TV, 2}}},
     {AllocObj,           newInstance, DSSA, SSync,
                            {{SSA, 0}}},
-    {CustomInstanceInit, &ObjectData::callCustomInstanceInit,
-                           DSSA, SSync, {{SSA, 0}}},
     {InitProps,          &Class::initProps, DNone, SSync,
                            {{extra(&ClassData::cls)}}},
     {InitSProps,         &Class::initSProps, DNone, SSync,
@@ -197,17 +225,9 @@ static CallMap s_callMap {
     {LdClsCtor,          loadClassCtor, DSSA, SSync,
                            {{SSA, 0}}},
     {LookupClsRDSHandle, lookupClsRDSHandle, DSSA, SNone, {{SSA, 0}}},
-    {LookupClsMethod,    lookupClsMethodHelper, DNone, SSync,
-                           {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}}},
-    {LdArrFuncCtx,       loadArrayFunctionContext, DNone, SSync,
-                           {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
-    {LdArrFPushCuf,      fpushCufHelperArray, DNone, SSync,
-                           {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
-    {LdStrFPushCuf,      fpushCufHelperString, DNone, SSync,
-                           {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
-    {PrintStr,           print_string, DNone, SNone, {{SSA, 0}}},
-    {PrintInt,           print_int, DNone, SNone, {{SSA, 0}}},
-    {PrintBool,          print_boolean, DNone, SNone, {{SSA, 0}}},
+    {PrintStr,           print_string, DNone, SSync, {{SSA, 0}}},
+    {PrintInt,           print_int, DNone, SSync, {{SSA, 0}}},
+    {PrintBool,          print_boolean, DNone, SSync, {{SSA, 0}}},
     {VerifyParamCls,     VerifyParamTypeSlow, DNone, SSync,
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}}},
     {VerifyParamCallable, VerifyParamTypeCallable, DNone, SSync,
@@ -218,24 +238,107 @@ static CallMap s_callMap {
     {VerifyRetCallable,  VerifyRetTypeCallable, DNone, SSync, {{TV, 0}}},
     {VerifyRetFail,      VerifyRetTypeFail, DNone, SSync, {{TV, 0}}},
     {RaiseUninitLoc,     raiseUndefVariable, DNone, SSync, {{SSA, 0}}},
+    {RaiseError,         raise_error_sd, DNone, SSync, {{SSA, 0}}},
     {RaiseWarning,       raiseWarning, DNone, SSync, {{SSA, 0}}},
     {RaiseNotice,        raiseNotice, DNone, SSync, {{SSA, 0}}},
     {RaiseArrayIndexNotice,
                          raiseArrayIndexNotice, DNone, SSync, {{SSA, 0}}},
-    {WarnNonObjProp,     raisePropertyOnNonObject, DNone, SSync, {}},
-    {ThrowNonObjProp,    throw_null_object_prop, DNone, SSync, {}},
+    {RaiseArrayKeyNotice,
+                         raiseArrayKeyNotice, DNone, SSync, {{SSA, 0}}},
     {RaiseUndefProp,     raiseUndefProp, DNone, SSync,
                            {{SSA, 0}, {SSA, 1}}},
-    {RaiseError,         raise_error_sd, DNone, SSync, {{SSA, 0}}},
+    {RaiseMissingArg,    raiseMissingArgument, DNone, SSync,
+                           {extra(&FuncArgData::func),
+                            extra(&FuncArgData::argNum)}},
     {IncStatGrouped,     Stats::incStatGrouped, DNone, SNone,
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
     {ClosureStaticLocInit,
                          closureStaticLocInit, DSSA, SNone,
                            {{SSA, 0}, {SSA, 1}, {TV, 2}}},
-    {ArrayIdx,           fssa(0), DTV, SSync,
-                           {{SSA, 1}, {SSA, 2}, {TV, 3}}},
     {GenericIdx,         genericIdx, DTV, SSync,
                           {{TV, 0}, {TV, 1}, {TV, 2}}},
+    {MapIdx,             mapIdx, DTV, SSync,
+                          {{SSA, 0}, {SSA, 1}, {TV, 2}}},
+    {ThrowInvalidOperation, throw_invalid_operation_exception,
+                          DNone, SSync, {{SSA, 0}}},
+    {HasToString,        &ObjectData::hasToString, DSSA, SSync,
+                          {{SSA, 0}}},
+
+    /* Type specialized comparison operators */
+    {GtStr,              static_cast<StrCmpFn>(more), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GteStr,             static_cast<StrCmpFn>(moreEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LtStr,              static_cast<StrCmpFn>(less), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LteStr,             static_cast<StrCmpFn>(lessEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {EqStr,              static_cast<StrCmpFn>(equal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NeqStr,             static_cast<StrCmpFn>(nequal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {SameStr,            static_cast<StrCmpFn>(same), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NSameStr,           static_cast<StrCmpFn>(nsame), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {CmpStr,             static_cast<StrCmpFnInt>(compare), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GtStrInt,           static_cast<StrIntCmpFn>(more), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GteStrInt,          static_cast<StrIntCmpFn>(moreEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LtStrInt,           static_cast<StrIntCmpFn>(less), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LteStrInt,          static_cast<StrIntCmpFn>(lessEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {EqStrInt,           static_cast<StrIntCmpFn>(equal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NeqStrInt,          static_cast<StrIntCmpFn>(nequal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {CmpStrInt,          static_cast<StrIntCmpFnInt>(compare), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GtObj,              static_cast<ObjCmpFn>(more), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GteObj,             static_cast<ObjCmpFn>(moreEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LtObj,              static_cast<ObjCmpFn>(less), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LteObj,             static_cast<ObjCmpFn>(lessEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {EqObj,              static_cast<ObjCmpFn>(equal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NeqObj,             static_cast<ObjCmpFn>(nequal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {CmpObj,             static_cast<ObjCmpFnInt>(compare), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GtArr,              static_cast<ArrCmpFn>(more), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GteArr,             static_cast<ArrCmpFn>(moreEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LtArr,              static_cast<ArrCmpFn>(less), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LteArr,             static_cast<ArrCmpFn>(lessEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {EqArr,              static_cast<ArrCmpFn>(equal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NeqArr,             static_cast<ArrCmpFn>(nequal), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {SameArr,            static_cast<ArrCmpFn>(same), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {NSameArr,           static_cast<ArrCmpFn>(nsame), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {CmpArr,             static_cast<ArrCmpFnInt>(compare), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GtRes,              static_cast<ResCmpFn>(more), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {GteRes,             static_cast<ResCmpFn>(moreEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LtRes,              static_cast<ResCmpFn>(less), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {LteRes,             static_cast<ResCmpFn>(lessEqual), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
+    {CmpRes,             static_cast<ResCmpFnInt>(compare), DSSA, SSync,
+                          {{SSA, 0}, {SSA, 1}}},
 
     /* Static prop helpers */
     {LdClsPropAddrOrNull,
@@ -258,13 +361,15 @@ static CallMap s_callMap {
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
 
     /* Generator support helpers */
-    {CreateCont,         &c_Generator::Create<false>, DSSA, SNone,
+    {CreateCont,         &Generator::Create<false>, DSSA, SNone,
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}}},
 
     /* Async function support helpers */
-    {CreateAFWH,         &c_AsyncFunctionWaitHandle::Create, DSSA, SSync,
+    {CreateAFWH,         &c_AsyncFunctionWaitHandle::Create<true>, DSSA, SNone,
                            {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}, {SSA, 4}}},
-    {CreateSSWH,         &c_StaticWaitHandle::CreateSucceededVM, DSSA, SNone,
+    {CreateAFWHNoVV,     &c_AsyncFunctionWaitHandle::Create<false>, DSSA, SNone,
+                           {{SSA, 0}, {SSA, 1}, {SSA, 2}, {SSA, 3}, {SSA, 4}}},
+    {CreateSSWH,         &c_StaticWaitHandle::CreateSucceeded, DSSA, SNone,
                            {{TV, 0}}},
     {AFWHPrepareChild,   &c_AsyncFunctionWaitHandle::PrepareChild, DSSA, SSync,
                            {{SSA, 0}, {SSA, 1}}},
@@ -272,79 +377,28 @@ static CallMap s_callMap {
                            {{SSA, 0}}},
 
     /* MInstrTranslator helpers */
-    {BaseG,    fssa(0), DSSA, SSync, {{TV, 1}}},
-    {PropX,    fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}, {SSA, 4}}},
-    {PropDX,   fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}, {SSA, 4}}},
-    {CGetProp, fssa(0), DTV, SSync,
-                 {{SSA, 1}, {SSA, 2}, {MemberKeyS, 3}, {SSA, 4}}},
-    {VGetProp, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}, {MemberKeyS, 3}, {SSA, 4}}},
-    {BindProp, fssa(0), DNone, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}, {SSA, 4}, {SSA, 5}}},
-    {SetProp,  fssa(0), DNone, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}, {TV, 4}}},
-    {UnsetProp, fssa(0), DNone, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}}},
-    {SetOpProp, fssa(0), DTV, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}, {TV, 4}, {SSA, 5}, {SSA, 6}}},
-    {IncDecProp, fssa(0), DTV, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}, {SSA, 4}, {SSA, 5}}},
-    {EmptyProp, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}}},
-    {IssetProp, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}}},
-    {ElemX,    fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {SSA, 3}}},
-    {ElemArray, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}}},
-    {ElemDX,   fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {SSA, 3}}},
-    {ElemUX,   fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {SSA, 3}}},
-    {ArrayGet, fssa(0), DTV, SSync,
-                 {{SSA, 1}, {SSA, 2}}},
-    {StringGet, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}}},
-    {MapGet,   fssa(0), DTV, SSync,
-                 {{SSA, 1}, {SSA, 2}}},
-    {CGetElem, fssa(0), DTV, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {SSA, 3}}},
-    {VGetElem, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {SSA, 3}}},
-    {BindElem, fssa(0), DNone, SSync,
-                 {{SSA, 1}, {TV, 2}, {SSA, 3}, {SSA, 4}}},
-    {SetWithRefElem, fssa(0), DNone, SSync,
-                 {{SSA, 1}, {TV, 2}, {SSA, 3}, {SSA, 4}}},
-    {ArraySet, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}}},
-    {MapSet,   fssa(0), DNone, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}}},
-    {ArraySetRef, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {SSA, 2}, {TV, 3}, {SSA, 4}}},
-    {SetElem,  fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {TV, 3}}},
-    {UnsetElem, fssa(0), DNone, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}}},
     {SetOpElem, setOpElem, DTV, SSync,
-                 {{SSA, 0}, {TV, 1}, {TV, 2}, {SSA, 3}, {SSA, 4}}},
+                 {{SSA, 0}, {TV, 1}, {TV, 2}, {SSA, 3},
+                  extra(&SetOpData::op)}},
     {IncDecElem, incDecElem, DTV, SSync,
-                 {{SSA, 0}, {TV, 1}, {SSA, 2}, {SSA, 3}}},
+                 {{SSA, 0}, {TV, 1}, {SSA, 2},
+                  extra(&IncDecData::op)}},
     {SetNewElem, setNewElem, DNone, SSync, {{SSA, 0}, {TV, 1}}},
     {SetNewElemArray, setNewElemArray, DNone, SSync, {{SSA, 0}, {TV, 1}}},
-    {SetWithRefNewElem, fssa(0), DNone, SSync,
-                 {{SSA, 1}, {SSA, 2}, {SSA, 3}}},
     {BindNewElem, bindNewElemIR, DNone, SSync,
                  {{SSA, 0}, {SSA, 1}, {SSA, 2}}},
-    {ArrayIsset, fssa(0), DSSA, SSync, {{SSA, 1}, {SSA, 2}}},
-    {VectorIsset, fssa(0), DSSA, SSync, {{SSA, 1}, {SSA, 2}}},
-    {PairIsset, fssa(0), DSSA, SSync, {{SSA, 1}, {SSA, 2}}},
-    {MapIsset,  fssa(0), DSSA, SSync, {{SSA, 1}, {SSA, 2}}},
-    {IssetElem, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {SSA, 3}}},
-    {EmptyElem, fssa(0), DSSA, SSync,
-                 {{SSA, 1}, {MemberKeyIS, 2}, {SSA, 3}}},
+    {StringGet, MInstrHelpers::stringGetI, DSSA, SSync, {{SSA, 0}, {SSA, 1}}},
+
+    {PairIsset, MInstrHelpers::pairIsset, DSSA, SSync, {{SSA, 0}, {SSA, 1}}},
+    {VectorIsset, MInstrHelpers::vectorIsset, DSSA, SSync,
+                  {{SSA, 0}, {SSA, 1}}},
+    {BindElem, MInstrHelpers::bindElemC, DNone, SSync,
+                 {{SSA, 0}, {TV, 1}, {SSA, 2}, {SSA, 3}}},
+    {SetWithRefElem, MInstrHelpers::setWithRefElemC, DNone, SSync,
+                 {{SSA, 0}, {TV, 1}, {TV, 2}, {SSA, 3}}},
+    {SetWithRefNewElem, MInstrHelpers::setWithRefNewElem, DNone, SSync,
+                 {{SSA, 0}, {TV, 1}, {SSA, 2}}},
+    {ThrowOutOfBounds, throwOOB, DNone, SSync, {{SSA, 0}}},
 
     /* instanceof checks */
     {InstanceOf, &Class::classof, DSSA, SNone, {{SSA, 0}, {SSA, 1}}},
@@ -365,10 +419,11 @@ static CallMap s_callMap {
     {DbgAssertPtr, assertTv, DNone, SNone, {{SSA, 0}}},
 
     /* surprise flag support */
-    {SurpriseHook,        &EventHook::CheckSurprise, DNone, SSync, {}},
-    {FunctionSuspendHook, &EventHook::onFunctionSuspend, DNone, SSync,
+    {SuspendHookE, &EventHook::onFunctionSuspendE, DNone, SSync,
                             {{SSA, 0}, {SSA, 1}}},
-    {FunctionReturnHook,  &EventHook::onFunctionReturnJit, DNone, SSync,
+    {SuspendHookR, &EventHook::onFunctionSuspendR, DNone, SSync,
+                            {{SSA, 0}, {SSA, 1}}},
+    {ReturnHook,  &EventHook::onFunctionReturn, DNone, SSync,
                             {{SSA, 0}, {TV, 1}}},
 
     /* silence operator support */
@@ -378,23 +433,12 @@ static CallMap s_callMap {
     // count($mixed)
     {Count, &countHelper, DSSA, SSync, {{TV, 0}}},
 
-    // count($array)
-    {CountArray, &ArrayData::size, DSSA, SNone, {{SSA, 0}}},
+    {GetMemoKey, getMemoKeyHelper, DTV, SSync, {{TV, 0}}},
 };
 
 CallMap::CallMap(CallInfoList infos) {
   for (auto const& info : infos) {
     m_map[info.op] = info;
-
-    // Check for opcodes that have a version which modifies the stack,
-    // and add an entry to the table for that one.
-    if (opcodeHasFlags(info.op, HasStackVersion)) {
-      Opcode stkOp = getStackModifyingOpcode(info.op);
-      assert(opcodeHasFlags(stkOp, ModifiesStack));
-      auto& slot = m_map[stkOp];
-      slot = info;
-      slot.op = stkOp;
-    }
   }
 }
 
@@ -404,71 +448,40 @@ bool CallMap::hasInfo(Opcode op) {
 
 const CallInfo& CallMap::info(Opcode op) {
   auto it = s_callMap.m_map.find(op);
-  assert(it != s_callMap.m_map.end());
+  assertx(it != s_callMap.m_map.end());
   return it->second;
 }
 
+///////////////////////////////////////////////////////////////////////////////
+
 } // NativeCalls
 
-namespace X64 {
-using namespace NativeCalls;
-ArgGroup toArgGroup(const CallInfo& info, const RegAllocInfo& regs,
-                    const IRInstruction* inst) {
-  ArgGroup argGroup{inst, regs[inst]};
-  for (auto const& arg : info.args) {
-    switch (arg.type) {
-    case ArgType::SSA:
-      argGroup.ssa(arg.ival);
-      break;
-    case ArgType::TV:
-      argGroup.typedValue(arg.ival);
-      break;
-    case ArgType::MemberKeyS:
-      argGroup.memberKeyS(arg.ival);
-      break;
-    case ArgType::MemberKeyIS:
-      argGroup.memberKeyIS(arg.ival);
-      break;
-    case ArgType::ExtraImm:
-      argGroup.imm(arg.extraFunc(inst));
-      break;
-    case ArgType::Imm:
-      argGroup.imm(arg.ival);
-      break;
-    }
-  }
-  return argGroup;
-}
-} // X64
-namespace ARM {
-using namespace NativeCalls;
-ArgGroup toArgGroup(const CallInfo& info, const RegAllocInfo& regs,
-                    const IRInstruction* inst) {
-  ArgGroup argGroup{inst, regs[inst]};
-  for (auto const& arg : info.args) {
-    switch (arg.type) {
-    case ArgType::SSA:
-      argGroup.ssa(arg.ival);
-      break;
-    case ArgType::TV:
-      argGroup.typedValue(arg.ival);
-      break;
-    case ArgType::MemberKeyS:
-      argGroup.memberKeyS(arg.ival);
-      break;
-    case ArgType::MemberKeyIS:
-      argGroup.memberKeyIS(arg.ival);
-      break;
-    case ArgType::ExtraImm:
-      argGroup.imm(arg.extraFunc(inst));
-      break;
-    case ArgType::Imm:
-      argGroup.imm(arg.ival);
-      break;
-    }
-  }
-  return argGroup;
-}
-} // ARM
+///////////////////////////////////////////////////////////////////////////////
 
-} }
+using namespace NativeCalls;
+ArgGroup toArgGroup(const CallInfo& info,
+                    const StateVector<SSATmp,Vloc>& locs,
+                    const IRInstruction* inst) {
+  ArgGroup argGroup{inst, locs};
+  for (auto const& arg : info.args) {
+    switch (arg.type) {
+    case ArgType::SSA:
+      argGroup.ssa(arg.ival);
+      break;
+    case ArgType::TV:
+      argGroup.typedValue(arg.ival);
+      break;
+    case ArgType::ExtraImm:
+      argGroup.imm(arg.extraFunc(inst));
+      break;
+    case ArgType::Imm:
+      argGroup.imm(arg.ival);
+      break;
+    }
+  }
+  return argGroup;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+}}

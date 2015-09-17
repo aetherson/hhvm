@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -40,7 +40,7 @@ SwitchStatement::SwitchStatement
     m_exp(exp), m_cases(cases) {
   if (m_cases && m_exp->is(Expression::KindOfSimpleVariable)) {
     for (int i = m_cases->getCount(); i--; ) {
-      CaseStatementPtr c(dynamic_pointer_cast<CaseStatement>((*m_cases)[i]));
+      auto c = dynamic_pointer_cast<CaseStatement>((*m_cases)[i]);
       if (c->getCondition() && c->getCondition()->hasEffect()) {
         m_exp->setContext(Expression::LValue);
         m_exp->setContext(Expression::NoLValueWrapper);
@@ -73,17 +73,15 @@ void SwitchStatement::analyzeProgram(AnalysisResultPtr ar) {
 
   if (ar->getPhase() == AnalysisResult::AnalyzeAll &&
       m_exp->is(Expression::KindOfSimpleVariable)) {
-    SimpleVariablePtr exp = dynamic_pointer_cast<SimpleVariable>(m_exp);
+    auto exp = dynamic_pointer_cast<SimpleVariable>(m_exp);
     if (exp && exp->getSymbol() && exp->getSymbol()->isClassName()) {
       // Mark some classes as volatile since the name is used in switch
       for (int i = 0; i < m_cases->getCount(); i++) {
-        CaseStatementPtr stmt =
-          dynamic_pointer_cast<CaseStatement>((*m_cases)[i]);
+        auto stmt = dynamic_pointer_cast<CaseStatement>((*m_cases)[i]);
         assert(stmt);
         ExpressionPtr caseCond = stmt->getCondition();
         if (caseCond && caseCond->isScalar()) {
-          ScalarExpressionPtr name =
-            dynamic_pointer_cast<ScalarExpression>(caseCond);
+          auto name = dynamic_pointer_cast<ScalarExpression>(caseCond);
           if (name && name->isLiteralString()) {
             string className = name->getLiteralString();
             ClassScopePtr cls = ar->findClass(toLower(className));
@@ -139,53 +137,6 @@ void SwitchStatement::setNthKid(int n, ConstructPtr cp) {
   }
 }
 
-void SwitchStatement::inferTypes(AnalysisResultPtr ar) {
-  // we optimize the most two common cases of switch statements
-  bool allInteger = true;
-  bool allString = true;
-  if (m_cases && m_cases->getCount()) {
-    for (int i = 0; i < m_cases->getCount(); i++) {
-      CaseStatementPtr stmt =
-        dynamic_pointer_cast<CaseStatement>((*m_cases)[i]);
-      if (!stmt->getCondition()) {
-        if (m_cases->getCount() == 1) allInteger = allString = false;
-      } else {
-        if (!stmt->isLiteralInteger()) allInteger = false;
-        if (!stmt->isLiteralString()) allString = false;
-      }
-    }
-  }
-  if (allInteger && allString) {
-    allInteger = allString = false;
-  }
-
-  TypePtr ret = m_exp->inferAndCheck(ar, Type::Some, false);
-  // these are the cases where toInt64(x) is OK for the switch statement
-  if (allInteger && (ret->is(Type::KindOfInt32) || ret->is(Type::KindOfInt64))) {
-    m_exp->setExpectedType(Type::Int64);
-  }
-  if (ret->is(Type::KindOfObject) && ret->isSpecificObject()) {
-    m_exp->setExpectedType(Type::Object);
-  }
-  ConstructPtr self = shared_from_this();
-  if (m_cases && m_cases->getCount()) {
-    int defaultCount = 0;
-    for (int i = 0; i < m_cases->getCount(); i++) {
-      CaseStatementPtr stmt =
-        dynamic_pointer_cast<CaseStatement>((*m_cases)[i]);
-      stmt->inferAndCheck(ar, Type::Some, false);
-      ExpressionPtr cond = stmt->getCondition();
-      if (!cond) {
-        defaultCount++;
-      }
-    }
-    // TODO: this really belongs in analyzeProgram()
-    if (defaultCount > 1 && getScope()->isFirstPass()) {
-      Compiler::Error(Compiler::MoreThanOneDefault, m_cases);
-    }
-  }
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 void SwitchStatement::outputCodeModel(CodeGenerator &cg) {
@@ -200,7 +151,7 @@ void SwitchStatement::outputCodeModel(CodeGenerator &cg) {
     cg.printStatementVector(m_cases);
   }
   cg.printPropertyHeader("sourceLocation");
-  cg.printLocation(this->getLocation());
+  cg.printLocation(this);
   cg.printObjectFooter();
 }
 

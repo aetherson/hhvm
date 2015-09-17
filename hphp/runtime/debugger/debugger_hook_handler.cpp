@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -117,7 +117,12 @@ void proxySetBreakPoints(DebuggerProxy* proxy) {
   }
 }
 
-void DebuggerHookHandler::onFileLoad(Unit* unit) {
+DebuggerHook* HphpdHook::GetInstance() {
+  static DebuggerHook* instance = new HphpdHook();
+  return instance;
+}
+
+void HphpdHook::onFileLoad(Unit* unit) {
   DebuggerProxy* proxy = Debugger::GetProxy().get();
   if (proxy == nullptr) return;
 
@@ -134,7 +139,7 @@ void DebuggerHookHandler::onFileLoad(Unit* unit) {
   }
 }
 
-void DebuggerHookHandler::onDefClass(const Class* cls) {
+void HphpdHook::onDefClass(const Class* cls) {
   // Make sure we have a proxy
   DebuggerProxy* proxy = Debugger::GetProxy().get();
   if (proxy == nullptr) return;
@@ -164,7 +169,7 @@ void DebuggerHookHandler::onDefClass(const Class* cls) {
   }
 }
 
-void DebuggerHookHandler::onDefFunc(const Func* f) {
+void HphpdHook::onDefFunc(const Func* f) {
   // Make sure we have a proxy
   DebuggerProxyPtr proxy = Debugger::GetProxy();
   if (proxy == nullptr) return;

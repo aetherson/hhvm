@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -18,9 +18,8 @@
 #define incl_HPHP_REPLAY_TRANSPORT_H_
 
 #include "hphp/runtime/server/transport.h"
-#include "hphp/util/hdf.h"
-#include "hphp/runtime/base/complex-types.h"
 #include "hphp/runtime/base/ini-setting.h"
+#include "hphp/util/hdf.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -51,7 +50,8 @@ public:
   virtual void getHeaders(HeaderMap &headers);
   virtual void addHeaderImpl(const char *name, const char *value);
   virtual void removeHeaderImpl(const char *name);
-  virtual void sendImpl(const void *data, int size, int code, bool chunked);
+  virtual void sendImpl(const void *data, int size, int code, bool chunked,
+                        bool eom);
 
   int getResponseCode() const { return m_code;}
   const std::string &getResponse() const { return m_response;}

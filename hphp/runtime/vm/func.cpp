@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -17,22 +17,23 @@
 #include "hphp/runtime/vm/func.h"
 
 #include "hphp/runtime/base/attr.h"
-#include "hphp/runtime/base/base-includes.h"
+#include "hphp/runtime/ext/extension.h"
 #include "hphp/runtime/base/builtin-functions.h"
-#include "hphp/runtime/base/class-info.h"
 #include "hphp/runtime/base/execution-context.h"
+#include "hphp/runtime/base/intercept.h"
 #include "hphp/runtime/base/runtime-option.h"
 #include "hphp/runtime/base/static-string-table.h"
 #include "hphp/runtime/base/string-data.h"
 #include "hphp/runtime/base/type-string.h"
-
 #include "hphp/runtime/vm/class.h"
 #include "hphp/runtime/vm/jit/mc-generator.h"
+#include "hphp/runtime/vm/jit/recycle-tc.h"
 #include "hphp/runtime/vm/jit/types.h"
 #include "hphp/runtime/vm/treadmill.h"
 #include "hphp/runtime/vm/type-constraint.h"
 #include "hphp/runtime/vm/unit.h"
-#include "hphp/runtime/vm/verifier/cfg.h"
+
+#include "hphp/system/systemlib.h"
 
 #include "hphp/util/atomic-vector.h"
 #include "hphp/util/fixed-vector.h"
@@ -50,9 +51,9 @@ TRACE_SET_MOD(hhbc);
 
 using jit::mcg;
 
-const StringData* Func::s___call       = makeStaticString("__call");
-const StringData* Func::s___callStatic = makeStaticString("__callStatic");
-std::atomic<bool> Func::s_treadmill;
+const StringData*     Func::s___call       = makeStaticString("__call");
+const StringData*     Func::s___callStatic = makeStaticString("__callStatic");
+std::atomic<bool>     Func::s_treadmill;
 
 /*
  * This size hint will create a ~6MB vector and is rarely hit in practice.
@@ -73,30 +74,24 @@ const AtomicVector<const Func*>& Func::getFuncVec() {
 ///////////////////////////////////////////////////////////////////////////////
 // Creation and destruction.
 
-Func::Func(Unit& unit, PreClass* preClass, int line1, int line2,
-           Offset base, Offset past, const StringData* name, Attr attrs,
-           bool top, const StringData* docComment, int numParams)
+Func::Func(Unit& unit, const StringData* name, Attr attrs)
   : m_name(name)
   , m_unit(&unit)
   , m_attrs(attrs)
 {
+  m_isPreFunc = false;
   m_hasPrivateAncestor = false;
-  m_shared = new SharedData(preClass, base, past,
-                            line1, line2, top, docComment);
-  init(numParams);
+  m_shared = nullptr;
 }
 
 Func::~Func() {
   if (m_fullName != nullptr && m_maybeIntercepted != -1) {
     unregister_intercept_flag(fullNameStr(), &m_maybeIntercepted);
   }
-  int maxNumPrologues = getMaxNumPrologues(numParams());
-  int numPrologues =
-    maxNumPrologues > kNumFixedPrologues ? maxNumPrologues
-                                         : kNumFixedPrologues;
-  if (mcg != nullptr) {
-    mcg->smashPrologueGuards((jit::TCA*)m_prologueTable,
-                             numPrologues, this);
+  if (mcg != nullptr && !RuntimeOption::EvalEnableReusableTC) {
+    // If Reusable TC is enabled then the prologue may have already been smashed
+    // and the memory may now be in use by another function.
+    smashPrologues();
   }
 #ifdef DEBUG
   validate();
@@ -104,121 +99,99 @@ Func::~Func() {
 #endif
 }
 
-void* Func::allocFuncMem(
-  const StringData* name, int numParams,
-  bool needsNextClonedClosure,
-  bool lowMem) {
+void* Func::allocFuncMem(int numParams) {
   int maxNumPrologues = Func::getMaxNumPrologues(numParams);
-  int numExtraPrologues =
-    maxNumPrologues > kNumFixedPrologues ?
-    maxNumPrologues - kNumFixedPrologues :
-    0;
-  int numExtraFuncPtrs = (int) needsNextClonedClosure;
-  size_t funcSize =
-    sizeof(Func) +
-    numExtraPrologues * sizeof(unsigned char*) +
-    numExtraFuncPtrs * sizeof(Func*);
+  int numExtraPrologues = std::max(maxNumPrologues - kNumFixedPrologues, 0);
 
-  void* mem = lowMem ? low_malloc(funcSize) : malloc(funcSize);
+  size_t funcSize = sizeof(Func) + numExtraPrologues * sizeof(unsigned char*);
 
-  /**
-   * The Func object can have optional nextClonedClosure pointer to Func
-   * in front of the actual object. The layout is as follows:
-   *
-   *               +--------------------------------+ low address
-   *               |  nextClonedClosure (optional)  |
-   *               |  in closures                   |
-   *               +--------------------------------+ Func* address
-   *               |  Func object                   |
-   *               +--------------------------------+ high address
-   */
-  memset(mem, 0, numExtraFuncPtrs * sizeof(Func*));
-  return ((Func**) mem) + numExtraFuncPtrs;
+  return low_malloc(funcSize);
 }
 
 void Func::destroy(Func* func) {
   if (func->m_funcId != InvalidFuncId) {
+    if (mcg && RuntimeOption::EvalEnableReusableTC) {
+      // Free TC-space associated with func
+      jit::reclaimFunction(func);
+    }
+
     DEBUG_ONLY auto oldVal = s_funcVec.exchange(func->m_funcId, nullptr);
     assert(oldVal == func);
     func->m_funcId = InvalidFuncId;
+
     if (s_treadmill.load(std::memory_order_acquire)) {
       Treadmill::enqueue([func](){ destroy(func); });
       return;
     }
   }
-
-  /*
-   * Funcs in PreClasses are just templates, and don't get used
-   * until they are cloned so we don't put them in low memory.
-   */
-  bool lowMem = !func->preClass() || func->m_cls;
-  void* mem = func;
-  if (func->isClosureBody()) {
-    Func** startOfFunc = ((Func**) mem) - 1; // move back by a pointer
-    mem = startOfFunc;
-    if (Func* f = *startOfFunc) {
-      /*
-       * cloned closures use the prolog array to hold
-       * the per-clone post-prolog entry points.
-       * They're not real prologs, and they shouldn't be
-       * smashed, so clear them out here.
-       */
-      f->initPrologues(f->numParams());
-      Func::destroy(f);
-    }
-  }
   func->~Func();
-  if (lowMem) {
-    low_free(mem);
+  low_free(func);
+}
+
+void Func::freeClone() {
+  assert(isPreFunc());
+  assert(m_cloned.flag.test_and_set());
+
+  if (mcg && RuntimeOption::EvalEnableReusableTC) {
+    // Free TC-space associated with func
+    jit::reclaimFunction(this);
   } else {
-    free(mem);
+    smashPrologues();
   }
+
+  if (m_funcId != InvalidFuncId) {
+    DEBUG_ONLY auto oldVal = s_funcVec.exchange(m_funcId, nullptr);
+    assert(oldVal == this);
+    m_funcId = InvalidFuncId;
+  }
+
+  m_cloned.flag.clear();
+}
+
+void Func::smashPrologues() const {
+  int maxNumPrologues = getMaxNumPrologues(numParams());
+  int numPrologues =
+    maxNumPrologues > kNumFixedPrologues ? maxNumPrologues
+                                         : kNumFixedPrologues;
+  mcg->smashPrologueGuards((jit::TCA*)m_prologueTable,
+                           numPrologues, this);
 }
 
 Func* Func::clone(Class* cls, const StringData* name) const {
   auto numParams = this->numParams();
-  Func* f = new (allocFuncMem(
-                   m_name,
-                   numParams,
-                   isClosureBody(),
-                   cls || !preClass())) Func(*this);
 
+  // If this is a PreFunc (i.e., a Func on a PreClass) that is not already
+  // being used as a regular Func by a Class, and we aren't trying to change
+  // its name (since the name is part of the template for later clones), we can
+  // reuse this same Func as the clone.
+  bool const can_reuse =
+    m_isPreFunc && !name && !m_cloned.flag.test_and_set();
+
+  Func* f = !can_reuse
+    ? new (allocFuncMem(numParams)) Func(*this)
+    : const_cast<Func*>(this);
+
+  f->m_cloned.flag.test_and_set();
   f->initPrologues(numParams);
   f->m_funcId = InvalidFuncId;
-  if (name) {
-    f->m_name = name;
-  }
-  if (cls != f->m_cls) {
-    f->m_cls = cls;
-  }
+  if (name) f->m_name = name;
+  f->m_cls = cls;
   f->setFullName(numParams);
-  f->m_profCounter = 0;
+
+  if (f != this) {
+    f->m_cachedFunc = rds::Link<Func*>{rds::kInvalidHandle};
+    f->m_maybeIntercepted = -1;
+    f->m_isPreFunc = false;
+  }
+
   return f;
 }
 
-Func* Func::cloneAndSetClass(Class* cls) const {
-  if (Func* ret = findCachedClone(cls)) {
-    return ret;
-  }
+void Func::rescope(Class* ctx, Attr attrs) {
+  m_cls = ctx;
+  if (attrs != AttrNone) m_attrs = attrs;
 
-  static Mutex s_clonedFuncListMutex;
-  Lock l(s_clonedFuncListMutex);
-  // Check again now that I'm the writer
-  if (Func* ret = findCachedClone(cls)) {
-    return ret;
-  }
-
-  Func* clonedFunc = clone(cls);
-  clonedFunc->setNewFuncId();
-
-  // Save it so we don't have to keep cloning it and retranslating
-  Func** nextFunc = &this->nextClonedClosure();
-  while (*nextFunc) {
-    nextFunc = &nextFunc[0]->nextClonedClosure();
-  }
-  *nextFunc = clonedFunc;
-
-  return clonedFunc;
+  setFullName(numParams());
 }
 
 void Func::rename(const StringData* name) {
@@ -243,13 +216,8 @@ void Func::init(int numParams) {
   }
   if (isSpecial(m_name)) {
     /*
-     * i)  We dont want these compiler generated functions to
-     *     appear in backtraces.
-     *
-     * ii) 86sinit and 86pinit construct NameValueTableWrappers
-     *     on the stack. So we MUST NOT allow those to leak into
-     *     the backtrace (since the backtrace will outlive the
-     *     variables).
+     * We dont want these compiler generated functions to
+     * appear in backtraces.
      */
     m_attrs = m_attrs | AttrNoInjection;
   }
@@ -291,21 +259,31 @@ void Func::setFullName(int numParams) {
       std::string(m_cls->name()->data()) + "::" + m_name->data());
   } else {
     m_fullName = m_name;
-    m_namedEntity = NamedEntity::get(m_name);
+
+    // A scoped closure may not have a `cls', but we still need to preserve its
+    // `methodSlot', which refers to its slot in its `baseCls' (which still
+    // points to a subclass of Closure).
+    if (!isMethod()) {
+      m_namedEntity = NamedEntity::get(m_name);
+    }
   }
   if (RuntimeOption::EvalPerfDataMap) {
-    int numPre = isClosureBody() ? 1 : 0;
-    char* from = (char*)this - numPre * sizeof(Func);
-
     int maxNumPrologues = Func::getMaxNumPrologues(numParams);
-    int numPrologues = maxNumPrologues > kNumFixedPrologues ?
-      maxNumPrologues : kNumFixedPrologues;
+    int numPrologues = maxNumPrologues > kNumFixedPrologues
+      ? maxNumPrologues
+      : kNumFixedPrologues;
+
+    char* from = (char*)this;
     char* to = (char*)(m_prologueTable + numPrologues);
+
     Debug::DebugInfo::recordDataMap(
-      from, to, folly::format("Func-{}-{}", numPre,
-                              (isPseudoMain() ?
-                               m_unit->filepath()->data() :
-                               m_fullName->data())).str());
+      from,
+      to,
+      folly::format(
+        "Func-{}",
+        isPseudoMain() ? m_unit->filepath() : m_fullName.get()
+      ).str()
+    );
   }
   if (RuntimeOption::DynamicInvokeFunctions.size()) {
     if (RuntimeOption::DynamicInvokeFunctions.find(m_fullName->data()) !=
@@ -402,7 +380,7 @@ bool Func::isFuncIdValid(FuncId id) {
 // Bytecode.
 
 DVFuncletsVec Func::getDVFunclets() const {
- DVFuncletsVec dvs;
+  DVFuncletsVec dvs;
   int nParams = numParams();
   for (int i = 0; i < nParams; ++i) {
     const ParamInfo& pi = params()[i];
@@ -509,11 +487,14 @@ bool Func::mustBeRef(int32_t arg) const {
       if (name() == s_array_multisort.get() && !cls()) return false;
     }
   }
+
+  // We force mustBeRef() to return false for array_multisort(). It tries to
+  // pass all variadic arguments by reference, but it also allow expressions
+  // that cannot be taken by reference (ex. SORT_REGULAR flag).
   return
     arg < numParams() ||
     !(m_attrs & AttrVariadicByRef) ||
-    !methInfo() ||
-    !(methInfo()->attribute & ClassInfo::MixedVariableArguments);
+    !(name() == s_array_multisort.get() && !cls());
 }
 
 
@@ -531,27 +512,6 @@ int Func::numSlotsInFrame() const {
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// Closures.
-
-bool Func::isClonedClosure() const {
-  if (!isClosureBody()) return false;
-  if (!cls()) return true;
-  return cls()->lookupMethod(name()) != this;
-}
-
-Func* Func::findCachedClone(Class* cls) const {
-  Func* nextFunc = const_cast<Func*>(this);
-  while (nextFunc) {
-    if (nextFunc->cls() == cls) {
-      return nextFunc;
-    }
-    nextFunc = nextFunc->nextClonedClosure();
-  }
-  return nullptr;
-}
-
-
-///////////////////////////////////////////////////////////////////////////////
 // Persistence.
 
 bool Func::isNameBindingImmutable(const Unit* fromUnit) const {
@@ -564,7 +524,7 @@ bool Func::isNameBindingImmutable(const Unit* fromUnit) const {
     return true;
   }
 
-  if (isUnique() && RuntimeOption::RepoAuthoritative) {
+  if (isUnique()) {
     return true;
   }
 
@@ -607,12 +567,11 @@ const FPIEnt* Func::findPrecedingFPI(Offset o) const {
   assert(o >= base() && o < past());
   const FPIEntVec& fpitab = shared()->m_fpitab;
   assert(fpitab.size());
-  const FPIEnt* fe = &fpitab[0];
-  unsigned int i;
-  for (i = 1; i < fpitab.size(); i++) {
+  const FPIEnt* fe = 0;
+  for (unsigned i = 0; i < fpitab.size(); i++) {
     const FPIEnt* cur = &fpitab[i];
     if (o > cur->m_fcallOff &&
-        fe->m_fcallOff < cur->m_fcallOff) {
+        (!fe || fe->m_fcallOff < cur->m_fcallOff)) {
       fe = cur;
     }
   }
@@ -649,8 +608,10 @@ static void print_attrs(std::ostream& out, Attr attrs) {
   if (attrs & AttrFinal)     { out << " final"; }
   if (attrs & AttrPhpLeafFn) { out << " (leaf)"; }
   if (attrs & AttrHot)       { out << " (hot)"; }
+  if (attrs & AttrNoOverride){ out << " (nooverride)"; }
   if (attrs & AttrInterceptable) { out << " (interceptable)"; }
   if (attrs & AttrPersistent) { out << " (persistent)"; }
+  if (attrs & AttrMayUseVV) { out << " (mayusevv)"; }
 }
 
 void Func::prettyPrint(std::ostream& out, const PrintOpts& opts) const {
@@ -676,7 +637,7 @@ void Func::prettyPrint(std::ostream& out, const PrintOpts& opts) const {
   if (!opts.metadata) return;
 
   const ParamInfoVec& params = shared()->m_params;
-  for (uint i = 0; i < params.size(); ++i) {
+  for (uint32_t i = 0; i < params.size(); ++i) {
     if (params[i].funcletOff != InvalidAbsoluteOffset) {
       out << " DV for parameter " << i << " at " << params[i].funcletOff;
       if (params[i].phpCode) {
@@ -734,186 +695,30 @@ void Func::prettyPrint(std::ostream& out, const PrintOpts& opts) const {
 
 
 ///////////////////////////////////////////////////////////////////////////////
-// Other methods.
-
-void Func::getFuncInfo(ClassInfo::MethodInfo* mi) const {
-  assert(mi);
-  if (methInfo() != nullptr) {
-    // Very large operator=() invocation.
-    *mi = *methInfo();
-    // Deep copy the vectors of mi-owned pointers.
-    for (auto& p : mi->parameters)      p = new ClassInfo::ParameterInfo(*p);
-    for (auto& p : mi->staticVariables) p = new ClassInfo::ConstantInfo(*p);
-  } else {
-    // hphpc sets the ClassInfo::VariableArguments attribute if the method
-    // contains a call to func_get_arg, func_get_args, or func_num_args. We
-    // don't do this in the VM currently and hopefully we never will need to.
-    int attr = 0;
-    if (m_attrs & AttrReference) attr |= ClassInfo::IsReference;
-    if (m_attrs & AttrAbstract) attr |= ClassInfo::IsAbstract;
-    if (m_attrs & AttrFinal) attr |= ClassInfo::IsFinal;
-    if (m_attrs & AttrProtected) attr |= ClassInfo::IsProtected;
-    if (m_attrs & AttrPrivate) attr |= ClassInfo::IsPrivate;
-    if (m_attrs & AttrStatic) attr |= ClassInfo::IsStatic;
-    if (m_attrs & AttrHPHPSpecific) attr |= ClassInfo::HipHopSpecific;
-    if (!(attr & ClassInfo::IsProtected || attr & ClassInfo::IsPrivate)) {
-      attr |= ClassInfo::IsPublic;
-    }
-    if (attr == 0) attr = ClassInfo::IsNothing;
-    mi->attribute = (ClassInfo::Attribute)attr;
-    mi->name = m_name->data();
-    mi->file = m_unit->filepath()->data();
-    mi->line1 = line1();
-    mi->line2 = line2();
-    if (docComment() && !docComment()->empty()) {
-      mi->docComment = docComment()->data();
-    }
-    // Get the parameter info
-    auto limit = numParams();
-    for (unsigned i = 0; i < limit; ++i) {
-      ClassInfo::ParameterInfo* pi = new ClassInfo::ParameterInfo;
-      attr = 0;
-      if (byRef(i)) {
-        attr |= ClassInfo::IsReference;
-      }
-      if (attr == 0) {
-        attr = ClassInfo::IsNothing;
-      }
-      const ParamInfoVec& params = shared()->m_params;
-      const ParamInfo& fpi = params[i];
-      pi->attribute = (ClassInfo::Attribute)attr;
-      pi->name = shared()->m_localNames[i]->data();
-      if (params.size() <= i || !fpi.hasDefaultValue()) {
-        pi->value = nullptr;
-        pi->valueText = "";
-      } else {
-        if (fpi.hasScalarDefaultValue()) {
-          // Most of the time the default value is scalar, so we can
-          // avoid evaling in the common case
-          pi->value = strdup(f_serialize(
-            tvAsVariant((TypedValue*)&fpi.defaultValue)).get()->data());
-        } else {
-          // Eval PHP code to get default value, and serialize the result. Note
-          // that access of undefined class constants can cause the eval() to
-          // fatal. Zend lets such fatals propagate, so don't bother catching
-          // exceptions here.
-          const Variant& v = g_context->getEvaledArg(
-            fpi.phpCode,
-            cls() ? cls()->nameStr() : nameStr()
-          );
-          pi->value = strdup(f_serialize(v).get()->data());
-        }
-        // This is a raw char*, but its lifetime should be at least as long
-        // as the the Func*. At this writing, it's a merged anon string
-        // owned by ParamInfo.
-        pi->valueText = fpi.phpCode->data();
-      }
-      pi->type = fpi.typeConstraint.hasConstraint() ?
-        fpi.typeConstraint.typeName()->data() : "";
-      for (auto it = fpi.userAttributes.begin();
-          it != fpi.userAttributes.end(); ++it) {
-        // convert the typedvalue to a cvarref and push into pi.
-        auto userAttr = new ClassInfo::UserAttributeInfo;
-        assert(it->first->isStatic());
-        userAttr->name = const_cast<StringData*>(it->first.get());
-        userAttr->setStaticValue(tvAsCVarRef(&it->second));
-        pi->userAttrs.push_back(userAttr);
-      }
-      mi->parameters.push_back(pi);
-    }
-    // XXX ConstantInfo is abused to store static variable metadata, and
-    // although ConstantInfo::callbacks provides a mechanism for registering
-    // callbacks, it does not pass enough information through for the callback
-    // functions to know the function context whence the callbacks came.
-    // Furthermore, the callback mechanism isn't employed in a fashion that
-    // would allow repeated introspection to reflect updated values.
-    // Supporting introspection of static variable values will require
-    // different plumbing than currently exists in ConstantInfo.
-    const SVInfoVec& staticVars = shared()->m_staticVars;
-    for (SVInfoVec::const_iterator it = staticVars.begin();
-         it != staticVars.end(); ++it) {
-      ClassInfo::ConstantInfo* ci = new ClassInfo::ConstantInfo;
-      ci->name = StrNR(it->name);
-      if ((*it).phpCode != nullptr) {
-        ci->valueLen = (*it).phpCode->size();
-        ci->valueText = (*it).phpCode->data();
-      } else {
-        ci->valueLen = 0;
-        ci->valueText = "";
-      }
-
-      mi->staticVariables.push_back(ci);
-    }
-  }
-}
-
-bool Func::shouldPGO() const {
-  if (!RuntimeOption::EvalJitPGO) return false;
-
-  // Non-cloned closures simply contain prologues that redispacth to
-  // cloned closures.  They don't contain a translation for the
-  // function entry, which is what triggers an Optimize retranslation.
-  // So don't generate profiling translations for them -- there's not
-  // much to do with PGO anyway here, since they just have prologues.
-  if (isClosureBody() && !isClonedClosure()) return false;
-
-  if (!RuntimeOption::EvalJitPGOHotOnly) return true;
-  return attrs() & AttrHot;
-}
-
-void Func::incProfCounter() {
-  assert(isProfileRequest());
-  __sync_fetch_and_add(&m_profCounter, 1);
-}
-
-bool Func::anyBlockEndsAt(Offset off) const {
-  assert(jit::Translator::WriteLease().amOwner());
-  // The empty() check relies on a Func's bytecode always being nonempty
-  assert(base() != past());
-  if (m_shared->m_blockEnds.empty()) {
-    using namespace Verifier;
-
-    Arena arena;
-    GraphBuilder builder{arena, this};
-    Graph* cfg = builder.build();
-
-    for (LinearBlocks blocks = linearBlocks(cfg); !blocks.empty(); ) {
-      auto last = blocks.popFront()->last - m_unit->entry();
-      m_shared->m_blockEnds.insert(last);
-    }
-
-    assert(!m_shared->m_blockEnds.empty());
-  }
-
-  return m_shared->m_blockEnds.count(off) != 0;
-}
-
-
-///////////////////////////////////////////////////////////////////////////////
 // SharedData.
 
 Func::SharedData::SharedData(PreClass* preClass, Offset base, Offset past,
                              int line1, int line2, bool top,
                              const StringData* docComment)
-  : m_preClass(preClass)
-  , m_base(base)
-  , m_past(past)
+  : m_base(base)
+  , m_preClass(preClass)
   , m_numLocals(0)
   , m_numIterators(0)
   , m_line1(line1)
-  , m_line2(line2)
-  , m_info(nullptr)
-  , m_refBitPtr(0)
-  , m_builtinFuncPtr(nullptr)
   , m_docComment(docComment)
+  , m_refBitPtr(0)
   , m_top(top)
   , m_isClosureBody(false)
   , m_isAsync(false)
   , m_isGenerator(false)
   , m_isPairGenerator(false)
   , m_isGenerated(false)
+  , m_hasExtendedSharedData(false)
   , m_originalFilename(nullptr)
-{}
+{
+  m_pastDelta = std::min<uint32_t>(past - base, kSmallDeltaLimit);
+  m_line2Delta = std::min<uint32_t>(line2 - line1, kSmallDeltaLimit);
+}
 
 Func::SharedData::~SharedData() {
   free(m_refBitPtr);

@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -41,12 +41,6 @@ public:
    */
   bool find(const std::string &name, const char *&data, int &len,
             bool &compressed) const;
-
-private:
-  struct ResourceFile {
-    std::shared_ptr<CstrBuffer> file;
-    std::shared_ptr<CstrBuffer> compressed;
-  };
 };
 
 ///////////////////////////////////////////////////////////////////////////////

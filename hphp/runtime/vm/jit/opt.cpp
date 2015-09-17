@@ -2,7 +2,7 @@
    +----------------------------------------------------------------------+
    | HipHop for PHP                                                       |
    +----------------------------------------------------------------------+
-   | Copyright (c) 2010-2014 Facebook, Inc. (http://www.facebook.com)     |
+   | Copyright (c) 2010-2015 Facebook, Inc. (http://www.facebook.com)     |
    +----------------------------------------------------------------------+
    | This source file is subject to version 3.01 of the PHP license,      |
    | that is bundled with this package in the file LICENSE, and is        |
@@ -16,179 +16,130 @@
 
 #include "hphp/runtime/vm/jit/opt.h"
 
-#include "hphp/util/trace.h"
 #include "hphp/runtime/vm/jit/check.h"
 #include "hphp/runtime/vm/jit/guard-relaxation.h"
 #include "hphp/runtime/vm/jit/ir-builder.h"
 #include "hphp/runtime/vm/jit/ir-unit.h"
+#include "hphp/runtime/vm/jit/mutation.h"
 #include "hphp/runtime/vm/jit/print.h"
+#include "hphp/runtime/vm/jit/simplify.h"
 #include "hphp/runtime/vm/jit/timer.h"
+#include "hphp/runtime/vm/jit/dce.h"
+
+#include "hphp/util/trace.h"
+
+#include <boost/dynamic_bitset.hpp>
 
 namespace HPHP { namespace jit {
 
-// insert inst after the point dst is defined
-static void insertAfter(IRInstruction* definer, IRInstruction* inst) {
-  assert(!definer->isBlockEnd());
-  Block* block = definer->block();
-  auto pos = block->iteratorTo(definer);
-  if (pos->op() == DefLabel) {
-    ++pos;
+namespace {
+
+//////////////////////////////////////////////////////////////////////
+
+enum class DCE { None, Minimal, Full };
+
+template<class PassFN>
+void doPass(IRUnit& unit, PassFN fn, DCE dce) {
+  fn(unit);
+  switch (dce) {
+  case DCE::Minimal:  mandatoryDCE(unit); break;
+  case DCE::Full:     fullDCE(unit); // fallthrough
+  case DCE::None:     assertx(checkEverything(unit)); break;
   }
-  block->insert(++pos, inst);
 }
 
-/*
- * Insert a DbgAssertRefCount instruction after each place we produce
- * a refcounted value.  The value must be something we can safely dereference
- * to check the _count field.
- */
-static void insertRefCountAsserts(IRInstruction& inst, IRUnit& unit) {
-  for (SSATmp& dst : inst.dsts()) {
-    Type t = dst.type();
-    if (t <= (Type::Counted | Type::StaticStr | Type::StaticArr)) {
-      insertAfter(&inst, unit.gen(DbgAssertRefCount, inst.marker(), &dst));
+void removeExitPlaceholders(IRUnit& unit) {
+  for (auto& block : rpoSortCfg(unit)) {
+    if (block->back().is(ExitPlaceholder)) {
+      unit.replace(&block->back(), Jmp, block->next());
     }
   }
 }
 
-/*
- * Insert a DbgAssertTv instruction for each stack location stored to by
- * a SpillStack instruction.
- */
-static void insertSpillStackAsserts(IRInstruction& inst, IRUnit& unit) {
-  SSATmp* sp = inst.dst();
-  auto const vals = inst.srcs().subpiece(2);
-  auto* block = inst.block();
-  auto pos = block->iteratorTo(&inst); ++pos;
-  for (unsigned i = 0, n = vals.size(); i < n; ++i) {
-    Type t = vals[i]->type();
-    if (t <= Type::Gen) {
-      IRInstruction* addr = unit.gen(LdStackAddr,
-                                     inst.marker(),
-                                     Type::PtrToGen,
-                                     StackOffset(i),
-                                     sp);
-      block->insert(pos, addr);
-      IRInstruction* check = unit.gen(DbgAssertPtr, inst.marker(), addr->dst());
-      block->insert(pos, check);
-    }
-  }
-}
+//////////////////////////////////////////////////////////////////////
 
-/*
- * Insert asserts at various points in the IR.
- * TODO: t2137231 Insert DbgAssertPtr at points that use or produces a GenPtr
- */
-static void insertAsserts(IRUnit& unit) {
-  postorderWalk(unit, [&](Block* block) {
-      for (auto it = block->begin(), end = block->end(); it != end; ) {
-        IRInstruction& inst = *it;
-        ++it;
-        if (inst.op() == SpillStack) {
-          insertSpillStackAsserts(inst, unit);
-          continue;
-        }
-        if (inst.op() == Call) {
-          SSATmp* sp = inst.dst();
-          IRInstruction* addr = unit.gen(LdStackAddr,
-                                         inst.marker(),
-                                         Type::PtrToGen,
-                                         StackOffset(0),
-                                         sp);
-          insertAfter(&inst, addr);
-          insertAfter(addr, unit.gen(DbgAssertPtr, inst.marker(), addr->dst()));
-          continue;
-        }
-        if (!inst.isBlockEnd()) insertRefCountAsserts(inst, unit);
-      }
-    });
 }
 
 void optimize(IRUnit& unit, IRBuilder& irBuilder, TransKind kind) {
-  Timer _t(Timer::optimize);
+  Timer timer(Timer::optimize);
 
-  auto finishPass = [&](const char* msg) {
-    printUnit(6, unit, folly::format("after {}", msg).str().c_str());
-    assert(checkCfg(unit));
-    assert(checkTmpsSpanningCalls(unit));
-    forEachInst(rpoSortCfg(unit),
-                [&](IRInstruction* inst) {
-                  assertOperandTypes(inst, &unit);
-                });
-  };
+  assertx(checkEverything(unit));
 
-  auto doPass = [&](void (*fn)(IRUnit&), const char* msg) {
-    fn(unit);
-    finishPass(msg);
-  };
+  auto const hasLoop = RuntimeOption::EvalJitLoops && cfgHasLoop(unit);
 
-  auto dce = [&](const char* which) {
-    if (!RuntimeOption::EvalHHIRDeadCodeElim) return;
-    eliminateDeadCode(unit);
-    finishPass(folly::format("{} DCE", which).str().c_str());
-  };
+  if (shouldHHIRRelaxGuards() && !hasLoop) {
+    Timer _t(Timer::optimize_relaxGuards);
+    const bool simple = kind == TransKind::Profile;
+    RelaxGuardsFlags flags = (RelaxGuardsFlags)
+      (RelaxReflow | (simple ? RelaxSimple : RelaxNormal));
+    auto changed = relaxGuards(unit, *irBuilder.guards(), flags);
+    if (changed) {
+      printUnit(6, unit, "after guard relaxation");
+      mandatoryDCE(unit);  // relaxGuards can leave unreachable preds.
+    }
 
-  auto const doReoptimize = RuntimeOption::EvalHHIRExtraOptPass &&
-    (RuntimeOption::EvalHHIRCse || RuntimeOption::EvalHHIRSimplification);
-
-  if (shouldHHIRRelaxGuards()) {
-    /*
-     * In TransProfile mode, we can only relax the guards in tracelet
-     * region mode.  If the region came from analyze() and we relax the
-     * guards here, then the RegionDesc's TypePreds in ProfData won't
-     * accurately reflect the generated guards.  This can result in a
-     * TransOptimze region to be formed with types that are incompatible,
-     * e.g.:
-     *    B1: TypePred: Loc0: Bool      // but this gets relaxed to Uncounted
-     *        PostCond: Loc0: Uncounted // post-conds are accurate
-     *    B2: TypePred: Loc0: Int       // this will always fail
-     */
-    const bool relax = kind != TransKind::Profile ||
-                       RuntimeOption::EvalJitRegionSelector == "tracelet";
-    if (relax) {
-      Timer _t(Timer::optimize_relaxGuards);
-      const bool simple = kind == TransKind::Profile &&
-                          RuntimeOption::EvalJitRegionSelector == "tracelet";
-      RelaxGuardsFlags flags = (RelaxGuardsFlags)
-        (RelaxReflow | (simple ? RelaxSimple : RelaxNormal));
-      auto changed = relaxGuards(unit, *irBuilder.guards(), flags);
-      if (changed) finishPass("guard relaxation");
-
-      if (doReoptimize) {
-        irBuilder.reoptimize();
-        finishPass("guard relaxation reoptimize");
-      }
+    if (RuntimeOption::EvalHHIRSimplification) {
+      doPass(unit, simplifyPass, DCE::Minimal);
+      doPass(unit, cleanCfg, DCE::None);
     }
   }
 
-  if (RuntimeOption::EvalHHIRRefcountOpts) {
-    optimizeRefcounts(unit, FrameState{unit, unit.entry()->front().marker()});
-    finishPass("refcount opts");
-  }
+  fullDCE(unit);
+  printUnit(6, unit, " after initial DCE ");
+  assertx(checkEverything(unit));
 
-  dce("initial");
+  if (RuntimeOption::EvalHHIRTypeCheckHoisting) {
+    doPass(unit, hoistTypeChecks, DCE::Minimal);
+  }
 
   if (RuntimeOption::EvalHHIRPredictionOpts) {
-    doPass(optimizePredictions, "prediction opts");
+    doPass(unit, optimizePredictions, DCE::None);
   }
 
-  if (doReoptimize) {
-    irBuilder.reoptimize();
-    finishPass("reoptimize");
-    // Cleanup any dead code left around by CSE/Simplification
-    // Ideally, this would be controlled by a flag returned
-    // by optimizeTrace indicating whether DCE is necessary
-    dce("reoptimize");
+  if (RuntimeOption::EvalHHIRSimplification) {
+    doPass(unit, simplifyPass, DCE::Full);
+    doPass(unit, cleanCfg, DCE::None);
   }
 
-  if (RuntimeOption::EvalHHIRJumpOpts) {
-    doPass(optimizeJumps, "jumpopts");
-    dce("jump opts");
+  if (RuntimeOption::EvalHHIRGlobalValueNumbering) {
+    doPass(unit, gvn, DCE::Full);
   }
+
+  if (kind != TransKind::Profile && RuntimeOption::EvalHHIRMemoryOpts) {
+    doPass(unit, optimizeLoads, DCE::Full);
+  }
+
+  if (kind != TransKind::Profile && RuntimeOption::EvalHHIRMemoryOpts) {
+    doPass(unit, optimizeStores, DCE::Full);
+  }
+
+  if (kind != TransKind::Profile && RuntimeOption::EvalHHIRRefcountOpts) {
+    doPass(unit, optimizeRefcounts2, DCE::Full);
+  }
+
+  if (RuntimeOption::EvalHHIRLICM) {
+    if (kind != TransKind::Profile && hasLoop) {
+      // The clean pass is just to stress lack of pre_headers for now, since
+      // LICM is a disabled prototype pass.
+      doPass(unit, cleanCfg, DCE::None);
+      doPass(unit, optimizeLoopInvariantCode, DCE::Minimal);
+    }
+  }
+
+  doPass(unit, removeExitPlaceholders, DCE::Full);
 
   if (RuntimeOption::EvalHHIRGenerateAsserts) {
-    doPass(insertAsserts, "RefCnt asserts");
+    doPass(unit, insertAsserts, DCE::None);
+  }
+
+  // Perform final cleanup passes to collapse any critical edges that were
+  // split, and simplify our instructions before shipping off to codegen.
+  doPass(unit, cleanCfg, DCE::None);
+  if (kind != TransKind::Profile && RuntimeOption::EvalHHIRSimplification) {
+    doPass(unit, simplifyPass, DCE::Full);
   }
 }
 
-} }
+//////////////////////////////////////////////////////////////////////
+
+}}
